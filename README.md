@@ -1,17 +1,19 @@
 # litewire
 
-MySQL, PostgreSQL, and SQL Server wire protocol proxy for SQLite. Connect your existing apps to SQLite without changing a line of code.
+MySQL, PostgreSQL, SQL Server, and Hrana protocol proxy for SQLite. Connect your existing apps to SQLite without changing a line of code.
 
-litewire accepts connections from MySQL, PostgreSQL, and SQL Server clients, translates the SQL dialect on the fly, and executes against a SQLite backend. Your app thinks it's talking to a real database server -- it's actually talking to SQLite.
+litewire accepts connections from MySQL, PostgreSQL, SQL Server, and libsql SDK clients, translates the SQL dialect on the fly, and executes against a SQLite backend. Your app thinks it's talking to a real database server -- it's actually talking to SQLite.
 
 ```
-PHP/Rails/Django (pdo_mysql, pdo_pgsql, pdo_sqlsrv, etc.)
+PHP/Rails/Django (pdo_mysql, pdo_pgsql, pdo_sqlsrv)
+libsql SDK (Rust, JS, Python, Go)
         |
         v
    +---------+
-   | litewire |  <-- MySQL :3306 / PostgreSQL :5432 / TDS :1433
+   | litewire |  <-- MySQL :3306 / PG :5432 / TDS :1433 / Hrana :8080
    +----+----+
         |  SQL translation (MySQL/PG/T-SQL -> SQLite)
+        |  or direct passthrough (Hrana -> SQLite)
         v
      SQLite
 ```
@@ -29,8 +31,8 @@ PHP/Rails/Django (pdo_mysql, pdo_pgsql, pdo_sqlsrv, etc.)
 # Start with a MySQL frontend
 litewire --mysql-listen 127.0.0.1:3306 --db app.db
 
-# Start with all three frontends
-litewire --mysql-listen 127.0.0.1:3306 --pg-listen 127.0.0.1:5432 --tds-listen 127.0.0.1:1433 --db app.db
+# Start with all frontends
+litewire --mysql-listen 127.0.0.1:3306 --pg-listen 127.0.0.1:5432 --tds-listen 127.0.0.1:1433 --hrana-listen 127.0.0.1:8080 --db app.db
 
 # Connect from any MySQL client
 mysql -h 127.0.0.1 -P 3306 -e "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
@@ -42,6 +44,16 @@ psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM users"
 
 # Or SQL Server
 sqlcmd -S 127.0.0.1,1433 -Q "SELECT * FROM users"
+
+# Or via libsql SDK (Hrana protocol -- no SQL translation, native SQLite)
+# Any libsql client SDK works: Rust, JavaScript, Python, Go
+```
+
+litewire also serves as a **lightweight drop-in replacement for sqld** (libsql-server). Apps using the Turso/libsql SDK can point at litewire instead of sqld for CI, development, and single-node deployments -- no replication server needed.
+
+```bash
+# CI/CD: replace sqld with litewire
+litewire --hrana-listen 127.0.0.1:8080 --db test.db
 ```
 
 ## As a Library
@@ -50,7 +62,7 @@ litewire is also a Rust crate with a pluggable backend:
 
 ```toml
 [dependencies]
-litewire = { version = "0.1", features = ["mysql", "postgres", "tds"] }
+litewire = { version = "0.1", features = ["mysql", "postgres", "tds", "hrana"] }
 ```
 
 ```rust
@@ -64,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         .mysql("127.0.0.1:3306")
         .postgres("127.0.0.1:5432")
         .tds("127.0.0.1:1433")
+        .hrana("127.0.0.1:8080")
         .serve()
         .await
 }
