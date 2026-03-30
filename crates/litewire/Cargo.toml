@@ -32,6 +32,7 @@ postgres = ["dep:litewire-postgres"]
 tds = ["dep:litewire-tds"]
 hrana = ["dep:litewire-hrana"]
 backend-rusqlite = ["litewire-backend/rusqlite"]
+backend-hrana-client = ["litewire-backend/hrana-client"]
 cli = ["dep:clap", "dep:tracing-subscriber"]
 
 [dev-dependencies]

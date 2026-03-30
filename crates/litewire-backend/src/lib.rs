@@ -7,6 +7,9 @@
 #[cfg(feature = "rusqlite")]
 pub mod rusqlite_backend;
 
+#[cfg(feature = "hrana-client")]
+pub mod hrana_client;
+
 use std::fmt;
 use std::sync::Arc;
 
@@ -81,6 +84,9 @@ pub type SharedBackend = Arc<dyn Backend>;
 
 #[cfg(feature = "rusqlite")]
 pub use rusqlite_backend::Rusqlite;
+
+#[cfg(feature = "hrana-client")]
+pub use hrana_client::HranaClient;
 
 #[cfg(test)]
 mod tests {

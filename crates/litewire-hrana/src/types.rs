@@ -7,32 +7,32 @@ use serde::{Deserialize, Serialize};
 
 // ── Request types ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineRequest {
     pub baton: Option<String>,
     pub requests: Vec<StreamRequest>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamRequest {
     Execute(ExecuteRequest),
     Close,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     pub stmt: StmtRequest,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StmtRequest {
     pub sql: String,
     #[serde(default)]
     pub args: Vec<HranaValue>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HranaValue {
     Null,
@@ -65,28 +65,28 @@ impl HranaValue {
 
 // ── Response types ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineResponse {
     pub baton: Option<String>,
     pub base_url: Option<String>,
     pub results: Vec<StreamResult>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamResult {
     Ok { response: StreamResponse },
     Error { error: ErrorResponse },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamResponse {
     Execute { result: ExecuteResponse },
     Close,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteResponse {
     pub cols: Vec<ColResponse>,
     pub rows: Vec<Vec<ResponseValue>>,
@@ -94,13 +94,13 @@ pub struct ExecuteResponse {
     pub last_insert_rowid: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColResponse {
     pub name: String,
     pub decltype: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseValue {
     Null,
@@ -132,7 +132,7 @@ impl ResponseValue {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub message: String,
     pub code: Option<String>,
