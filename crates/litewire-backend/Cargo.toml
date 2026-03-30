@@ -1,0 +1,19 @@
+[package]
+name = "litewire-backend"
+description = "Backend trait and implementations for litewire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = ["rusqlite"]
+rusqlite = ["dep:rusqlite"]
