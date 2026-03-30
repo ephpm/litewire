@@ -541,7 +541,7 @@ The Rust building blocks exist but nobody has assembled them into a complete tra
 
 ## Use as a Library (ePHPm Example)
 
-litewire is designed to be embedded in other projects. [ePHPm](https://github.com/pvm-org/ephpm) uses litewire as a library in two modes depending on deployment:
+litewire is designed to be embedded in other projects. [ePHPm](https://github.com/ephpm/ephpm) uses litewire as a library in two modes depending on deployment:
 
 ### Single-Node / CI / Development
 
