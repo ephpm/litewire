@@ -42,6 +42,14 @@ fn rewrite_data_type(dt: &DataType) -> DataType {
 
         DataType::JSON | DataType::JSONB => DataType::Text,
 
+        DataType::Custom(name, _) => {
+            let upper = name.to_string().to_ascii_uppercase();
+            match upper.as_str() {
+                "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" => DataType::Integer(None),
+                _ => dt.clone(),
+            }
+        }
+
         other => other.clone(),
     }
 }
@@ -148,5 +156,30 @@ mod tests {
         let results = translate("SELECT 1 + 2", Dialect::PostgreSQL).unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.contains("1 + 2"), "got: {sql}");
+    }
+
+    #[test]
+    fn serial_to_integer() {
+        let results = translate(
+            "CREATE TABLE t (id SERIAL PRIMARY KEY)",
+            Dialect::PostgreSQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        let upper = sql.to_ascii_uppercase();
+        assert!(!upper.contains("SERIAL"), "SERIAL not rewritten: {sql}");
+        assert!(upper.contains("INTEGER"), "no INTEGER found: {sql}");
+    }
+
+    #[test]
+    fn bigserial_to_integer() {
+        let results = translate(
+            "CREATE TABLE t (id BIGSERIAL PRIMARY KEY)",
+            Dialect::PostgreSQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        let upper = sql.to_ascii_uppercase();
+        assert!(upper.contains("INTEGER"), "no INTEGER found: {sql}");
     }
 }

@@ -142,6 +142,40 @@ fn rewrite_expr(expr: &mut Expr) {
         Expr::Subquery(q) => {
             rewrite_query_exprs(q);
         }
+        Expr::CompoundIdentifier(parts) => {
+            let joined = parts
+                .iter()
+                .map(|p| p.value.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(".");
+            match joined.as_str() {
+                "@@IDENTITY" => {
+                    *expr = Expr::Function(Function {
+                        name: func_name("last_insert_rowid"),
+                        args: func_args(vec![]),
+                        filter: None,
+                        over: None,
+                        within_group: vec![],
+                        parameters: FunctionArguments::None,
+                        null_treatment: None,
+                        uses_odbc_syntax: false,
+                    });
+                }
+                "@@ROWCOUNT" => {
+                    *expr = Expr::Function(Function {
+                        name: func_name("changes"),
+                        args: func_args(vec![]),
+                        filter: None,
+                        over: None,
+                        within_group: vec![],
+                        parameters: FunctionArguments::None,
+                        null_treatment: None,
+                        uses_odbc_syntax: false,
+                    });
+                }
+                _ => {}
+            }
+        }
         _ => {}
     }
 }
@@ -196,14 +230,47 @@ fn rewrite_function(func: &mut Function) {
         "ISNULL" => {
             func.name = func_name("IFNULL");
         }
+        "NEWID" => {
+            // NEWID() -> lower(hex(randomblob(16)))
+            func.name = func_name("lower");
+            func.args = func_args(vec![Expr::Function(Function {
+                name: func_name("hex"),
+                args: func_args(vec![Expr::Function(Function {
+                    name: func_name("randomblob"),
+                    args: func_args(vec![value_expr(Value::Number("16".into(), false))]),
+                    filter: None,
+                    over: None,
+                    within_group: vec![],
+                    parameters: FunctionArguments::None,
+                    null_treatment: None,
+                    uses_odbc_syntax: false,
+                })]),
+                filter: None,
+                over: None,
+                within_group: vec![],
+                parameters: FunctionArguments::None,
+                null_treatment: None,
+                uses_odbc_syntax: false,
+            })]);
+        }
         _ => {}
     }
 }
 
 /// Rewrite literal values.
 fn rewrite_value(val: &mut Value) {
-    if let Value::Boolean(b) = val {
-        *val = Value::Number(if *b { "1".into() } else { "0".into() }, false);
+    match val {
+        Value::Boolean(b) => {
+            *val = Value::Number(if *b { "1".into() } else { "0".into() }, false);
+        }
+        Value::Placeholder(p) => {
+            if let Some(rest) = p.strip_prefix('$') {
+                if rest.chars().all(|c| c.is_ascii_digit()) {
+                    *p = format!("?{rest}");
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -311,6 +378,40 @@ mod tests {
         .unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.contains('1'), "got: {sql}");
+    }
+
+    // ── NEWID rewrite ────────────────────────────────────────────────────
+
+    #[test]
+    fn newid_rewrite() {
+        let results = translate("SELECT NEWID()", Dialect::TDS).unwrap();
+        let sql = extract_sql(&results[0]);
+        let lower = sql.to_ascii_lowercase();
+        assert!(lower.contains("lower"), "got: {sql}");
+        assert!(lower.contains("hex"), "got: {sql}");
+        assert!(lower.contains("randomblob"), "got: {sql}");
+    }
+
+    // ── Placeholder rewrite ────────────────────────────────────────────────
+
+    #[test]
+    fn dollar_placeholder_to_question_mark() {
+        let results = translate("SELECT * FROM t WHERE id = $1", Dialect::PostgreSQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("?1"), "got: {sql}");
+        assert!(!sql.contains("$1"), "got: {sql}");
+    }
+
+    #[test]
+    fn multiple_dollar_placeholders() {
+        let results = translate(
+            "SELECT * FROM t WHERE a = $1 AND b = $2",
+            Dialect::PostgreSQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("?1"), "got: {sql}");
+        assert!(sql.contains("?2"), "got: {sql}");
     }
 
     // ── Helper ──────────────────────────────────────────────────────────────

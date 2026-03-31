@@ -30,6 +30,14 @@ pub enum MetadataQuery {
     },
     /// `SELECT ... FROM information_schema.schemata` — schema listing.
     InformationSchemata,
+    /// `SELECT ... FROM pg_catalog.pg_tables` or similar.
+    PgCatalogTables,
+    /// `SELECT ... FROM pg_catalog.pg_columns` or `pg_attribute` for a table.
+    PgCatalogColumns { table: String },
+    /// `SELECT ... FROM sys.tables` (T-SQL).
+    SysTables,
+    /// `SELECT ... FROM sys.columns` (T-SQL) for a table.
+    SysColumns { table: String },
 }
 
 impl MetadataQuery {
@@ -101,6 +109,28 @@ impl MetadataQuery {
                     .collect();
                 format!("SELECT {}", cols.join(", "))
             }
+            Self::PgCatalogTables => {
+                "SELECT name AS tablename, 'main' AS schemaname FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name".into()
+            }
+            Self::PgCatalogColumns { table } => {
+                format!(
+                    "SELECT '{table}' AS table_name, name AS column_name, \
+                     type AS data_type, \
+                     CASE WHEN \"notnull\" = 1 THEN 'NO' ELSE 'YES' END AS is_nullable, \
+                     dflt_value AS column_default \
+                     FROM pragma_table_info('{table}') ORDER BY cid"
+                )
+            }
+            Self::SysTables => {
+                "SELECT name, 'U' AS type FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name".into()
+            }
+            Self::SysColumns { table } => {
+                format!(
+                    "SELECT name AS COLUMN_NAME, type AS DATA_TYPE, \
+                     CASE WHEN \"notnull\" = 1 THEN 0 ELSE 1 END AS is_nullable \
+                     FROM pragma_table_info('{table}') ORDER BY cid"
+                )
+            }
         }
     }
 }
@@ -126,6 +156,8 @@ fn system_variable_value(name: &str) -> &'static str {
         "lower_case_table_names" => "0",
         "autocommit" => "1",
         "transaction_isolation" | "tx_isolation" => "'SERIALIZABLE'",
+        "identity" => "last_insert_rowid()",
+        "rowcount" => "changes()",
         _ => "NULL",
     }
 }
@@ -232,6 +264,48 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
                 return Some(MetadataQuery::SystemVariables { variables });
             }
         }
+    }
+
+    // pg_catalog queries.
+    if upper.contains("PG_CATALOG.PG_TABLES") || upper.contains("PG_CATALOG.PG_CLASS") {
+        return Some(MetadataQuery::PgCatalogTables);
+    }
+    if upper.contains("PG_CATALOG.PG_ATTRIBUTE") {
+        let table_filter = extract_where_value_original(trimmed, "TABLE_NAME")
+            .or_else(|| extract_where_value_original(trimmed, "ATTRELID"));
+        return Some(MetadataQuery::PgCatalogColumns {
+            table: table_filter.unwrap_or_default(),
+        });
+    }
+
+    // T-SQL sys.tables / sys.columns.
+    if upper.contains("SYS.TABLES") || upper.contains("SYSOBJECTS") {
+        return Some(MetadataQuery::SysTables);
+    }
+    if upper.contains("SYS.COLUMNS") || upper.contains("SYSCOLUMNS") {
+        let table_filter = extract_where_value_original(trimmed, "TABLE_NAME");
+        return Some(MetadataQuery::SysColumns {
+            table: table_filter.unwrap_or_default(),
+        });
+    }
+
+    // T-SQL stored procedure metadata: sp_tables, sp_columns.
+    if upper.starts_with("EXEC SP_TABLES") || upper.starts_with("SP_TABLES") {
+        return Some(MetadataQuery::SysTables);
+    }
+    if upper.starts_with("EXEC SP_COLUMNS") || upper.starts_with("SP_COLUMNS") {
+        // Try to extract the table name argument.
+        let table = trimmed
+            .split_ascii_whitespace()
+            .nth(1)
+            .map(|s| {
+                s.trim_matches('\'')
+                    .trim_matches('"')
+                    .trim_end_matches(';')
+                    .to_string()
+            })
+            .unwrap_or_default();
+        return Some(MetadataQuery::SysColumns { table });
     }
 
     None
@@ -709,5 +783,133 @@ mod tests {
         let sql = MetadataQuery::InformationSchemata.to_sqlite_sql();
         assert!(sql.contains("SCHEMA_NAME"), "got: {sql}");
         assert!(sql.contains("'main'"), "got: {sql}");
+    }
+
+    // ── @@IDENTITY / @@ROWCOUNT ────────────────────────────────────────────
+
+    #[test]
+    fn identity_system_variable() {
+        let sql = MetadataQuery::SystemVariables {
+            variables: vec!["identity".into()],
+        }
+        .to_sqlite_sql();
+        assert!(sql.contains("last_insert_rowid()"), "got: {sql}");
+    }
+
+    #[test]
+    fn rowcount_system_variable() {
+        let sql = MetadataQuery::SystemVariables {
+            variables: vec!["rowcount".into()],
+        }
+        .to_sqlite_sql();
+        assert!(sql.contains("changes()"), "got: {sql}");
+    }
+
+    #[test]
+    fn detect_select_at_identity() {
+        let q = detect_metadata_query("SELECT @@IDENTITY", Dialect::TDS);
+        assert!(
+            matches!(q, Some(MetadataQuery::SystemVariables { .. })),
+            "got: {q:?}"
+        );
+    }
+
+    #[test]
+    fn detect_select_at_rowcount() {
+        let q = detect_metadata_query("SELECT @@ROWCOUNT", Dialect::TDS);
+        assert!(
+            matches!(q, Some(MetadataQuery::SystemVariables { .. })),
+            "got: {q:?}"
+        );
+    }
+
+    // ── pg_catalog detection ───────────────────────────────────────────────
+
+    #[test]
+    fn detect_pg_catalog_tables() {
+        let q = detect_metadata_query(
+            "SELECT * FROM pg_catalog.pg_tables",
+            Dialect::PostgreSQL,
+        );
+        assert!(matches!(q, Some(MetadataQuery::PgCatalogTables)), "got: {q:?}");
+    }
+
+    #[test]
+    fn detect_pg_catalog_pg_class() {
+        let q = detect_metadata_query(
+            "SELECT * FROM pg_catalog.pg_class WHERE relkind = 'r'",
+            Dialect::PostgreSQL,
+        );
+        assert!(matches!(q, Some(MetadataQuery::PgCatalogTables)), "got: {q:?}");
+    }
+
+    #[test]
+    fn pg_catalog_tables_sql() {
+        let sql = MetadataQuery::PgCatalogTables.to_sqlite_sql();
+        assert!(sql.contains("sqlite_master"), "got: {sql}");
+        assert!(sql.contains("tablename"), "got: {sql}");
+    }
+
+    #[test]
+    fn pg_catalog_columns_sql() {
+        let sql = MetadataQuery::PgCatalogColumns {
+            table: "users".into(),
+        }
+        .to_sqlite_sql();
+        assert!(sql.contains("pragma_table_info"), "got: {sql}");
+        assert!(sql.contains("users"), "got: {sql}");
+    }
+
+    // ── sys.tables / sys.columns detection ─────────────────────────────────
+
+    #[test]
+    fn detect_sys_tables() {
+        let q = detect_metadata_query("SELECT * FROM sys.tables", Dialect::TDS);
+        assert!(matches!(q, Some(MetadataQuery::SysTables)), "got: {q:?}");
+    }
+
+    #[test]
+    fn detect_sys_columns() {
+        let q = detect_metadata_query(
+            "SELECT * FROM sys.columns WHERE TABLE_NAME = 'users'",
+            Dialect::TDS,
+        );
+        assert!(
+            matches!(q, Some(MetadataQuery::SysColumns { ref table }) if table == "users"),
+            "got: {q:?}"
+        );
+    }
+
+    #[test]
+    fn sys_tables_sql() {
+        let sql = MetadataQuery::SysTables.to_sqlite_sql();
+        assert!(sql.contains("sqlite_master"), "got: {sql}");
+    }
+
+    #[test]
+    fn sys_columns_sql() {
+        let sql = MetadataQuery::SysColumns {
+            table: "orders".into(),
+        }
+        .to_sqlite_sql();
+        assert!(sql.contains("pragma_table_info"), "got: {sql}");
+        assert!(sql.contains("orders"), "got: {sql}");
+    }
+
+    // ── sp_tables / sp_columns detection ───────────────────────────────────
+
+    #[test]
+    fn detect_sp_tables() {
+        let q = detect_metadata_query("EXEC sp_tables", Dialect::TDS);
+        assert!(matches!(q, Some(MetadataQuery::SysTables)), "got: {q:?}");
+    }
+
+    #[test]
+    fn detect_sp_columns() {
+        let q = detect_metadata_query("EXEC sp_columns 'users'", Dialect::TDS);
+        assert!(
+            matches!(q, Some(MetadataQuery::SysColumns { .. })),
+            "got: {q:?}"
+        );
     }
 }
