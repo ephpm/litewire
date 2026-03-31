@@ -452,6 +452,97 @@ async fn on_duplicate_key_update() {
     drop(conn);
 }
 
+// ── Transaction tests ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn transaction_commit() {
+    init_tracing();
+    let port = free_port().await;
+    let _server = start_litewire(port).await;
+    let mut conn = connect(port).await;
+
+    conn.query_drop("CREATE TABLE txn_t (id INTEGER PRIMARY KEY, val TEXT)")
+        .await
+        .unwrap();
+
+    conn.query_drop("BEGIN").await.unwrap();
+    conn.query_drop("INSERT INTO txn_t VALUES (1, 'inside_txn')")
+        .await
+        .unwrap();
+    conn.query_drop("COMMIT").await.unwrap();
+
+    // Data should be visible after commit.
+    let rows: Vec<(i64, String)> = conn
+        .query("SELECT id, val FROM txn_t")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, "inside_txn".into())]);
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn transaction_rollback() {
+    init_tracing();
+    let port = free_port().await;
+    let _server = start_litewire(port).await;
+    let mut conn = connect(port).await;
+
+    conn.query_drop("CREATE TABLE txn_rb (id INTEGER PRIMARY KEY, val TEXT)")
+        .await
+        .unwrap();
+
+    conn.query_drop("INSERT INTO txn_rb VALUES (1, 'before')")
+        .await
+        .unwrap();
+
+    conn.query_drop("BEGIN").await.unwrap();
+    conn.query_drop("INSERT INTO txn_rb VALUES (2, 'rolled_back')")
+        .await
+        .unwrap();
+    conn.query_drop("ROLLBACK").await.unwrap();
+
+    // Only the row inserted before the transaction should exist.
+    let rows: Vec<(i64, String)> = conn
+        .query("SELECT id, val FROM txn_rb ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, "before".into())]);
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn transaction_atomicity() {
+    init_tracing();
+    let port = free_port().await;
+    let _server = start_litewire(port).await;
+    let mut conn = connect(port).await;
+
+    conn.query_drop("CREATE TABLE txn_atom (id INTEGER PRIMARY KEY, val INTEGER)")
+        .await
+        .unwrap();
+
+    conn.query_drop("INSERT INTO txn_atom VALUES (1, 100)")
+        .await
+        .unwrap();
+
+    // Begin a transaction, update, then rollback — value should remain 100.
+    conn.query_drop("BEGIN").await.unwrap();
+    conn.query_drop("UPDATE txn_atom SET val = 200 WHERE id = 1")
+        .await
+        .unwrap();
+    conn.query_drop("ROLLBACK").await.unwrap();
+
+    let rows: Vec<(i64, i64)> = conn
+        .query("SELECT id, val FROM txn_atom")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 100)]);
+
+    drop(conn);
+}
+
 #[tokio::test]
 async fn information_schema_tables() {
     init_tracing();

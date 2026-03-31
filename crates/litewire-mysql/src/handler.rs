@@ -11,6 +11,21 @@ use opensrv_mysql::*;
 use tokio::io::AsyncWrite;
 use tracing::{debug, warn};
 
+/// Build an `OkResponse` with the correct transaction status flag.
+fn ok_response(affected_rows: u64, last_insert_id: u64, in_transaction: bool) -> OkResponse {
+    let status_flags = if in_transaction {
+        StatusFlags::SERVER_STATUS_IN_TRANS
+    } else {
+        StatusFlags::empty()
+    };
+    OkResponse {
+        affected_rows,
+        last_insert_id,
+        status_flags,
+        ..OkResponse::default()
+    }
+}
+
 use crate::types::sqlite_to_mysql_column_type;
 
 /// A cached prepared statement.
@@ -30,6 +45,8 @@ pub struct LiteWireHandler {
     stmts: HashMap<u32, PreparedStmt>,
     /// Next statement ID to assign.
     next_stmt_id: u32,
+    /// Whether the connection is inside an explicit transaction.
+    in_transaction: bool,
 }
 
 impl LiteWireHandler {
@@ -38,6 +55,7 @@ impl LiteWireHandler {
             backend,
             stmts: HashMap::new(),
             next_stmt_id: 1,
+            in_transaction: false,
         }
     }
 
@@ -95,11 +113,36 @@ impl LiteWireHandler {
     ) -> Result<(), std::io::Error> {
         match self.backend.execute(sql, params).await {
             Ok(r) => {
-                let resp = OkResponse {
-                    affected_rows: r.affected_rows,
-                    last_insert_id: r.last_insert_rowid.unwrap_or(0) as u64,
-                    ..OkResponse::default()
-                };
+                let resp = ok_response(
+                    r.affected_rows,
+                    r.last_insert_rowid.unwrap_or(0) as u64,
+                    self.in_transaction,
+                );
+                results.completed(resp).await
+            }
+            Err(e) => {
+                results
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
+                    .await
+            }
+        }
+    }
+
+    /// Execute a transaction command (BEGIN/COMMIT/ROLLBACK) and update state.
+    async fn do_transaction<W: AsyncWrite + Send + Unpin>(
+        &mut self,
+        sql: &str,
+        results: QueryResultWriter<'_, W>,
+    ) -> Result<(), std::io::Error> {
+        match self.backend.execute(sql, &[]).await {
+            Ok(_) => {
+                let upper = sql.trim().to_ascii_uppercase();
+                if upper.starts_with("BEGIN") || upper.starts_with("START") {
+                    self.in_transaction = true;
+                } else if upper.starts_with("COMMIT") || upper.starts_with("ROLLBACK") {
+                    self.in_transaction = false;
+                }
+                let resp = ok_response(0, 0, self.in_transaction);
                 results.completed(resp).await
             }
             Err(e) => {
@@ -244,11 +287,14 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
 
         // Noop statements (empty SQL from SET NAMES etc.)
         if sql.is_empty() {
-            return results.completed(OkResponse::default()).await;
+            return results
+                .completed(ok_response(0, 0, self.in_transaction))
+                .await;
         }
 
         match kind {
             StatementKind::Query => self.do_query(&sql, &values, results).await,
+            StatementKind::Transaction => self.do_transaction(&sql, results).await,
             _ => self.do_execute(&sql, &values, results).await,
         }
     }
@@ -289,6 +335,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
                 let kind = classify(&sqlite_sql);
                 match kind {
                     StatementKind::Query => self.do_query(&sqlite_sql, &[], results).await,
+                    StatementKind::Transaction => {
+                        self.do_transaction(&sqlite_sql, results).await
+                    }
                     _ => self.do_execute(&sqlite_sql, &[], results).await,
                 }
             }

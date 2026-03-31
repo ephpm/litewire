@@ -124,6 +124,26 @@ impl LiteWire {
             }));
         }
 
+        #[cfg(feature = "postgres")]
+        if let Some(addr) = self.postgres_listen {
+            let config = litewire_postgres::PostgresFrontendConfig { listen: addr };
+            let frontend =
+                litewire_postgres::PostgresFrontend::new(config, Arc::clone(&self.backend));
+            handles.push(tokio::spawn(async move {
+                frontend.serve().await.map_err(Into::into)
+            }));
+        }
+
+        #[cfg(feature = "tds")]
+        if let Some(addr) = self.tds_listen {
+            let config = litewire_tds::TdsFrontendConfig { listen: addr };
+            let frontend =
+                litewire_tds::TdsFrontend::new(config, Arc::clone(&self.backend));
+            handles.push(tokio::spawn(async move {
+                frontend.serve().await.map_err(Into::into)
+            }));
+        }
+
         if handles.is_empty() {
             anyhow::bail!("no frontends configured -- enable at least one listener");
         }

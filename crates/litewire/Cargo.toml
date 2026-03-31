@@ -37,5 +37,8 @@ cli = ["dep:clap", "dep:tracing-subscriber"]
 
 [dev-dependencies]
 mysql_async = { workspace = true }
+tokio-postgres = { workspace = true }
+tiberius = { workspace = true }
+tokio-util = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }

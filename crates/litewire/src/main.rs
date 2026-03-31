@@ -29,6 +29,22 @@ struct Cli {
     /// Disable Hrana HTTP frontend.
     #[arg(long)]
     no_hrana: bool,
+
+    /// PostgreSQL frontend listen address.
+    #[arg(long)]
+    postgres_listen: Option<String>,
+
+    /// Disable PostgreSQL frontend.
+    #[arg(long)]
+    no_postgres: bool,
+
+    /// TDS (SQL Server) frontend listen address.
+    #[arg(long)]
+    tds_listen: Option<String>,
+
+    /// Disable TDS frontend.
+    #[arg(long)]
+    no_tds: bool,
 }
 
 #[tokio::main]
@@ -56,6 +72,20 @@ async fn main() -> anyhow::Result<()> {
     if !cli.no_hrana {
         if let Some(ref addr) = cli.hrana_listen {
             builder = builder.hrana(addr);
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    if !cli.no_postgres {
+        if let Some(ref addr) = cli.postgres_listen {
+            builder = builder.postgres(addr);
+        }
+    }
+
+    #[cfg(feature = "tds")]
+    if !cli.no_tds {
+        if let Some(ref addr) = cli.tds_listen {
+            builder = builder.tds(addr);
         }
     }
 
