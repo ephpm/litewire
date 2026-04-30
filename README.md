@@ -135,4 +135,4 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 
 ## License
 
-MIT OR Apache-2.0
+MIT
