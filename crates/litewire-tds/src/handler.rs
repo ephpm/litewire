@@ -512,3 +512,170 @@ async fn send_error<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     token::write_done(&mut resp, token::DONE_FINAL, 0);
     packet::write_message(stream, PacketType::Response, &resp, DEFAULT_PACKET_SIZE).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── decode_utf16le ─────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_utf16le_ascii() {
+        // "Hello" as UTF-16LE
+        let data: Vec<u8> = "Hello"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        assert_eq!(decode_utf16le(&data), Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn decode_utf16le_unicode() {
+        // "café" contains a non-ASCII character
+        let data: Vec<u8> = "caf\u{00E9}"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        assert_eq!(decode_utf16le(&data), Some("caf\u{00E9}".to_string()));
+    }
+
+    #[test]
+    fn decode_utf16le_emoji() {
+        // Emoji requires a surrogate pair in UTF-16
+        let data: Vec<u8> = "\u{1F600}"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        assert_eq!(decode_utf16le(&data), Some("\u{1F600}".to_string()));
+    }
+
+    #[test]
+    fn decode_utf16le_empty() {
+        assert_eq!(decode_utf16le(&[]), Some(String::new()));
+    }
+
+    #[test]
+    fn decode_utf16le_odd_length_returns_none() {
+        // Odd number of bytes cannot be valid UTF-16LE
+        assert_eq!(decode_utf16le(&[0x41]), None);
+        assert_eq!(decode_utf16le(&[0x41, 0x00, 0x42]), None);
+    }
+
+    // ── TdsSession ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn session_new_initial_state() {
+        let session = TdsSession::new();
+        assert!(!session.in_transaction);
+        assert_eq!(session.current_tran_id, 0);
+        assert_eq!(session.next_tran_id, 1);
+    }
+
+    #[test]
+    fn session_begin_sets_transaction() {
+        let mut session = TdsSession::new();
+        let id = session.begin();
+        assert_eq!(id, 1);
+        assert!(session.in_transaction);
+        assert_eq!(session.current_tran_id, 1);
+    }
+
+    #[test]
+    fn session_end_clears_transaction() {
+        let mut session = TdsSession::new();
+        session.begin();
+        let old_id = session.end();
+        assert_eq!(old_id, 1);
+        assert!(!session.in_transaction);
+        assert_eq!(session.current_tran_id, 0);
+    }
+
+    #[test]
+    fn session_multiple_begin_end_cycles() {
+        let mut session = TdsSession::new();
+
+        let id1 = session.begin();
+        assert_eq!(id1, 1);
+        let old1 = session.end();
+        assert_eq!(old1, 1);
+
+        let id2 = session.begin();
+        assert_eq!(id2, 2);
+        assert!(session.in_transaction);
+        assert_eq!(session.current_tran_id, 2);
+
+        let old2 = session.end();
+        assert_eq!(old2, 2);
+        assert!(!session.in_transaction);
+
+        let id3 = session.begin();
+        assert_eq!(id3, 3);
+    }
+
+    #[test]
+    fn session_next_tran_id_increments() {
+        let mut session = TdsSession::new();
+        session.begin();
+        assert_eq!(session.next_tran_id, 2);
+        session.end();
+        session.begin();
+        assert_eq!(session.next_tran_id, 3);
+    }
+
+    // ── skip_all_headers ───────────────────────────────────────────────────
+
+    #[test]
+    fn skip_all_headers_valid() {
+        // total_length = 10 (stored as u32 LE at the start), then 6 bytes of header data
+        let mut payload = vec![0u8; 20];
+        payload[0..4].copy_from_slice(&10u32.to_le_bytes());
+        assert_eq!(skip_all_headers(&payload), 10);
+    }
+
+    #[test]
+    fn skip_all_headers_exact_payload_length() {
+        // total_length equals the entire payload length
+        let mut payload = vec![0u8; 8];
+        payload[0..4].copy_from_slice(&8u32.to_le_bytes());
+        assert_eq!(skip_all_headers(&payload), 8);
+    }
+
+    #[test]
+    fn skip_all_headers_minimum_valid() {
+        // total_length = 4 (minimum valid: just the length field itself)
+        let mut payload = vec![0u8; 10];
+        payload[0..4].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(skip_all_headers(&payload), 4);
+    }
+
+    #[test]
+    fn skip_all_headers_payload_shorter_than_4_bytes() {
+        assert_eq!(skip_all_headers(&[]), 0);
+        assert_eq!(skip_all_headers(&[0x01]), 0);
+        assert_eq!(skip_all_headers(&[0x01, 0x02]), 0);
+        assert_eq!(skip_all_headers(&[0x01, 0x02, 0x03]), 0);
+    }
+
+    #[test]
+    fn skip_all_headers_total_length_exceeds_payload() {
+        // total_length claims 100 bytes but payload is only 10
+        let mut payload = vec![0u8; 10];
+        payload[0..4].copy_from_slice(&100u32.to_le_bytes());
+        assert_eq!(skip_all_headers(&payload), 0);
+    }
+
+    #[test]
+    fn skip_all_headers_total_length_less_than_4() {
+        // total_length = 3 is invalid (< 4), should return 0
+        let mut payload = vec![0u8; 10];
+        payload[0..4].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(skip_all_headers(&payload), 0);
+    }
+
+    #[test]
+    fn skip_all_headers_total_length_zero() {
+        let mut payload = vec![0u8; 10];
+        payload[0..4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(skip_all_headers(&payload), 0);
+    }
+}

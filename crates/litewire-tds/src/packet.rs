@@ -142,3 +142,60 @@ pub async fn write_message<W: AsyncWriteExt + Unpin>(
 
     writer.flush().await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PacketType::from_u8 ────────────────────────────────────────────────
+
+    #[test]
+    fn packet_type_prelogin() {
+        assert_eq!(PacketType::from_u8(0x12), Some(PacketType::PreLogin));
+    }
+
+    #[test]
+    fn packet_type_login7() {
+        assert_eq!(PacketType::from_u8(0x10), Some(PacketType::Login7));
+    }
+
+    #[test]
+    fn packet_type_sql_batch() {
+        assert_eq!(PacketType::from_u8(0x01), Some(PacketType::SqlBatch));
+    }
+
+    #[test]
+    fn packet_type_rpc_request() {
+        assert_eq!(PacketType::from_u8(0x03), Some(PacketType::RpcRequest));
+    }
+
+    #[test]
+    fn packet_type_response() {
+        assert_eq!(PacketType::from_u8(0x04), Some(PacketType::Response));
+    }
+
+    #[test]
+    fn packet_type_invalid_zero() {
+        assert_eq!(PacketType::from_u8(0x00), None);
+    }
+
+    #[test]
+    fn packet_type_invalid_0x02() {
+        assert_eq!(PacketType::from_u8(0x02), None);
+    }
+
+    #[test]
+    fn packet_type_invalid_0xff() {
+        assert_eq!(PacketType::from_u8(0xFF), None);
+    }
+
+    // ── PacketType repr round-trip ─────────────────────────────────────────
+
+    #[test]
+    fn packet_type_round_trip() {
+        for byte in [0x01u8, 0x03, 0x04, 0x10, 0x12] {
+            let pt = PacketType::from_u8(byte).unwrap();
+            assert_eq!(pt as u8, byte);
+        }
+    }
+}
