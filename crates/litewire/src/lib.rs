@@ -157,3 +157,191 @@ impl LiteWire {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory_backend() -> backend::Rusqlite {
+        backend::Rusqlite::memory().unwrap()
+    }
+
+    // ── Builder construction ───────────────────────────────────────────────
+
+    #[test]
+    fn new_does_not_panic() {
+        let _lw = LiteWire::new(memory_backend());
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_builder_returns_self() {
+        let _lw = LiteWire::new(memory_backend()).mysql("127.0.0.1:3306");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_builder_returns_self() {
+        let _lw = LiteWire::new(memory_backend()).postgres("127.0.0.1:5432");
+    }
+
+    #[cfg(feature = "tds")]
+    #[test]
+    fn tds_builder_returns_self() {
+        let _lw = LiteWire::new(memory_backend()).tds("127.0.0.1:1433");
+    }
+
+    #[cfg(feature = "hrana")]
+    #[test]
+    fn hrana_builder_returns_self() {
+        let _lw = LiteWire::new(memory_backend()).hrana("127.0.0.1:8080");
+    }
+
+    #[cfg(all(feature = "mysql", feature = "hrana"))]
+    #[test]
+    fn builder_chaining_mysql_and_hrana() {
+        let _lw = LiteWire::new(memory_backend())
+            .mysql("127.0.0.1:3306")
+            .hrana("127.0.0.1:8080");
+    }
+
+    #[cfg(all(feature = "mysql", feature = "hrana", feature = "postgres", feature = "tds"))]
+    #[test]
+    fn builder_chaining_all_frontends() {
+        let _lw = LiteWire::new(memory_backend())
+            .mysql("127.0.0.1:3306")
+            .postgres("127.0.0.1:5432")
+            .tds("127.0.0.1:1433")
+            .hrana("127.0.0.1:8080");
+    }
+
+    // ── Invalid address handling ───────────────────────────────────────────
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_invalid_address_does_not_panic() {
+        let _lw = LiteWire::new(memory_backend()).mysql("not-an-address");
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_empty_address_does_not_panic() {
+        let _lw = LiteWire::new(memory_backend()).mysql("");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_invalid_address_does_not_panic() {
+        let _lw = LiteWire::new(memory_backend()).postgres("not-an-address");
+    }
+
+    #[cfg(feature = "hrana")]
+    #[test]
+    fn hrana_invalid_address_does_not_panic() {
+        let _lw = LiteWire::new(memory_backend()).hrana("garbage!!!");
+    }
+
+    #[cfg(feature = "tds")]
+    #[test]
+    fn tds_invalid_address_does_not_panic() {
+        let _lw = LiteWire::new(memory_backend()).tds("");
+    }
+
+    /// An invalid address should result in the listener field remaining `None`,
+    /// so `serve()` should treat it as if no frontend was configured.
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    async fn invalid_address_means_no_frontend() {
+        let server = LiteWire::new(memory_backend()).mysql("not-an-address");
+        let result = server.serve().await;
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("no frontends configured"),
+            "expected 'no frontends configured' error, got: {err}",
+        );
+    }
+
+    // ── serve() with no frontends ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn serve_no_frontends_returns_error() {
+        let server = LiteWire::new(memory_backend());
+        let result = server.serve().await;
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("no frontends configured"),
+            "expected 'no frontends configured' error, got: {err}",
+        );
+    }
+
+    // ── serve() smoke tests (server starts and runs) ───────────────────────
+
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    async fn serve_starts_mysql() {
+        let backend = memory_backend();
+        let server = LiteWire::new(backend).mysql("127.0.0.1:0");
+        // serve() should start without immediately erroring.
+        // A timeout means the server is running (it blocks until shutdown).
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.serve(),
+        )
+        .await;
+        assert!(result.is_err(), "should timeout, meaning server is running");
+    }
+
+    #[cfg(feature = "hrana")]
+    #[tokio::test]
+    async fn serve_starts_hrana() {
+        let backend = memory_backend();
+        let server = LiteWire::new(backend).hrana("127.0.0.1:0");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.serve(),
+        )
+        .await;
+        assert!(result.is_err(), "should timeout, meaning server is running");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn serve_starts_postgres() {
+        let backend = memory_backend();
+        let server = LiteWire::new(backend).postgres("127.0.0.1:0");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.serve(),
+        )
+        .await;
+        assert!(result.is_err(), "should timeout, meaning server is running");
+    }
+
+    #[cfg(feature = "tds")]
+    #[tokio::test]
+    async fn serve_starts_tds() {
+        let backend = memory_backend();
+        let server = LiteWire::new(backend).tds("127.0.0.1:0");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.serve(),
+        )
+        .await;
+        assert!(result.is_err(), "should timeout, meaning server is running");
+    }
+
+    #[cfg(all(feature = "mysql", feature = "hrana"))]
+    #[tokio::test]
+    async fn serve_starts_multiple_frontends() {
+        let backend = memory_backend();
+        let server = LiteWire::new(backend)
+            .mysql("127.0.0.1:0")
+            .hrana("127.0.0.1:0");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.serve(),
+        )
+        .await;
+        assert!(result.is_err(), "should timeout, meaning server is running");
+    }
+}
