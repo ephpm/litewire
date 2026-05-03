@@ -32,7 +32,7 @@ libsql SDK (Rust, JS, Python, Go)
 litewire --mysql-listen 127.0.0.1:3306 --db app.db
 
 # Start with all frontends
-litewire --mysql-listen 127.0.0.1:3306 --pg-listen 127.0.0.1:5432 --tds-listen 127.0.0.1:1433 --hrana-listen 127.0.0.1:8080 --db app.db
+litewire --mysql-listen 127.0.0.1:3306 --postgres-listen 127.0.0.1:5432 --tds-listen 127.0.0.1:1433 --hrana-listen 127.0.0.1:8080 --db app.db
 
 # Connect from any MySQL client
 mysql -h 127.0.0.1 -P 3306 -e "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
@@ -86,11 +86,11 @@ async fn main() -> anyhow::Result<()> {
 
 | Backend | Feature flag | Use case |
 |---------|-------------|----------|
-| `rusqlite` | `backend-rusqlite` | Direct in-process SQLite |
-| `libsql` | `backend-libsql` | libSQL (Turso's SQLite fork) via HTTP/Hrana |
+| `Rusqlite` | `backend-rusqlite` | Direct in-process SQLite |
+| `HranaClient` | `backend-hrana-client` | Remote SQLite via the Hrana HTTP protocol (sqld / Turso) |
 | Custom | implement `Backend` trait | Bring your own |
 
-The `libsql` backend connects to [sqld](https://github.com/tursodatabase/libsql) via HTTP, enabling embedded replicas and distributed SQLite clusters.
+The `HranaClient` backend connects to [sqld](https://github.com/tursodatabase/libsql) via HTTP, enabling embedded replicas and distributed SQLite clusters.
 
 ## SQL Translation
 
@@ -98,7 +98,7 @@ litewire translates MySQL and PostgreSQL SQL dialects to SQLite on the fly:
 
 | MySQL / PostgreSQL / T-SQL | SQLite |
 |---------------------------|--------|
-| `AUTO_INCREMENT` / `SERIAL` / `IDENTITY(1,1)` | `INTEGER PRIMARY KEY AUTOINCREMENT` |
+| `AUTO_INCREMENT` / `SERIAL` / `IDENTITY(1,1)` | `INTEGER` (relies on SQLite's rowid alias when combined with `PRIMARY KEY`) |
 | `NOW()` / `GETDATE()` | `datetime('now')` |
 | `ON DUPLICATE KEY UPDATE` | `ON CONFLICT DO UPDATE` |
 | `SHOW TABLES` / `sys.tables` | `SELECT name FROM sqlite_master WHERE type='table'` |
@@ -110,7 +110,7 @@ litewire translates MySQL and PostgreSQL SQL dialects to SQLite on the fly:
 | `SET NAMES utf8mb4` / `SET NOCOUNT ON` | No-op |
 | Backtick / `[bracket]` quoting | Passed through or converted |
 
-See [docs/sql-translation.md](docs/sql-translation.md) for the full translation reference.
+See [docs/architecture.md](docs/architecture.md) for the full translation reference.
 
 ## Tested With
 
