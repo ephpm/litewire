@@ -428,4 +428,291 @@ mod tests {
             other => panic!("expected Other error, got: {other:?}"),
         }
     }
+
+    // ── value_to_hrana: Float (was missing) ─────────────────────────────────
+
+    #[test]
+    fn value_to_hrana_float() {
+        match value_to_hrana(&Value::Float(3.14)) {
+            HranaValue::Float { value } => {
+                assert!((value - 3.14).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Float, got: {other:?}"),
+        }
+    }
+
+    // ── value_to_hrana: edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn value_to_hrana_integer_max() {
+        match value_to_hrana(&Value::Integer(i64::MAX)) {
+            HranaValue::Integer { value } => assert_eq!(value, i64::MAX.to_string()),
+            other => panic!("expected Integer, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_to_hrana_integer_min() {
+        match value_to_hrana(&Value::Integer(i64::MIN)) {
+            HranaValue::Integer { value } => {
+                assert_eq!(value, i64::MIN.to_string());
+                assert!(value.starts_with('-'));
+            }
+            other => panic!("expected Integer, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_to_hrana_integer_zero() {
+        match value_to_hrana(&Value::Integer(0)) {
+            HranaValue::Integer { value } => assert_eq!(value, "0"),
+            other => panic!("expected Integer, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_to_hrana_empty_text() {
+        match value_to_hrana(&Value::Text(String::new())) {
+            HranaValue::Text { value } => assert_eq!(value, ""),
+            other => panic!("expected Text, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_to_hrana_empty_blob() {
+        match value_to_hrana(&Value::Blob(vec![])) {
+            HranaValue::Blob { base64: b64 } => assert_eq!(b64, ""),
+            other => panic!("expected Blob, got: {other:?}"),
+        }
+    }
+
+    // ── response_value_to_backend: edge cases ───────────────────────────────
+
+    #[test]
+    fn response_value_integer_non_numeric_defaults_to_zero() {
+        let rv = ResponseValue::Integer {
+            value: "abc".into(),
+        };
+        let val = response_value_to_backend(&rv);
+        assert_eq!(val, Value::Integer(0));
+    }
+
+    #[test]
+    fn response_value_integer_overflow_defaults_to_zero() {
+        let rv = ResponseValue::Integer {
+            value: "99999999999999999999".into(),
+        };
+        let val = response_value_to_backend(&rv);
+        assert_eq!(val, Value::Integer(0));
+    }
+
+    #[test]
+    fn response_value_integer_negative() {
+        let rv = ResponseValue::Integer {
+            value: "-42".into(),
+        };
+        let val = response_value_to_backend(&rv);
+        assert_eq!(val, Value::Integer(-42));
+    }
+
+    #[test]
+    fn response_value_integer_empty_string_defaults_to_zero() {
+        let rv = ResponseValue::Integer {
+            value: String::new(),
+        };
+        let val = response_value_to_backend(&rv);
+        assert_eq!(val, Value::Integer(0));
+    }
+
+    #[test]
+    fn response_value_blob_invalid_base64_defaults_to_empty() {
+        let rv = ResponseValue::Blob {
+            base64: "!!!not-valid-base64!!!".into(),
+        };
+        let val = response_value_to_backend(&rv);
+        assert_eq!(val, Value::Blob(vec![]));
+    }
+
+    #[test]
+    fn response_value_blob_valid_base64() {
+        use base64::Engine;
+        let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let rv = ResponseValue::Blob { base64: b64 };
+        let val = response_value_to_backend(&rv);
+        assert_eq!(val, Value::Blob(data));
+    }
+
+    #[test]
+    fn response_value_empty_text() {
+        let rv = ResponseValue::Text {
+            value: String::new(),
+        };
+        let val = response_value_to_backend(&rv);
+        assert_eq!(val, Value::Text(String::new()));
+    }
+
+    // ── execute_response_to_result_set: edge cases ──────────────────────────
+
+    #[test]
+    fn execute_response_empty_rows_nonempty_columns() {
+        let exec = ExecuteResponse {
+            cols: vec![
+                ColResponse {
+                    name: "id".into(),
+                    decltype: Some("INTEGER".into()),
+                },
+                ColResponse {
+                    name: "name".into(),
+                    decltype: Some("TEXT".into()),
+                },
+            ],
+            rows: vec![],
+            affected_row_count: 0,
+            last_insert_rowid: None,
+        };
+        let rs = execute_response_to_result_set(exec);
+        assert_eq!(rs.columns.len(), 2);
+        assert!(rs.rows.is_empty());
+    }
+
+    #[test]
+    fn execute_response_empty_columns_and_rows() {
+        let exec = ExecuteResponse {
+            cols: vec![],
+            rows: vec![],
+            affected_row_count: 0,
+            last_insert_rowid: None,
+        };
+        let rs = execute_response_to_result_set(exec);
+        assert!(rs.columns.is_empty());
+        assert!(rs.rows.is_empty());
+    }
+
+    #[test]
+    fn execute_response_rows_with_null_values() {
+        let exec = ExecuteResponse {
+            cols: vec![
+                ColResponse {
+                    name: "a".into(),
+                    decltype: None,
+                },
+                ColResponse {
+                    name: "b".into(),
+                    decltype: None,
+                },
+            ],
+            rows: vec![vec![ResponseValue::Null, ResponseValue::Null]],
+            affected_row_count: 0,
+            last_insert_rowid: None,
+        };
+        let rs = execute_response_to_result_set(exec);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], Value::Null);
+        assert_eq!(rs.rows[0][1], Value::Null);
+    }
+
+    #[test]
+    fn execute_response_mixed_value_types_in_row() {
+        let exec = ExecuteResponse {
+            cols: vec![
+                ColResponse {
+                    name: "a".into(),
+                    decltype: None,
+                },
+                ColResponse {
+                    name: "b".into(),
+                    decltype: None,
+                },
+                ColResponse {
+                    name: "c".into(),
+                    decltype: None,
+                },
+                ColResponse {
+                    name: "d".into(),
+                    decltype: None,
+                },
+                ColResponse {
+                    name: "e".into(),
+                    decltype: None,
+                },
+            ],
+            rows: vec![vec![
+                ResponseValue::Null,
+                ResponseValue::Integer {
+                    value: "7".into(),
+                },
+                ResponseValue::Float { value: 2.5 },
+                ResponseValue::Text {
+                    value: "hello".into(),
+                },
+                ResponseValue::Blob {
+                    base64: "AAEC".into(), // [0, 1, 2]
+                },
+            ]],
+            affected_row_count: 0,
+            last_insert_rowid: None,
+        };
+        let rs = execute_response_to_result_set(exec);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], Value::Null);
+        assert_eq!(rs.rows[0][1], Value::Integer(7));
+        assert_eq!(rs.rows[0][2], Value::Float(2.5));
+        assert_eq!(rs.rows[0][3], Value::Text("hello".into()));
+        assert_eq!(rs.rows[0][4], Value::Blob(vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn execute_response_column_decltype_none() {
+        let exec = ExecuteResponse {
+            cols: vec![ColResponse {
+                name: "expr".into(),
+                decltype: None,
+            }],
+            rows: vec![vec![ResponseValue::Integer {
+                value: "1".into(),
+            }]],
+            affected_row_count: 0,
+            last_insert_rowid: None,
+        };
+        let rs = execute_response_to_result_set(exec);
+        assert!(rs.columns[0].decltype.is_none());
+    }
+
+    // ── HranaClient::new() URL handling ─────────────────────────────────────
+
+    #[test]
+    fn hrana_client_url_trailing_slash_trimmed() {
+        let client = HranaClient::new("http://localhost:8081/");
+        assert_eq!(client.pipeline_url, "http://localhost:8081/v2/pipeline");
+        assert_eq!(client.health_url, "http://localhost:8081/health");
+    }
+
+    #[test]
+    fn hrana_client_url_no_trailing_slash() {
+        let client = HranaClient::new("http://localhost:8081");
+        assert_eq!(client.pipeline_url, "http://localhost:8081/v2/pipeline");
+        assert_eq!(client.health_url, "http://localhost:8081/health");
+    }
+
+    #[test]
+    fn hrana_client_url_multiple_trailing_slashes_trimmed() {
+        let client = HranaClient::new("http://localhost:8081///");
+        assert_eq!(client.pipeline_url, "http://localhost:8081/v2/pipeline");
+        assert_eq!(client.health_url, "http://localhost:8081/health");
+    }
+
+    // ── hrana_error_to_backend: additional cases ────────────────────────────
+
+    #[test]
+    fn hrana_error_with_non_sqlite_code() {
+        let err = hrana_error_to_backend(ErrorResponse {
+            message: "something else".into(),
+            code: Some("INTERNAL_ERROR".into()),
+        });
+        match err {
+            BackendError::Other(msg) => assert_eq!(msg, "something else"),
+            other => panic!("expected Other error, got: {other:?}"),
+        }
+    }
 }

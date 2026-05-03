@@ -405,4 +405,353 @@ mod tests {
         assert_eq!(rs.rows[0][0], Value::Integer(1));
         assert_eq!(rs.rows[0][1], Value::Text("hello".into()));
     }
+
+    // ── Concurrent / sequential operations ──────────────────────────────────
+
+    #[tokio::test]
+    async fn query_execute_query_sequential() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap();
+
+        // Query empty table
+        let rs = backend.query("SELECT * FROM t", &[]).await.unwrap();
+        assert!(rs.rows.is_empty());
+
+        // Insert a row
+        backend
+            .execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                &[Value::Integer(1), Value::Text("first".into())],
+            )
+            .await
+            .unwrap();
+
+        // Query again and see the new row
+        let rs = backend.query("SELECT * FROM t", &[]).await.unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][1], Value::Text("first".into()));
+
+        // Insert another row
+        backend
+            .execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                &[Value::Integer(2), Value::Text("second".into())],
+            )
+            .await
+            .unwrap();
+
+        // Verify both rows exist
+        let rs = backend
+            .query("SELECT * FROM t ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rs.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn explicit_integer_primary_key_rowid() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap();
+
+        // Insert with an explicit id of 42
+        let result = backend
+            .execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                &[Value::Integer(42), Value::Text("at 42".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.last_insert_rowid, Some(42));
+
+        // Insert with an explicit id of 100
+        let result = backend
+            .execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                &[Value::Integer(100), Value::Text("at 100".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.last_insert_rowid, Some(100));
+    }
+
+    // ── Edge case values ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn integer_extremes() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (v INTEGER)", &[])
+            .await
+            .unwrap();
+
+        for val in [i64::MIN, i64::MAX, 0] {
+            backend
+                .execute("INSERT INTO t VALUES (?1)", &[Value::Integer(val)])
+                .await
+                .unwrap();
+        }
+
+        let rs = backend.query("SELECT v FROM t ORDER BY rowid", &[]).await.unwrap();
+        assert_eq!(rs.rows[0][0], Value::Integer(i64::MIN));
+        assert_eq!(rs.rows[1][0], Value::Integer(i64::MAX));
+        assert_eq!(rs.rows[2][0], Value::Integer(0));
+    }
+
+    #[tokio::test]
+    async fn float_extremes() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (v REAL)", &[])
+            .await
+            .unwrap();
+
+        for val in [f64::MIN, f64::MAX, f64::MIN_POSITIVE] {
+            backend
+                .execute("INSERT INTO t VALUES (?1)", &[Value::Float(val)])
+                .await
+                .unwrap();
+        }
+
+        let rs = backend.query("SELECT v FROM t ORDER BY rowid", &[]).await.unwrap();
+        assert_eq!(rs.rows[0][0], Value::Float(f64::MIN));
+        assert_eq!(rs.rows[1][0], Value::Float(f64::MAX));
+        assert_eq!(rs.rows[2][0], Value::Float(f64::MIN_POSITIVE));
+    }
+
+    #[tokio::test]
+    async fn empty_text_roundtrip() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (v TEXT)", &[])
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO t VALUES (?1)", &[Value::Text(String::new())])
+            .await
+            .unwrap();
+
+        let rs = backend.query("SELECT v FROM t", &[]).await.unwrap();
+        assert_eq!(rs.rows[0][0], Value::Text(String::new()));
+    }
+
+    #[tokio::test]
+    async fn empty_blob_roundtrip() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (v BLOB)", &[])
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO t VALUES (?1)", &[Value::Blob(vec![])])
+            .await
+            .unwrap();
+
+        let rs = backend.query("SELECT v FROM t", &[]).await.unwrap();
+        assert_eq!(rs.rows[0][0], Value::Blob(vec![]));
+    }
+
+    #[tokio::test]
+    async fn large_text_roundtrip() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (v TEXT)", &[])
+            .await
+            .unwrap();
+
+        let large = "x".repeat(10_000);
+        backend
+            .execute(
+                "INSERT INTO t VALUES (?1)",
+                &[Value::Text(large.clone())],
+            )
+            .await
+            .unwrap();
+
+        let rs = backend.query("SELECT v FROM t", &[]).await.unwrap();
+        assert_eq!(rs.rows[0][0], Value::Text(large));
+    }
+
+    #[tokio::test]
+    async fn large_blob_roundtrip() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (v BLOB)", &[])
+            .await
+            .unwrap();
+
+        let large: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        backend
+            .execute(
+                "INSERT INTO t VALUES (?1)",
+                &[Value::Blob(large.clone())],
+            )
+            .await
+            .unwrap();
+
+        let rs = backend.query("SELECT v FROM t", &[]).await.unwrap();
+        assert_eq!(rs.rows[0][0], Value::Blob(large));
+    }
+
+    #[tokio::test]
+    async fn text_with_special_characters() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (v TEXT)", &[])
+            .await
+            .unwrap();
+
+        let specials = vec![
+            "hello\0world",        // null byte
+            "こんにちは",           // Japanese
+            "🎉🚀💯",             // emoji
+            "café résumé naïve",   // accented
+            "line1\nline2\ttab",   // newline and tab
+            "'quotes' and \"double\"", // quotes
+        ];
+
+        for s in &specials {
+            backend
+                .execute(
+                    "INSERT INTO t VALUES (?1)",
+                    &[Value::Text(s.to_string())],
+                )
+                .await
+                .unwrap();
+        }
+
+        let rs = backend.query("SELECT v FROM t ORDER BY rowid", &[]).await.unwrap();
+        for (i, s) in specials.iter().enumerate() {
+            assert_eq!(rs.rows[i][0], Value::Text(s.to_string()));
+        }
+    }
+
+    // ── Mixed types in a single row ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn insert_all_types_in_one_row() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute(
+                "CREATE TABLE t (a, b INTEGER, c REAL, d TEXT, e BLOB)",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        backend
+            .execute(
+                "INSERT INTO t VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    Value::Null,
+                    Value::Integer(99),
+                    Value::Float(1.5),
+                    Value::Text("mixed".into()),
+                    Value::Blob(vec![0xAB, 0xCD]),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rs = backend.query("SELECT * FROM t", &[]).await.unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], Value::Null);
+        assert_eq!(rs.rows[0][1], Value::Integer(99));
+        assert_eq!(rs.rows[0][2], Value::Float(1.5));
+        assert_eq!(rs.rows[0][3], Value::Text("mixed".into()));
+        assert_eq!(rs.rows[0][4], Value::Blob(vec![0xAB, 0xCD]));
+    }
+
+    // ── Error cases ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn query_nonexistent_table() {
+        let backend = Rusqlite::memory().unwrap();
+        let result = backend.query("SELECT * FROM nonexistent_table", &[]).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("no such table"),
+            "expected 'no such table' in error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_wrong_param_count() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (a INTEGER, b TEXT)", &[])
+            .await
+            .unwrap();
+
+        // Provide 3 params when only 2 are expected
+        let result = backend
+            .execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                &[
+                    Value::Integer(1),
+                    Value::Text("hello".into()),
+                    Value::Integer(99),
+                ],
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_sql_syntax_error() {
+        let backend = Rusqlite::memory().unwrap();
+        let result = backend.execute("INSERT INTO VALUES ()", &[]).await;
+        assert!(result.is_err());
+    }
+
+    // ── UPDATE and DELETE affected_rows ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_affected_rows() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (id INTEGER, v TEXT)", &[])
+            .await
+            .unwrap();
+
+        for i in 0..3 {
+            backend
+                .execute(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    &[Value::Integer(i), Value::Text("same".into())],
+                )
+                .await
+                .unwrap();
+        }
+
+        let result = backend
+            .execute(
+                "UPDATE t SET v = ?1 WHERE v = ?2",
+                &[Value::Text("changed".into()), Value::Text("same".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.affected_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn delete_no_matching_rows() {
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (id INTEGER)", &[])
+            .await
+            .unwrap();
+
+        let result = backend
+            .execute("DELETE FROM t WHERE id = ?1", &[Value::Integer(999)])
+            .await
+            .unwrap();
+        assert_eq!(result.affected_rows, 0);
+    }
 }
