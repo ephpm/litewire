@@ -299,16 +299,26 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
             .split_ascii_whitespace()
             .nth(1)
             .map(|s| {
-                s.trim_matches('\'')
-                    .trim_matches('"')
-                    .trim_end_matches(';')
-                    .to_string()
+                sanitize_identifier(
+                    s.trim_matches('\'')
+                        .trim_matches('"')
+                        .trim_end_matches(';'),
+                )
             })
             .unwrap_or_default();
         return Some(MetadataQuery::SysColumns { table });
     }
 
     None
+}
+
+/// Sanitize an identifier (table or schema name) by stripping any character
+/// that isn't alphanumeric, underscore, or period. This prevents SQL injection
+/// when identifiers are interpolated into generated SQL via `format!()`.
+fn sanitize_identifier(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+        .collect()
 }
 
 /// Extract a simple `column = 'value'` filter from a WHERE clause.
@@ -338,13 +348,12 @@ fn extract_where_value_original(original_sql: &str, column: &str) -> Option<Stri
     if let Some(pos) = upper.find(&pattern) {
         let after = &original_sql[pos + pattern.len()..];
         let after_trimmed = after.trim_start();
-        let trim_offset = after.len() - after_trimmed.len();
         let after = after_trimmed;
         if after.starts_with('\'') || after.starts_with('"') {
             let quote = after.as_bytes()[0] as char;
             let rest = &after[1..];
             if let Some(end) = rest.find(quote) {
-                return Some(rest[..end].to_string());
+                return Some(sanitize_identifier(&rest[..end]));
             }
         }
     }
@@ -361,13 +370,14 @@ fn extract_table_name(upper_rest: &str, original: &str) -> String {
     let orig_word = orig_rest.split_ascii_whitespace().next().unwrap_or(word);
 
     // Strip backticks, double quotes, brackets.
-    orig_word
+    let raw = orig_word
         .trim_matches('`')
         .trim_matches('"')
         .trim_matches('[')
         .trim_end_matches(']')
-        .trim_end_matches(';')
-        .to_string()
+        .trim_end_matches(';');
+
+    sanitize_identifier(raw)
 }
 
 #[cfg(test)]
@@ -910,6 +920,83 @@ mod tests {
         assert!(
             matches!(q, Some(MetadataQuery::SysColumns { .. })),
             "got: {q:?}"
+        );
+    }
+
+    // ── SQL injection sanitization ────────────────────────────────────────
+
+    #[test]
+    fn table_name_injection_sanitized() {
+        let q = detect_metadata_query(
+            "DESCRIBE users'; DROP TABLE x; --",
+            Dialect::MySQL,
+        );
+        match q {
+            Some(MetadataQuery::ShowColumns { table }) => {
+                assert!(!table.contains('\''), "quote not stripped: {table}");
+                assert!(!table.contains(';'), "semicolon not stripped: {table}");
+                assert!(!table.contains('-'), "dash not stripped: {table}");
+            }
+            other => panic!("should detect as ShowColumns, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_filter_injection_sanitized() {
+        let q = detect_metadata_query(
+            "SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'main'; DROP TABLE x'",
+            Dialect::MySQL,
+        );
+        match q {
+            Some(MetadataQuery::InformationSchemaTables { schema_filter }) => {
+                if let Some(schema) = &schema_filter {
+                    assert!(!schema.contains(';'), "semicolon not stripped: {schema}");
+                    assert!(!schema.contains('\''), "quote not stripped: {schema}");
+                    assert!(!schema.contains('-'), "dash not stripped: {schema}");
+                }
+            }
+            other => panic!("expected InformationSchemaTables, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normal_identifiers_unchanged() {
+        // Simple underscore name
+        let q = detect_metadata_query("DESCRIBE my_table", Dialect::MySQL);
+        assert!(
+            matches!(q, Some(MetadataQuery::ShowColumns { ref table }) if table == "my_table"),
+            "got: {q:?}"
+        );
+
+        // Mixed case with digits
+        let q = detect_metadata_query("DESCRIBE MyTable123", Dialect::MySQL);
+        assert!(
+            matches!(q, Some(MetadataQuery::ShowColumns { ref table }) if table == "MyTable123"),
+            "got: {q:?}"
+        );
+
+        // Dot-separated (schema.table)
+        let q = detect_metadata_query("DESCRIBE schema.table", Dialect::MySQL);
+        assert!(
+            matches!(q, Some(MetadataQuery::ShowColumns { ref table }) if table == "schema.table"),
+            "got: {q:?}"
+        );
+    }
+
+    #[test]
+    fn generated_sql_safe_from_injection() {
+        let q = detect_metadata_query(
+            "DESCRIBE users'; DROP TABLE sqlite_master; --",
+            Dialect::MySQL,
+        );
+        let sql = q.unwrap().to_sqlite_sql();
+        assert!(
+            !sql.contains(';'),
+            "generated SQL contains semicolon: {sql}"
+        );
+        assert!(
+            !sql.contains("--"),
+            "generated SQL contains comment marker: {sql}"
         );
     }
 }
