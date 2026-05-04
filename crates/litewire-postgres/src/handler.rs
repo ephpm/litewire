@@ -481,3 +481,345 @@ impl ExtendedQueryHandler for PostgresHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use pgwire::api::portal::{Format, Portal};
+    use pgwire::api::results::{FieldFormat, FieldInfo};
+    use pgwire::api::stmt::StoredStatement;
+
+    // ── value_to_pg_type ───────────────────────────────────────────────────
+
+    #[test]
+    fn value_to_pg_type_null() {
+        assert_eq!(value_to_pg_type(&Value::Null), Type::TEXT);
+    }
+
+    #[test]
+    fn value_to_pg_type_integer() {
+        assert_eq!(value_to_pg_type(&Value::Integer(42)), Type::INT8);
+    }
+
+    #[test]
+    fn value_to_pg_type_float() {
+        assert_eq!(value_to_pg_type(&Value::Float(3.14)), Type::FLOAT8);
+    }
+
+    #[test]
+    fn value_to_pg_type_text() {
+        assert_eq!(
+            value_to_pg_type(&Value::Text("hello".into())),
+            Type::TEXT
+        );
+    }
+
+    #[test]
+    fn value_to_pg_type_blob() {
+        assert_eq!(
+            value_to_pg_type(&Value::Blob(vec![1, 2, 3])),
+            Type::BYTEA
+        );
+    }
+
+    // ── encode_value ───────────────────────────────────────────────────────
+
+    /// Helper: create a single-column schema and encode one value into it.
+    fn encode_single(val: &Value, pg_type: Type) -> PgWireResult<()> {
+        let field = FieldInfo::new(
+            "col".into(),
+            None,
+            None,
+            pg_type.clone(),
+            FieldFormat::Binary,
+        );
+        let schema = Arc::new(vec![FieldInfo::new(
+            "col".into(),
+            None,
+            None,
+            pg_type,
+            FieldFormat::Binary,
+        )]);
+        let mut encoder = DataRowEncoder::new(schema);
+        encode_value(&mut encoder, val, &field)?;
+        let _row = encoder.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn encode_null() {
+        encode_single(&Value::Null, Type::TEXT).expect("encoding null should succeed");
+    }
+
+    #[test]
+    fn encode_integer() {
+        encode_single(&Value::Integer(42), Type::INT8)
+            .expect("encoding integer should succeed");
+    }
+
+    #[test]
+    fn encode_negative_integer() {
+        encode_single(&Value::Integer(-100), Type::INT8)
+            .expect("encoding negative integer should succeed");
+    }
+
+    #[test]
+    fn encode_float() {
+        encode_single(&Value::Float(3.14), Type::FLOAT8)
+            .expect("encoding float should succeed");
+    }
+
+    #[test]
+    fn encode_text() {
+        encode_single(&Value::Text("hello world".into()), Type::TEXT)
+            .expect("encoding text should succeed");
+    }
+
+    #[test]
+    fn encode_empty_text() {
+        encode_single(&Value::Text(String::new()), Type::TEXT)
+            .expect("encoding empty text should succeed");
+    }
+
+    #[test]
+    fn encode_blob() {
+        encode_single(&Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]), Type::BYTEA)
+            .expect("encoding blob should succeed");
+    }
+
+    #[test]
+    fn encode_empty_blob() {
+        encode_single(&Value::Blob(vec![]), Type::BYTEA)
+            .expect("encoding empty blob should succeed");
+    }
+
+    #[test]
+    fn encode_bool_true() {
+        // Integer 1 with BOOL type should encode as true.
+        encode_single(&Value::Integer(1), Type::BOOL)
+            .expect("encoding bool true should succeed");
+    }
+
+    #[test]
+    fn encode_bool_false() {
+        // Integer 0 with BOOL type should encode as false.
+        encode_single(&Value::Integer(0), Type::BOOL)
+            .expect("encoding bool false should succeed");
+    }
+
+    #[test]
+    fn encode_bool_nonzero() {
+        // Any nonzero integer with BOOL type should encode as true.
+        encode_single(&Value::Integer(42), Type::BOOL)
+            .expect("encoding nonzero bool should succeed");
+    }
+
+    // ── extract_params ─────────────────────────────────────────────────────
+
+    /// Helper: build a Portal with given parameter types and binary parameter bytes.
+    fn make_portal(
+        param_types: Vec<Type>,
+        parameters: Vec<Option<Bytes>>,
+    ) -> Portal<String> {
+        let stmt = Arc::new(StoredStatement::new(
+            String::new(),
+            String::new(),
+            param_types,
+        ));
+        let mut portal = Portal::<String>::default();
+        portal.statement = stmt;
+        portal.parameter_format = Format::UnifiedBinary;
+        portal.parameters = parameters;
+        portal
+    }
+
+    #[test]
+    fn extract_params_bool_true() {
+        let portal = make_portal(
+            vec![Type::BOOL],
+            vec![Some(Bytes::from_static(&[1]))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Integer(1)]);
+    }
+
+    #[test]
+    fn extract_params_bool_false() {
+        let portal = make_portal(
+            vec![Type::BOOL],
+            vec![Some(Bytes::from_static(&[0]))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Integer(0)]);
+    }
+
+    #[test]
+    fn extract_params_int2() {
+        let portal = make_portal(
+            vec![Type::INT2],
+            vec![Some(Bytes::from(42_i16.to_be_bytes().to_vec()))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Integer(42)]);
+    }
+
+    #[test]
+    fn extract_params_int4() {
+        let portal = make_portal(
+            vec![Type::INT4],
+            vec![Some(Bytes::from(1000_i32.to_be_bytes().to_vec()))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Integer(1000)]);
+    }
+
+    #[test]
+    fn extract_params_int8() {
+        let portal = make_portal(
+            vec![Type::INT8],
+            vec![Some(Bytes::from(
+                i64::MAX.to_be_bytes().to_vec(),
+            ))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Integer(i64::MAX)]);
+    }
+
+    #[test]
+    fn extract_params_int8_negative() {
+        let portal = make_portal(
+            vec![Type::INT8],
+            vec![Some(Bytes::from((-99_i64).to_be_bytes().to_vec()))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Integer(-99)]);
+    }
+
+    #[test]
+    fn extract_params_float4() {
+        let portal = make_portal(
+            vec![Type::FLOAT4],
+            vec![Some(Bytes::from(
+                2.5_f32.to_be_bytes().to_vec(),
+            ))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Float(2.5)]);
+    }
+
+    #[test]
+    fn extract_params_float8() {
+        let portal = make_portal(
+            vec![Type::FLOAT8],
+            vec![Some(Bytes::from(
+                3.14_f64.to_be_bytes().to_vec(),
+            ))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Float(3.14)]);
+    }
+
+    #[test]
+    fn extract_params_text() {
+        let portal = make_portal(
+            vec![Type::TEXT],
+            vec![Some(Bytes::from("hello"))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Text("hello".into())]);
+    }
+
+    #[test]
+    fn extract_params_bytea() {
+        let data = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        let portal = make_portal(
+            vec![Type::BYTEA],
+            vec![Some(Bytes::from(data.clone()))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Blob(data)]);
+    }
+
+    #[test]
+    fn extract_params_null() {
+        let portal = make_portal(vec![Type::TEXT], vec![None]);
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Null]);
+    }
+
+    #[test]
+    fn extract_params_null_int() {
+        let portal = make_portal(vec![Type::INT8], vec![None]);
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Null]);
+    }
+
+    #[test]
+    fn extract_params_unknown_type_defaults_to_text() {
+        // VARCHAR is not explicitly handled, so it should fall through to the
+        // default TEXT branch.
+        let portal = make_portal(
+            vec![Type::VARCHAR],
+            vec![Some(Bytes::from("fallback"))],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(params, vec![Value::Text("fallback".into())]);
+    }
+
+    #[test]
+    fn extract_params_multiple() {
+        let portal = make_portal(
+            vec![Type::INT8, Type::TEXT, Type::BOOL],
+            vec![
+                Some(Bytes::from(7_i64.to_be_bytes().to_vec())),
+                Some(Bytes::from("world")),
+                Some(Bytes::from_static(&[1])),
+            ],
+        );
+        let params = extract_params(&portal);
+        assert_eq!(
+            params,
+            vec![
+                Value::Integer(7),
+                Value::Text("world".into()),
+                Value::Integer(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_params_empty() {
+        let portal = make_portal(vec![], vec![]);
+        let params = extract_params(&portal);
+        assert!(params.is_empty());
+    }
+
+    // ── pg_error ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn pg_error_produces_user_error() {
+        let err = pg_error("something went wrong");
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.severity, "ERROR");
+                assert_eq!(info.code, "XX000");
+                assert_eq!(info.message, "something went wrong");
+            }
+            other => panic!("expected UserError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg_error_empty_message() {
+        let err = pg_error("");
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.message, "");
+            }
+            other => panic!("expected UserError, got: {other:?}"),
+        }
+    }
+}
