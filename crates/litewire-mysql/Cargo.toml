@@ -14,3 +14,7 @@ opensrv-mysql = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+litewire-backend = { workspace = true, features = ["rusqlite"] }
+tokio = { workspace = true, features = ["full"] }

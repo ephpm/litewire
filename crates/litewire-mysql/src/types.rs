@@ -157,4 +157,169 @@ mod tests {
             ColumnType::MYSQL_TYPE_BLOB
         );
     }
+
+    // ── Edge case tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn type_mapping_empty_string() {
+        // An empty string has no keyword matches, falls through to default.
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("")),
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
+    #[test]
+    fn type_mapping_whitespace_only() {
+        // Whitespace-only string does not contain any type keywords.
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("   ")),
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
+    #[test]
+    fn type_mapping_integer_with_extra_whitespace() {
+        // uppercased "  INTEGER  " still contains "INT".
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("  INTEGER  ")),
+            ColumnType::MYSQL_TYPE_LONGLONG
+        );
+    }
+
+    #[test]
+    fn type_mapping_text_with_extra_whitespace() {
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("  TEXT  ")),
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
+    #[test]
+    fn type_mapping_blob_with_extra_whitespace() {
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("  BLOB  ")),
+            ColumnType::MYSQL_TYPE_BLOB
+        );
+    }
+
+    #[test]
+    fn type_mapping_real_with_extra_whitespace() {
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("  REAL  ")),
+            ColumnType::MYSQL_TYPE_DOUBLE
+        );
+    }
+
+    #[test]
+    fn type_mapping_clob() {
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("CLOB")),
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
+    #[test]
+    fn type_mapping_mediumint() {
+        // "MEDIUMINT" contains "INT"
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("MEDIUMINT")),
+            ColumnType::MYSQL_TYPE_LONGLONG
+        );
+    }
+
+    #[test]
+    fn type_mapping_smallint() {
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("SMALLINT")),
+            ColumnType::MYSQL_TYPE_LONGLONG
+        );
+    }
+
+    #[test]
+    fn type_mapping_tinyblob() {
+        // "TINYBLOB" contains "BLOB"
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("TINYBLOB")),
+            ColumnType::MYSQL_TYPE_BLOB
+        );
+    }
+
+    #[test]
+    fn type_mapping_mediumblob() {
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("MEDIUMBLOB")),
+            ColumnType::MYSQL_TYPE_BLOB
+        );
+    }
+
+    #[test]
+    fn type_mapping_longblob() {
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("LONGBLOB")),
+            ColumnType::MYSQL_TYPE_BLOB
+        );
+    }
+
+    #[test]
+    fn type_mapping_mixed_case_varchar() {
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("VarChar(100)")),
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
+    #[test]
+    fn type_mapping_nchar() {
+        // "NCHAR" contains "CHAR"
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("NCHAR(10)")),
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
+    #[test]
+    fn type_mapping_nvarchar() {
+        // "NVARCHAR" contains "VARCHAR"
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("NVARCHAR(255)")),
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
+    #[test]
+    fn type_mapping_numeric_falls_to_default() {
+        // "NUMERIC" does not contain INT, REAL, FLOAT, DOUBLE, BLOB, TEXT,
+        // CHAR, CLOB, or VARCHAR -- falls to default.
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("NUMERIC")),
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
+    #[test]
+    fn type_mapping_boolean_falls_to_default() {
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("BOOLEAN")),
+            ColumnType::MYSQL_TYPE_VAR_STRING
+        );
+    }
+
+    #[test]
+    fn type_mapping_bytea_case_insensitive() {
+        // "bytea" uppercases to "BYTEA" which is checked with ==
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("bytea")),
+            ColumnType::MYSQL_TYPE_BLOB
+        );
+    }
+
+    #[test]
+    fn type_mapping_int_priority_over_later_checks() {
+        // "INT" is checked first, so "MEDIUMINT UNSIGNED" still hits INT.
+        assert_eq!(
+            sqlite_to_mysql_column_type(Some("MEDIUMINT UNSIGNED")),
+            ColumnType::MYSQL_TYPE_LONGLONG
+        );
+    }
 }
