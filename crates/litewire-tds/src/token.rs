@@ -418,3 +418,217 @@ pub fn write_done(buf: &mut BytesMut, status: u16, row_count: u64) {
     buf.put_u16_le(0); // CurCmd
     buf.put_u64_le(row_count); // DoneRowCount (8 bytes in TDS 7.2+)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litewire_backend::Column;
+
+    // ── sqlite_to_tds_type ─────────────────────────────────────────────────
+
+    #[test]
+    fn sqlite_type_none_defaults_to_nvarchar() {
+        assert!(matches!(sqlite_to_tds_type(None), TdsType::NVarChar));
+    }
+
+    #[test]
+    fn sqlite_type_integer() {
+        assert!(matches!(sqlite_to_tds_type(Some("INTEGER")), TdsType::BigInt));
+    }
+
+    #[test]
+    fn sqlite_type_int() {
+        assert!(matches!(sqlite_to_tds_type(Some("INT")), TdsType::BigInt));
+    }
+
+    #[test]
+    fn sqlite_type_bigint() {
+        assert!(matches!(sqlite_to_tds_type(Some("BIGINT")), TdsType::BigInt));
+    }
+
+    #[test]
+    fn sqlite_type_boolean() {
+        assert!(matches!(sqlite_to_tds_type(Some("BOOLEAN")), TdsType::BigInt));
+    }
+
+    #[test]
+    fn sqlite_type_bit() {
+        assert!(matches!(sqlite_to_tds_type(Some("BIT")), TdsType::BigInt));
+    }
+
+    #[test]
+    fn sqlite_type_real() {
+        assert!(matches!(sqlite_to_tds_type(Some("REAL")), TdsType::Float8));
+    }
+
+    #[test]
+    fn sqlite_type_float() {
+        assert!(matches!(sqlite_to_tds_type(Some("FLOAT")), TdsType::Float8));
+    }
+
+    #[test]
+    fn sqlite_type_double() {
+        assert!(matches!(sqlite_to_tds_type(Some("DOUBLE")), TdsType::Float8));
+    }
+
+    #[test]
+    fn sqlite_type_text() {
+        assert!(matches!(sqlite_to_tds_type(Some("TEXT")), TdsType::NVarChar));
+    }
+
+    #[test]
+    fn sqlite_type_varchar() {
+        assert!(matches!(sqlite_to_tds_type(Some("VARCHAR")), TdsType::NVarChar));
+    }
+
+    #[test]
+    fn sqlite_type_blob() {
+        assert!(matches!(sqlite_to_tds_type(Some("BLOB")), TdsType::VarBinary));
+    }
+
+    #[test]
+    fn sqlite_type_binary() {
+        assert!(matches!(sqlite_to_tds_type(Some("BINARY")), TdsType::VarBinary));
+    }
+
+    #[test]
+    fn sqlite_type_case_insensitive() {
+        assert!(matches!(sqlite_to_tds_type(Some("integer")), TdsType::BigInt));
+        assert!(matches!(sqlite_to_tds_type(Some("Real")), TdsType::Float8));
+        assert!(matches!(sqlite_to_tds_type(Some("blob")), TdsType::VarBinary));
+        assert!(matches!(sqlite_to_tds_type(Some("text")), TdsType::NVarChar));
+    }
+
+    #[test]
+    fn sqlite_type_unknown_defaults_to_nvarchar() {
+        assert!(matches!(sqlite_to_tds_type(Some("DATE")), TdsType::NVarChar));
+        assert!(matches!(sqlite_to_tds_type(Some("TIMESTAMP")), TdsType::NVarChar));
+        assert!(matches!(sqlite_to_tds_type(Some("JSON")), TdsType::NVarChar));
+    }
+
+    // ── value_to_tds_type ──────────────────────────────────────────────────
+
+    #[test]
+    fn value_type_null() {
+        assert!(matches!(value_to_tds_type(&Value::Null), TdsType::NVarChar));
+    }
+
+    #[test]
+    fn value_type_integer() {
+        assert!(matches!(value_to_tds_type(&Value::Integer(42)), TdsType::BigInt));
+    }
+
+    #[test]
+    fn value_type_float() {
+        assert!(matches!(value_to_tds_type(&Value::Float(3.14)), TdsType::Float8));
+    }
+
+    #[test]
+    fn value_type_text() {
+        assert!(matches!(
+            value_to_tds_type(&Value::Text("hello".into())),
+            TdsType::NVarChar
+        ));
+    }
+
+    #[test]
+    fn value_type_blob() {
+        assert!(matches!(
+            value_to_tds_type(&Value::Blob(vec![1, 2, 3])),
+            TdsType::VarBinary
+        ));
+    }
+
+    // ── build_columns ──────────────────────────────────────────────────────
+
+    #[test]
+    fn build_columns_empty() {
+        let cols = build_columns(&[], None);
+        assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn build_columns_with_declared_types() {
+        let columns = vec![
+            Column {
+                name: "id".into(),
+                decltype: Some("INTEGER".into()),
+            },
+            Column {
+                name: "name".into(),
+                decltype: Some("TEXT".into()),
+            },
+            Column {
+                name: "score".into(),
+                decltype: Some("REAL".into()),
+            },
+            Column {
+                name: "data".into(),
+                decltype: Some("BLOB".into()),
+            },
+        ];
+        let tds_cols = build_columns(&columns, None);
+        assert_eq!(tds_cols.len(), 4);
+        assert_eq!(tds_cols[0].name, "id");
+        assert!(matches!(tds_cols[0].tds_type, TdsType::BigInt));
+        assert_eq!(tds_cols[1].name, "name");
+        assert!(matches!(tds_cols[1].tds_type, TdsType::NVarChar));
+        assert_eq!(tds_cols[2].name, "score");
+        assert!(matches!(tds_cols[2].tds_type, TdsType::Float8));
+        assert_eq!(tds_cols[3].name, "data");
+        assert!(matches!(tds_cols[3].tds_type, TdsType::VarBinary));
+    }
+
+    #[test]
+    fn build_columns_no_decltype_with_first_row() {
+        let columns = vec![
+            Column {
+                name: "a".into(),
+                decltype: None,
+            },
+            Column {
+                name: "b".into(),
+                decltype: None,
+            },
+            Column {
+                name: "c".into(),
+                decltype: None,
+            },
+        ];
+        let first_row = vec![
+            Value::Integer(1),
+            Value::Float(2.5),
+            Value::Text("hi".into()),
+        ];
+        let tds_cols = build_columns(&columns, Some(&first_row));
+        assert_eq!(tds_cols.len(), 3);
+        assert!(matches!(tds_cols[0].tds_type, TdsType::BigInt));
+        assert!(matches!(tds_cols[1].tds_type, TdsType::Float8));
+        assert!(matches!(tds_cols[2].tds_type, TdsType::NVarChar));
+    }
+
+    #[test]
+    fn build_columns_no_decltype_no_first_row() {
+        let columns = vec![
+            Column {
+                name: "x".into(),
+                decltype: None,
+            },
+        ];
+        let tds_cols = build_columns(&columns, None);
+        assert_eq!(tds_cols.len(), 1);
+        assert!(matches!(tds_cols[0].tds_type, TdsType::NVarChar));
+    }
+
+    #[test]
+    fn build_columns_decltype_takes_precedence_over_first_row() {
+        let columns = vec![Column {
+            name: "val".into(),
+            decltype: Some("INTEGER".into()),
+        }];
+        // Even if the first row has a float, the declared type wins.
+        let first_row = vec![Value::Float(1.0)];
+        let tds_cols = build_columns(&columns, Some(&first_row));
+        assert!(matches!(tds_cols[0].tds_type, TdsType::BigInt));
+    }
+}
