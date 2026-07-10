@@ -4,9 +4,10 @@
 //! prepared statement prepare/execute/close.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use litewire_backend::{SharedBackend, Value};
-use litewire_translate::{self, Dialect, StatementKind, TranslateResult, classify};
+use litewire_translate::{self, Dialect, StatementKind, TranslateCache, TranslateResult, classify};
 use opensrv_mysql::*;
 use tokio::io::AsyncWrite;
 use tracing::{debug, warn};
@@ -49,6 +50,8 @@ struct PreparedStmt {
 /// Handler for a single MySQL client connection.
 pub struct LiteWireHandler {
     backend: SharedBackend,
+    /// Shared translation cache across all connections on this frontend.
+    translate_cache: Arc<TranslateCache>,
     /// Prepared statements keyed by the statement ID assigned during `on_prepare`.
     stmts: HashMap<u32, PreparedStmt>,
     /// Next statement ID to assign.
@@ -58,9 +61,10 @@ pub struct LiteWireHandler {
 }
 
 impl LiteWireHandler {
-    pub fn new(backend: SharedBackend) -> Self {
+    pub fn new(backend: SharedBackend, translate_cache: Arc<TranslateCache>) -> Self {
         Self {
             backend,
+            translate_cache,
             stmts: HashMap::new(),
             next_stmt_id: 1,
             in_transaction: false,
@@ -91,10 +95,18 @@ impl LiteWireHandler {
 
                 for row in &rs.rows {
                     for val in row {
+                        // Write each value in its native form so the binary
+                        // (prepared-statement) protocol accepts it against
+                        // the declared column type. Previously integers were
+                        // stringified, which worked only because every
+                        // column was declared as VAR_STRING. Now that
+                        // decltype flows through from `column_decltype`,
+                        // integer columns arrive at the wire as LONGLONG
+                        // and opensrv rejects a `String` payload.
                         match val {
                             Value::Null => rw.write_col(None::<&str>)?,
-                            Value::Integer(i) => rw.write_col(i.to_string())?,
-                            Value::Float(f) => rw.write_col(f.to_string())?,
+                            Value::Integer(i) => rw.write_col(*i)?,
+                            Value::Float(f) => rw.write_col(*f)?,
                             Value::Text(s) => rw.write_col(s.as_str())?,
                             Value::Blob(b) => rw.write_col(b.as_slice())?,
                         }
@@ -155,7 +167,8 @@ impl LiteWireHandler {
     /// Translate SQL and return the first translated result, or an error string.
     fn translate_sql(&self, query: &str) -> Result<(String, StatementKind), String> {
         let translated =
-            litewire_translate::translate(query, Dialect::MySQL).map_err(|e| e.to_string())?;
+            litewire_translate::translate_cached(&self.translate_cache, query, Dialect::MySQL)
+                .map_err(|e| e.to_string())?;
 
         let Some(result) = translated.into_iter().next() else {
             return Ok((String::new(), StatementKind::Other));
@@ -233,12 +246,14 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
             })
             .collect();
 
-        // Try to determine output columns for queries.
+        // Determine output columns. INSERT/UPDATE/DELETE have no result
+        // set -- skip describing them entirely. For SELECTs, use the
+        // backend's `describe_columns`, which on the rusqlite backend
+        // reads column metadata off the prepared statement without
+        // executing it (was: `SELECT ... LIMIT 0` round trip).
         let columns = if kind == StatementKind::Query && !sqlite_sql.is_empty() {
-            let probe_sql = format!("{sqlite_sql} LIMIT 0");
-            match self.backend.query(&probe_sql, &[]).await {
-                Ok(rs) => rs
-                    .columns
+            match self.backend.describe_columns(&sqlite_sql).await {
+                Ok(cols) => cols
                     .iter()
                     .map(|c| Column {
                         table: String::new(),
@@ -332,7 +347,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
     ) -> Result<(), Self::Error> {
         debug!(sql = %query, "COM_QUERY");
 
-        let translated = match litewire_translate::translate(query, Dialect::MySQL) {
+        let translated = match litewire_translate::translate_cached(
+            &self.translate_cache,
+            query,
+            Dialect::MySQL,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 warn!("SQL translation error: {e}");

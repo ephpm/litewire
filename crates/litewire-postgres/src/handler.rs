@@ -21,7 +21,7 @@ use pgwire::messages::data::DataRow;
 use tracing::{debug, warn};
 
 use litewire_backend::{SharedBackend, Value};
-use litewire_translate::{self, Dialect, StatementKind, TranslateResult, classify};
+use litewire_translate::{self, Dialect, StatementKind, TranslateCache, TranslateResult, classify};
 
 use crate::error_map;
 use crate::types::sqlite_to_pg_type;
@@ -30,20 +30,23 @@ use crate::types::sqlite_to_pg_type;
 pub struct PostgresHandler {
     backend: SharedBackend,
     query_parser: Arc<NoopQueryParser>,
+    translate_cache: Arc<TranslateCache>,
 }
 
 impl PostgresHandler {
-    pub fn new(backend: SharedBackend) -> Self {
+    pub fn new(backend: SharedBackend, translate_cache: Arc<TranslateCache>) -> Self {
         Self {
             backend,
             query_parser: Arc::new(NoopQueryParser::new()),
+            translate_cache,
         }
     }
 
     /// Translate SQL from PostgreSQL dialect to SQLite and classify it.
     fn translate_sql(&self, query: &str) -> Result<(String, StatementKind), String> {
         let translated =
-            litewire_translate::translate(query, Dialect::PostgreSQL).map_err(|e| e.to_string())?;
+            litewire_translate::translate_cached(&self.translate_cache, query, Dialect::PostgreSQL)
+                .map_err(|e| e.to_string())?;
 
         let Some(result) = translated.into_iter().next() else {
             return Ok((String::new(), StatementKind::Other));
@@ -204,11 +207,37 @@ impl PostgresHandler {
         Ok(Response::Execution(tag))
     }
 
-    /// Build column metadata for a query by probing with LIMIT 1.
+    /// Build column metadata for a query.
     ///
-    /// Uses LIMIT 1 (not LIMIT 0) so we can infer types from actual data
-    /// when columns lack declared types (e.g. `SELECT 1 + 2`).
+    /// Fast path: call the backend's `describe_columns`, which on rusqlite
+    /// reads column types off the prepared statement without executing.
+    /// If any column comes back without a declared type (typical for
+    /// expression columns like `SELECT 1 + 2`), fall back to a `LIMIT 1`
+    /// probe so we can infer from an actual value.
     async fn probe_columns(&self, sql: &str, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
+        let cols = match self.backend.describe_columns(sql).await {
+            Ok(c) => c,
+            Err(_) => return Ok(vec![]),
+        };
+
+        let has_untyped = cols.iter().any(|c| c.decltype.is_none());
+        if !has_untyped {
+            return Ok(cols
+                .iter()
+                .enumerate()
+                .map(|(idx, col)| {
+                    FieldInfo::new(
+                        col.name.clone(),
+                        None,
+                        None,
+                        sqlite_to_pg_type(col.decltype.as_deref()),
+                        format.format_for(idx),
+                    )
+                })
+                .collect());
+        }
+
+        // At least one expression column; probe for a real row to infer.
         let probe = format!("{sql} LIMIT 1");
         match self.backend.query(&probe, &[]).await {
             Ok(rs) => Ok(rs
@@ -372,10 +401,11 @@ impl SimpleQueryHandler for PostgresHandler {
         debug!(sql = %query, "PG simple query");
 
         let translated =
-            litewire_translate::translate(query, Dialect::PostgreSQL).map_err(|e| {
-                warn!("SQL translation error: {e}");
-                pg_error(&e.to_string())
-            })?;
+            litewire_translate::translate_cached(&self.translate_cache, query, Dialect::PostgreSQL)
+                .map_err(|e| {
+                    warn!("SQL translation error: {e}");
+                    pg_error(&e.to_string())
+                })?;
 
         let mut responses = Vec::new();
 

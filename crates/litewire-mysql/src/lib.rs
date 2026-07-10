@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use litewire_backend::SharedBackend;
+use litewire_translate::TranslateCache;
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
@@ -50,6 +51,11 @@ impl MysqlFrontend {
         info!(listen = %self.config.listen, "MySQL frontend listening");
 
         let backend = Arc::clone(&self.backend);
+        // Shared parse+rewrite cache across every accepted connection.
+        // Hot workloads (WordPress, Laravel) re-issue the same handful of
+        // prepared statements repeatedly; caching drops sqlparser off the
+        // hot path entirely.
+        let translate_cache = Arc::new(TranslateCache::default());
 
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -66,8 +72,9 @@ impl MysqlFrontend {
             debug!(%peer, "MySQL client connected");
 
             let be = Arc::clone(&backend);
+            let cache = Arc::clone(&translate_cache);
             tokio::spawn(async move {
-                let handler = LiteWireHandler::new(be);
+                let handler = LiteWireHandler::new(be, cache);
                 let (reader, writer) = stream.into_split();
                 if let Err(e) =
                     opensrv_mysql::AsyncMysqlIntermediary::run_on(handler, reader, writer).await

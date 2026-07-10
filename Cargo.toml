@@ -35,8 +35,10 @@ pgwire = "0.28"
 # SQL parsing
 sqlparser = { version = "0.57", features = ["serde"] }
 
-# Backends
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Backends. `column_decltype` exposes `Statement::columns()`, which we need
+# to fill in `Column.decltype` on empty result sets (an unexecuted prepared
+# SELECT). Without it, wire-frontend type inference has to LIMIT-0 probe.
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 
 # HTTP (Hrana)
 axum = "0.8"
