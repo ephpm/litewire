@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use litewire_backend::{SharedBackend, Value};
 use litewire_translate::{self, Dialect, StatementKind, TranslateResult, classify};
 
-use crate::packet::{self, PacketType, DEFAULT_PACKET_SIZE};
+use crate::packet::{self, DEFAULT_PACKET_SIZE, PacketType};
 use crate::token;
 
 /// Per-connection transaction state for TDS.
@@ -25,11 +25,7 @@ struct TdsSession {
 
 impl TdsSession {
     fn new() -> Self {
-        Self {
-            in_transaction: false,
-            next_tran_id: 1,
-            current_tran_id: 0,
-        }
+        Self { in_transaction: false, next_tran_id: 1, current_tran_id: 0 }
     }
 
     fn begin(&mut self) -> u64 {
@@ -207,10 +203,7 @@ fn decode_utf16le(data: &[u8]) -> Option<String> {
     if data.len() % 2 != 0 {
         return None;
     }
-    let chars: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
+    let chars: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
     String::from_utf16(&chars).ok()
 }
 
@@ -245,13 +238,8 @@ fn skip_all_headers(payload: &[u8]) -> usize {
     if payload.len() < 4 {
         return 0;
     }
-    let total_len =
-        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    if total_len >= 4 && total_len <= payload.len() {
-        total_len
-    } else {
-        0
-    }
+    let total_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    if total_len >= 4 && total_len <= payload.len() { total_len } else { 0 }
 }
 
 /// Handle an RPC request.
@@ -408,10 +396,8 @@ async fn execute_sql<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                             write_query_result(&mut resp, backend, &sqlite_sql, params).await;
                         }
                         StatementKind::Transaction => {
-                            write_transaction_result(
-                                &mut resp, backend, &sqlite_sql, session,
-                            )
-                            .await;
+                            write_transaction_result(&mut resp, backend, &sqlite_sql, session)
+                                .await;
                         }
                         _ => {
                             write_exec_result(&mut resp, backend, &sqlite_sql, params).await;

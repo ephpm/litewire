@@ -4,11 +4,7 @@ use clap::Parser;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(
-    name = "litewire",
-    version,
-    about = "SQL protocol proxy for SQLite"
-)]
+#[command(name = "litewire", version, about = "SQL protocol proxy for SQLite")]
 struct Cli {
     /// SQLite database file path.
     #[arg(long, default_value = "litewire.db")]

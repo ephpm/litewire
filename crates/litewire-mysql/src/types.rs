@@ -38,55 +38,34 @@ mod tests {
 
     #[test]
     fn type_mapping_integer() {
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("INTEGER")),
-            ColumnType::MYSQL_TYPE_LONGLONG
-        );
+        assert_eq!(sqlite_to_mysql_column_type(Some("INTEGER")), ColumnType::MYSQL_TYPE_LONGLONG);
     }
 
     #[test]
     fn type_mapping_int_substring() {
         // "BIGINT", "TINYINT", etc. all contain "INT"
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("BIGINT")),
-            ColumnType::MYSQL_TYPE_LONGLONG
-        );
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("TINYINT")),
-            ColumnType::MYSQL_TYPE_LONGLONG
-        );
+        assert_eq!(sqlite_to_mysql_column_type(Some("BIGINT")), ColumnType::MYSQL_TYPE_LONGLONG);
+        assert_eq!(sqlite_to_mysql_column_type(Some("TINYINT")), ColumnType::MYSQL_TYPE_LONGLONG);
     }
 
     #[test]
     fn type_mapping_real() {
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("REAL")),
-            ColumnType::MYSQL_TYPE_DOUBLE
-        );
+        assert_eq!(sqlite_to_mysql_column_type(Some("REAL")), ColumnType::MYSQL_TYPE_DOUBLE);
     }
 
     #[test]
     fn type_mapping_float() {
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("FLOAT")),
-            ColumnType::MYSQL_TYPE_DOUBLE
-        );
+        assert_eq!(sqlite_to_mysql_column_type(Some("FLOAT")), ColumnType::MYSQL_TYPE_DOUBLE);
     }
 
     #[test]
     fn type_mapping_double() {
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("DOUBLE")),
-            ColumnType::MYSQL_TYPE_DOUBLE
-        );
+        assert_eq!(sqlite_to_mysql_column_type(Some("DOUBLE")), ColumnType::MYSQL_TYPE_DOUBLE);
     }
 
     #[test]
     fn type_mapping_text() {
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("TEXT")),
-            ColumnType::MYSQL_TYPE_VAR_STRING
-        );
+        assert_eq!(sqlite_to_mysql_column_type(Some("TEXT")), ColumnType::MYSQL_TYPE_VAR_STRING);
     }
 
     #[test]
@@ -107,26 +86,17 @@ mod tests {
 
     #[test]
     fn type_mapping_blob() {
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("BLOB")),
-            ColumnType::MYSQL_TYPE_BLOB
-        );
+        assert_eq!(sqlite_to_mysql_column_type(Some("BLOB")), ColumnType::MYSQL_TYPE_BLOB);
     }
 
     #[test]
     fn type_mapping_bytea() {
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("BYTEA")),
-            ColumnType::MYSQL_TYPE_BLOB
-        );
+        assert_eq!(sqlite_to_mysql_column_type(Some("BYTEA")), ColumnType::MYSQL_TYPE_BLOB);
     }
 
     #[test]
     fn type_mapping_none_defaults_to_string() {
-        assert_eq!(
-            sqlite_to_mysql_column_type(None),
-            ColumnType::MYSQL_TYPE_VAR_STRING
-        );
+        assert_eq!(sqlite_to_mysql_column_type(None), ColumnType::MYSQL_TYPE_VAR_STRING);
     }
 
     #[test]
@@ -140,21 +110,9 @@ mod tests {
     #[test]
     fn type_mapping_case_insensitive() {
         // The function uppercases, so lowercase should work too.
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("integer")),
-            ColumnType::MYSQL_TYPE_LONGLONG
-        );
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("real")),
-            ColumnType::MYSQL_TYPE_DOUBLE
-        );
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("text")),
-            ColumnType::MYSQL_TYPE_VAR_STRING
-        );
-        assert_eq!(
-            sqlite_to_mysql_column_type(Some("blob")),
-            ColumnType::MYSQL_TYPE_BLOB
-        );
+        assert_eq!(sqlite_to_mysql_column_type(Some("integer")), ColumnType::MYSQL_TYPE_LONGLONG);
+        assert_eq!(sqlite_to_mysql_column_type(Some("real")), ColumnType::MYSQL_TYPE_DOUBLE);
+        assert_eq!(sqlite_to_mysql_column_type(Some("text")), ColumnType::MYSQL_TYPE_VAR_STRING);
+        assert_eq!(sqlite_to_mysql_column_type(Some("blob")), ColumnType::MYSQL_TYPE_BLOB);
     }
 }

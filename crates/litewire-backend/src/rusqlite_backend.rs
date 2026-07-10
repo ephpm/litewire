@@ -31,9 +31,7 @@ impl Rusqlite {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .map_err(|e| BackendError::Sqlite(e.to_string()))?;
 
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
     /// Open an in-memory SQLite database.
@@ -42,11 +40,8 @@ impl Rusqlite {
     ///
     /// Returns an error if the database cannot be opened.
     pub fn memory() -> Result<Self, BackendError> {
-        let conn =
-            Connection::open_in_memory().map_err(|e| BackendError::Sqlite(e.to_string()))?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        let conn = Connection::open_in_memory().map_err(|e| BackendError::Sqlite(e.to_string()))?;
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 }
 
@@ -73,9 +68,7 @@ fn extract_value(row: &rusqlite::Row<'_>, idx: usize) -> Result<Value, rusqlite:
         ValueRef::Null => Ok(Value::Null),
         ValueRef::Integer(i) => Ok(Value::Integer(i)),
         ValueRef::Real(f) => Ok(Value::Float(f)),
-        ValueRef::Text(s) => Ok(Value::Text(
-            String::from_utf8_lossy(s).into_owned(),
-        )),
+        ValueRef::Text(s) => Ok(Value::Text(String::from_utf8_lossy(s).into_owned())),
         ValueRef::Blob(b) => Ok(Value::Blob(b.to_vec())),
     }
 }
@@ -89,9 +82,7 @@ impl Backend for Rusqlite {
 
         task::spawn_blocking(move || {
             let conn = conn.lock();
-            let mut stmt = conn
-                .prepare(&sql)
-                .map_err(|e| BackendError::Sqlite(e.to_string()))?;
+            let mut stmt = conn.prepare(&sql).map_err(|e| BackendError::Sqlite(e.to_string()))?;
 
             let col_count = stmt.column_count();
             let columns: Vec<Column> = (0..col_count)
@@ -114,17 +105,13 @@ impl Backend for Rusqlite {
                 let mut values = Vec::with_capacity(col_count);
                 for i in 0..col_count {
                     values.push(
-                        extract_value(row, i)
-                            .map_err(|e| BackendError::Sqlite(e.to_string()))?,
+                        extract_value(row, i).map_err(|e| BackendError::Sqlite(e.to_string()))?,
                     );
                 }
                 result_rows.push(values);
             }
 
-            Ok(ResultSet {
-                columns,
-                rows: result_rows,
-            })
+            Ok(ResultSet { columns, rows: result_rows })
         })
         .await
         .map_err(|e| BackendError::Other(format!("spawn_blocking join error: {e}")))?
@@ -175,20 +162,14 @@ mod tests {
             .unwrap();
 
         let result = backend
-            .execute(
-                "INSERT INTO users (name) VALUES (?1)",
-                &[Value::Text("Alice".into())],
-            )
+            .execute("INSERT INTO users (name) VALUES (?1)", &[Value::Text("Alice".into())])
             .await
             .unwrap();
         assert_eq!(result.affected_rows, 1);
         assert_eq!(result.last_insert_rowid, Some(1));
 
         let result = backend
-            .execute(
-                "INSERT INTO users (name) VALUES (?1)",
-                &[Value::Text("Bob".into())],
-            )
+            .execute("INSERT INTO users (name) VALUES (?1)", &[Value::Text("Bob".into())])
             .await
             .unwrap();
         assert_eq!(result.last_insert_rowid, Some(2));
@@ -201,10 +182,8 @@ mod tests {
         assert_eq!(rs.rows[0][1], Value::Text("Alice".into()));
         assert_eq!(rs.rows[1][1], Value::Text("Bob".into()));
 
-        let rs = backend
-            .query("SELECT * FROM users WHERE id = ?1", &[Value::Integer(1)])
-            .await
-            .unwrap();
+        let rs =
+            backend.query("SELECT * FROM users WHERE id = ?1", &[Value::Integer(1)]).await.unwrap();
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][1], Value::Text("Alice".into()));
     }
@@ -213,10 +192,7 @@ mod tests {
     async fn types_roundtrip() {
         let backend = Rusqlite::memory().unwrap();
         backend
-            .execute(
-                "CREATE TABLE typed (i INTEGER, r REAL, t TEXT, b BLOB)",
-                &[],
-            )
+            .execute("CREATE TABLE typed (i INTEGER, r REAL, t TEXT, b BLOB)", &[])
             .await
             .unwrap();
 
@@ -244,10 +220,7 @@ mod tests {
     async fn null_handling() {
         let backend = Rusqlite::memory().unwrap();
         backend.execute("CREATE TABLE t (v TEXT)", &[]).await.unwrap();
-        backend
-            .execute("INSERT INTO t VALUES (?1)", &[Value::Null])
-            .await
-            .unwrap();
+        backend.execute("INSERT INTO t VALUES (?1)", &[Value::Null]).await.unwrap();
 
         let rs = backend.query("SELECT * FROM t", &[]).await.unwrap();
         assert_eq!(rs.rows[0][0], Value::Null);
@@ -256,10 +229,7 @@ mod tests {
     #[tokio::test]
     async fn empty_table_query() {
         let backend = Rusqlite::memory().unwrap();
-        backend
-            .execute("CREATE TABLE t (id INTEGER, name TEXT)", &[])
-            .await
-            .unwrap();
+        backend.execute("CREATE TABLE t (id INTEGER, name TEXT)", &[]).await.unwrap();
 
         let rs = backend.query("SELECT * FROM t", &[]).await.unwrap();
         assert_eq!(rs.columns.len(), 2);
@@ -269,27 +239,20 @@ mod tests {
     #[tokio::test]
     async fn multiple_params() {
         let backend = Rusqlite::memory().unwrap();
-        backend
-            .execute("CREATE TABLE t (a INTEGER, b TEXT, c REAL)", &[])
-            .await
-            .unwrap();
+        backend.execute("CREATE TABLE t (a INTEGER, b TEXT, c REAL)", &[]).await.unwrap();
         backend
             .execute(
                 "INSERT INTO t VALUES (?1, ?2, ?3)",
-                &[
-                    Value::Integer(1),
-                    Value::Text("hello".into()),
-                    Value::Float(9.99),
-                ],
+                &[Value::Integer(1), Value::Text("hello".into()), Value::Float(9.99)],
             )
             .await
             .unwrap();
 
         let rs = backend
-            .query("SELECT * FROM t WHERE a = ?1 AND b = ?2", &[
-                Value::Integer(1),
-                Value::Text("hello".into()),
-            ])
+            .query(
+                "SELECT * FROM t WHERE a = ?1 AND b = ?2",
+                &[Value::Integer(1), Value::Text("hello".into())],
+            )
             .await
             .unwrap();
         assert_eq!(rs.rows.len(), 1);
@@ -299,10 +262,7 @@ mod tests {
     #[tokio::test]
     async fn affected_rows_count() {
         let backend = Rusqlite::memory().unwrap();
-        backend
-            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", &[])
-            .await
-            .unwrap();
+        backend.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", &[]).await.unwrap();
 
         for i in 0..5 {
             backend
@@ -314,10 +274,8 @@ mod tests {
                 .unwrap();
         }
 
-        let result = backend
-            .execute("DELETE FROM t WHERE id >= ?1", &[Value::Integer(3)])
-            .await
-            .unwrap();
+        let result =
+            backend.execute("DELETE FROM t WHERE id >= ?1", &[Value::Integer(3)]).await.unwrap();
         assert_eq!(result.affected_rows, 2);
     }
 
@@ -338,16 +296,10 @@ mod tests {
     #[tokio::test]
     async fn blob_roundtrip() {
         let backend = Rusqlite::memory().unwrap();
-        backend
-            .execute("CREATE TABLE t (data BLOB)", &[])
-            .await
-            .unwrap();
+        backend.execute("CREATE TABLE t (data BLOB)", &[]).await.unwrap();
 
         let data = vec![0x00, 0xFF, 0xDE, 0xAD, 0xBE, 0xEF];
-        backend
-            .execute("INSERT INTO t VALUES (?1)", &[Value::Blob(data.clone())])
-            .await
-            .unwrap();
+        backend.execute("INSERT INTO t VALUES (?1)", &[Value::Blob(data.clone())]).await.unwrap();
 
         let rs = backend.query("SELECT * FROM t", &[]).await.unwrap();
         assert_eq!(rs.rows[0][0], Value::Blob(data));
@@ -357,10 +309,7 @@ mod tests {
     async fn last_insert_rowid_increments() {
         let backend = Rusqlite::memory().unwrap();
         backend
-            .execute(
-                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
-                &[],
-            )
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)", &[])
             .await
             .unwrap();
 

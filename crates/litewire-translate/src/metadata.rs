@@ -21,13 +21,9 @@ pub enum MetadataQuery {
     /// `SELECT @@variable` queries — MySQL system variables.
     SystemVariables { variables: Vec<String> },
     /// `SELECT ... FROM information_schema.tables` — table listing.
-    InformationSchemaTables {
-        schema_filter: Option<String>,
-    },
+    InformationSchemaTables { schema_filter: Option<String> },
     /// `SELECT ... FROM information_schema.columns` — column listing.
-    InformationSchemaColumns {
-        table_filter: Option<String>,
-    },
+    InformationSchemaColumns { table_filter: Option<String> },
     /// `SELECT ... FROM information_schema.schemata` — schema listing.
     InformationSchemata,
     /// `SELECT ... FROM pg_catalog.pg_tables` or similar.
@@ -138,8 +134,8 @@ impl MetadataQuery {
 /// Return a synthetic value for a MySQL system variable.
 fn system_variable_value(name: &str) -> &'static str {
     match name.to_ascii_lowercase().as_str() {
-        "max_allowed_packet" => "67108864",  // 64 MiB
-        "wait_timeout" => "28800",           // 8 hours
+        "max_allowed_packet" => "67108864", // 64 MiB
+        "wait_timeout" => "28800",          // 8 hours
         "interactive_timeout" => "28800",
         "net_write_timeout" => "60",
         "net_read_timeout" => "30",
@@ -180,19 +176,15 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
     }
 
     // SHOW COLUMNS FROM <table> / SHOW FIELDS FROM <table>
-    if let Some(rest) = upper
-        .strip_prefix("SHOW COLUMNS FROM ")
-        .or_else(|| upper.strip_prefix("SHOW FIELDS FROM "))
+    if let Some(rest) =
+        upper.strip_prefix("SHOW COLUMNS FROM ").or_else(|| upper.strip_prefix("SHOW FIELDS FROM "))
     {
         let table = extract_table_name(rest, trimmed);
         return Some(MetadataQuery::ShowColumns { table });
     }
 
     // DESCRIBE <table> / DESC <table>
-    if let Some(rest) = upper
-        .strip_prefix("DESCRIBE ")
-        .or_else(|| upper.strip_prefix("DESC "))
-    {
+    if let Some(rest) = upper.strip_prefix("DESCRIBE ").or_else(|| upper.strip_prefix("DESC ")) {
         let table = extract_table_name(rest, trimmed);
         return Some(MetadataQuery::ShowColumns { table });
     }
@@ -273,9 +265,7 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
     if upper.contains("PG_CATALOG.PG_ATTRIBUTE") {
         let table_filter = extract_where_value_original(trimmed, "TABLE_NAME")
             .or_else(|| extract_where_value_original(trimmed, "ATTRELID"));
-        return Some(MetadataQuery::PgCatalogColumns {
-            table: table_filter.unwrap_or_default(),
-        });
+        return Some(MetadataQuery::PgCatalogColumns { table: table_filter.unwrap_or_default() });
     }
 
     // T-SQL sys.tables / sys.columns.
@@ -284,9 +274,7 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
     }
     if upper.contains("SYS.COLUMNS") || upper.contains("SYSCOLUMNS") {
         let table_filter = extract_where_value_original(trimmed, "TABLE_NAME");
-        return Some(MetadataQuery::SysColumns {
-            table: table_filter.unwrap_or_default(),
-        });
+        return Some(MetadataQuery::SysColumns { table: table_filter.unwrap_or_default() });
     }
 
     // T-SQL stored procedure metadata: sp_tables, sp_columns.
@@ -298,12 +286,7 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
         let table = trimmed
             .split_ascii_whitespace()
             .nth(1)
-            .map(|s| {
-                s.trim_matches('\'')
-                    .trim_matches('"')
-                    .trim_end_matches(';')
-                    .to_string()
-            })
+            .map(|s| s.trim_matches('\'').trim_matches('"').trim_end_matches(';').to_string())
             .unwrap_or_default();
         return Some(MetadataQuery::SysColumns { table });
     }
@@ -314,6 +297,9 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
 /// Extract a simple `column = 'value'` filter from a WHERE clause.
 /// Searches on the uppercased SQL for the column name, but extracts the
 /// value from the original SQL to preserve case.
+// WIP scaffolding: not yet wired up. Kept alongside `extract_where_value_original`
+// while the metadata WHERE-clause extraction is being reworked.
+#[allow(dead_code)]
 fn extract_where_value(upper_sql: &str, column: &str) -> Option<String> {
     let pattern = format!("{column} = ");
     if let Some(pos) = upper_sql.find(&pattern) {
@@ -338,7 +324,7 @@ fn extract_where_value_original(original_sql: &str, column: &str) -> Option<Stri
     if let Some(pos) = upper.find(&pattern) {
         let after = &original_sql[pos + pattern.len()..];
         let after_trimmed = after.trim_start();
-        let trim_offset = after.len() - after_trimmed.len();
+        let _trim_offset = after.len() - after_trimmed.len();
         let after = after_trimmed;
         if after.starts_with('\'') || after.starts_with('"') {
             let quote = after.as_bytes()[0] as char;
@@ -493,30 +479,21 @@ mod tests {
 
     #[test]
     fn show_columns_sql() {
-        let sql = MetadataQuery::ShowColumns {
-            table: "users".into(),
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::ShowColumns { table: "users".into() }.to_sqlite_sql();
         assert!(sql.contains("PRAGMA table_info"));
         assert!(sql.contains("users"));
     }
 
     #[test]
     fn show_create_table_sql() {
-        let sql = MetadataQuery::ShowCreateTable {
-            table: "posts".into(),
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::ShowCreateTable { table: "posts".into() }.to_sqlite_sql();
         assert!(sql.contains("sqlite_master"));
         assert!(sql.contains("posts"));
     }
 
     #[test]
     fn show_index_sql() {
-        let sql = MetadataQuery::ShowIndex {
-            table: "users".into(),
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::ShowIndex { table: "users".into() }.to_sqlite_sql();
         assert!(sql.contains("PRAGMA index_list"));
         assert!(sql.contains("users"));
     }
@@ -535,10 +512,8 @@ mod tests {
 
     #[test]
     fn unknown_system_variable_returns_null() {
-        let sql = MetadataQuery::SystemVariables {
-            variables: vec!["nonexistent_var".into()],
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::SystemVariables { variables: vec!["nonexistent_var".into()] }
+            .to_sqlite_sql();
         assert!(sql.contains("NULL"), "got: {sql}");
     }
 
@@ -635,10 +610,8 @@ mod tests {
             ("tx_isolation", "SERIALIZABLE"),
         ];
         for (var, expected_fragment) in cases {
-            let sql = MetadataQuery::SystemVariables {
-                variables: vec![var.into()],
-            }
-            .to_sqlite_sql();
+            let sql =
+                MetadataQuery::SystemVariables { variables: vec![var.into()] }.to_sqlite_sql();
             assert!(
                 sql.contains(expected_fragment),
                 "@@{var}: expected {expected_fragment} in: {sql}"
@@ -650,26 +623,14 @@ mod tests {
 
     #[test]
     fn detect_information_schema_tables() {
-        let q = detect_metadata_query(
-            "SELECT * FROM information_schema.tables",
-            Dialect::MySQL,
-        );
-        assert!(matches!(
-            q,
-            Some(MetadataQuery::InformationSchemaTables { schema_filter: None })
-        ));
+        let q = detect_metadata_query("SELECT * FROM information_schema.tables", Dialect::MySQL);
+        assert!(matches!(q, Some(MetadataQuery::InformationSchemaTables { schema_filter: None })));
     }
 
     #[test]
     fn detect_information_schema_tables_with_backticks() {
-        let q = detect_metadata_query(
-            "SELECT * FROM INFORMATION_SCHEMA.`TABLES`",
-            Dialect::MySQL,
-        );
-        assert!(matches!(
-            q,
-            Some(MetadataQuery::InformationSchemaTables { .. })
-        ));
+        let q = detect_metadata_query("SELECT * FROM INFORMATION_SCHEMA.`TABLES`", Dialect::MySQL);
+        assert!(matches!(q, Some(MetadataQuery::InformationSchemaTables { .. })));
     }
 
     #[test]
@@ -679,9 +640,9 @@ mod tests {
             Dialect::MySQL,
         );
         match q {
-            Some(MetadataQuery::InformationSchemaTables {
-                schema_filter: Some(schema),
-            }) => assert_eq!(schema, "mydb"),
+            Some(MetadataQuery::InformationSchemaTables { schema_filter: Some(schema) }) => {
+                assert_eq!(schema, "mydb")
+            }
             other => panic!("expected InformationSchemaTables with filter, got: {other:?}"),
         }
     }
@@ -693,33 +654,22 @@ mod tests {
             Dialect::MySQL,
         );
         match q {
-            Some(MetadataQuery::InformationSchemaColumns {
-                table_filter: Some(table),
-            }) => assert_eq!(table, "users"),
+            Some(MetadataQuery::InformationSchemaColumns { table_filter: Some(table) }) => {
+                assert_eq!(table, "users")
+            }
             other => panic!("expected InformationSchemaColumns with filter, got: {other:?}"),
         }
     }
 
     #[test]
     fn detect_information_schema_columns_no_filter() {
-        let q = detect_metadata_query(
-            "SELECT * FROM INFORMATION_SCHEMA.COLUMNS",
-            Dialect::MySQL,
-        );
-        assert!(matches!(
-            q,
-            Some(MetadataQuery::InformationSchemaColumns {
-                table_filter: None
-            })
-        ));
+        let q = detect_metadata_query("SELECT * FROM INFORMATION_SCHEMA.COLUMNS", Dialect::MySQL);
+        assert!(matches!(q, Some(MetadataQuery::InformationSchemaColumns { table_filter: None })));
     }
 
     #[test]
     fn detect_information_schema_schemata() {
-        let q = detect_metadata_query(
-            "SELECT * FROM INFORMATION_SCHEMA.SCHEMATA",
-            Dialect::MySQL,
-        );
+        let q = detect_metadata_query("SELECT * FROM INFORMATION_SCHEMA.SCHEMATA", Dialect::MySQL);
         assert!(matches!(q, Some(MetadataQuery::InformationSchemata)));
     }
 
@@ -727,10 +677,7 @@ mod tests {
 
     #[test]
     fn information_schema_tables_sql() {
-        let sql = MetadataQuery::InformationSchemaTables {
-            schema_filter: None,
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::InformationSchemaTables { schema_filter: None }.to_sqlite_sql();
         assert!(sql.contains("sqlite_master"), "got: {sql}");
         assert!(sql.contains("TABLE_NAME"), "got: {sql}");
         assert!(sql.contains("TABLE_TYPE"), "got: {sql}");
@@ -738,10 +685,8 @@ mod tests {
 
     #[test]
     fn information_schema_tables_with_main_filter() {
-        let sql = MetadataQuery::InformationSchemaTables {
-            schema_filter: Some("main".into()),
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::InformationSchemaTables { schema_filter: Some("main".into()) }
+            .to_sqlite_sql();
         assert!(sql.contains("sqlite_master"), "got: {sql}");
         // Should NOT contain "AND 0" (main is a valid schema).
         assert!(!sql.contains("AND 0"), "got: {sql}");
@@ -749,20 +694,17 @@ mod tests {
 
     #[test]
     fn information_schema_tables_with_unknown_schema() {
-        let sql = MetadataQuery::InformationSchemaTables {
-            schema_filter: Some("nonexistent".into()),
-        }
-        .to_sqlite_sql();
+        let sql =
+            MetadataQuery::InformationSchemaTables { schema_filter: Some("nonexistent".into()) }
+                .to_sqlite_sql();
         // Should return empty (AND 0).
         assert!(sql.contains("AND 0"), "got: {sql}");
     }
 
     #[test]
     fn information_schema_columns_with_table_sql() {
-        let sql = MetadataQuery::InformationSchemaColumns {
-            table_filter: Some("users".into()),
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::InformationSchemaColumns { table_filter: Some("users".into()) }
+            .to_sqlite_sql();
         assert!(sql.contains("pragma_table_info"), "got: {sql}");
         assert!(sql.contains("users"), "got: {sql}");
         assert!(sql.contains("COLUMN_NAME"), "got: {sql}");
@@ -770,10 +712,7 @@ mod tests {
 
     #[test]
     fn information_schema_columns_no_table_fallback() {
-        let sql = MetadataQuery::InformationSchemaColumns {
-            table_filter: None,
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::InformationSchemaColumns { table_filter: None }.to_sqlite_sql();
         // Falls back to listing tables.
         assert!(sql.contains("sqlite_master"), "got: {sql}");
     }
@@ -789,48 +728,35 @@ mod tests {
 
     #[test]
     fn identity_system_variable() {
-        let sql = MetadataQuery::SystemVariables {
-            variables: vec!["identity".into()],
-        }
-        .to_sqlite_sql();
+        let sql =
+            MetadataQuery::SystemVariables { variables: vec!["identity".into()] }.to_sqlite_sql();
         assert!(sql.contains("last_insert_rowid()"), "got: {sql}");
     }
 
     #[test]
     fn rowcount_system_variable() {
-        let sql = MetadataQuery::SystemVariables {
-            variables: vec!["rowcount".into()],
-        }
-        .to_sqlite_sql();
+        let sql =
+            MetadataQuery::SystemVariables { variables: vec!["rowcount".into()] }.to_sqlite_sql();
         assert!(sql.contains("changes()"), "got: {sql}");
     }
 
     #[test]
     fn detect_select_at_identity() {
         let q = detect_metadata_query("SELECT @@IDENTITY", Dialect::TDS);
-        assert!(
-            matches!(q, Some(MetadataQuery::SystemVariables { .. })),
-            "got: {q:?}"
-        );
+        assert!(matches!(q, Some(MetadataQuery::SystemVariables { .. })), "got: {q:?}");
     }
 
     #[test]
     fn detect_select_at_rowcount() {
         let q = detect_metadata_query("SELECT @@ROWCOUNT", Dialect::TDS);
-        assert!(
-            matches!(q, Some(MetadataQuery::SystemVariables { .. })),
-            "got: {q:?}"
-        );
+        assert!(matches!(q, Some(MetadataQuery::SystemVariables { .. })), "got: {q:?}");
     }
 
     // ── pg_catalog detection ───────────────────────────────────────────────
 
     #[test]
     fn detect_pg_catalog_tables() {
-        let q = detect_metadata_query(
-            "SELECT * FROM pg_catalog.pg_tables",
-            Dialect::PostgreSQL,
-        );
+        let q = detect_metadata_query("SELECT * FROM pg_catalog.pg_tables", Dialect::PostgreSQL);
         assert!(matches!(q, Some(MetadataQuery::PgCatalogTables)), "got: {q:?}");
     }
 
@@ -852,10 +778,7 @@ mod tests {
 
     #[test]
     fn pg_catalog_columns_sql() {
-        let sql = MetadataQuery::PgCatalogColumns {
-            table: "users".into(),
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::PgCatalogColumns { table: "users".into() }.to_sqlite_sql();
         assert!(sql.contains("pragma_table_info"), "got: {sql}");
         assert!(sql.contains("users"), "got: {sql}");
     }
@@ -888,10 +811,7 @@ mod tests {
 
     #[test]
     fn sys_columns_sql() {
-        let sql = MetadataQuery::SysColumns {
-            table: "orders".into(),
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::SysColumns { table: "orders".into() }.to_sqlite_sql();
         assert!(sql.contains("pragma_table_info"), "got: {sql}");
         assert!(sql.contains("orders"), "got: {sql}");
     }
@@ -907,9 +827,6 @@ mod tests {
     #[test]
     fn detect_sp_columns() {
         let q = detect_metadata_query("EXEC sp_columns 'users'", Dialect::TDS);
-        assert!(
-            matches!(q, Some(MetadataQuery::SysColumns { .. })),
-            "got: {q:?}"
-        );
+        assert!(matches!(q, Some(MetadataQuery::SysColumns { .. })), "got: {q:?}");
     }
 }

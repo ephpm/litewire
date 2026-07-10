@@ -35,10 +35,9 @@ fn rewrite_data_type(dt: &DataType) -> DataType {
 
         DataType::Boolean => DataType::Integer(None),
 
-        DataType::Date
-        | DataType::Timestamp(_, _)
-        | DataType::Time(_, _)
-        | DataType::Interval => DataType::Text,
+        DataType::Date | DataType::Timestamp(_, _) | DataType::Time(_, _) | DataType::Interval => {
+            DataType::Text
+        }
 
         DataType::JSON | DataType::JSONB => DataType::Text,
 
@@ -56,7 +55,7 @@ fn rewrite_data_type(dt: &DataType) -> DataType {
 
 #[cfg(test)]
 mod tests {
-    use crate::{translate, Dialect, TranslateResult};
+    use crate::{Dialect, TranslateResult, translate};
 
     fn extract_sql(result: &TranslateResult) -> &str {
         match result {
@@ -67,11 +66,8 @@ mod tests {
 
     #[test]
     fn int_types_to_integer() {
-        let results = translate(
-            "CREATE TABLE t (a SMALLINT, b INT, c BIGINT)",
-            Dialect::PostgreSQL,
-        )
-        .unwrap();
+        let results =
+            translate("CREATE TABLE t (a SMALLINT, b INT, c BIGINT)", Dialect::PostgreSQL).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("SMALLINT"), "SMALLINT not rewritten: {sql}");
@@ -80,11 +76,8 @@ mod tests {
 
     #[test]
     fn float_to_real() {
-        let results = translate(
-            "CREATE TABLE t (a FLOAT(8), b NUMERIC(10,2))",
-            Dialect::PostgreSQL,
-        )
-        .unwrap();
+        let results =
+            translate("CREATE TABLE t (a FLOAT(8), b NUMERIC(10,2))", Dialect::PostgreSQL).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(upper.contains("REAL"), "no REAL found: {sql}");
@@ -93,11 +86,8 @@ mod tests {
 
     #[test]
     fn varchar_to_text() {
-        let results = translate(
-            "CREATE TABLE t (name VARCHAR(255), bio TEXT)",
-            Dialect::PostgreSQL,
-        )
-        .unwrap();
+        let results =
+            translate("CREATE TABLE t (name VARCHAR(255), bio TEXT)", Dialect::PostgreSQL).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("VARCHAR"), "VARCHAR not rewritten: {sql}");
@@ -132,11 +122,9 @@ mod tests {
 
     #[test]
     fn timestamp_to_text() {
-        let results = translate(
-            "CREATE TABLE t (created TIMESTAMP, updated DATE)",
-            Dialect::PostgreSQL,
-        )
-        .unwrap();
+        let results =
+            translate("CREATE TABLE t (created TIMESTAMP, updated DATE)", Dialect::PostgreSQL)
+                .unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("TIMESTAMP"), "TIMESTAMP not rewritten: {sql}");
@@ -160,11 +148,8 @@ mod tests {
 
     #[test]
     fn serial_to_integer() {
-        let results = translate(
-            "CREATE TABLE t (id SERIAL PRIMARY KEY)",
-            Dialect::PostgreSQL,
-        )
-        .unwrap();
+        let results =
+            translate("CREATE TABLE t (id SERIAL PRIMARY KEY)", Dialect::PostgreSQL).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("SERIAL"), "SERIAL not rewritten: {sql}");
@@ -173,11 +158,8 @@ mod tests {
 
     #[test]
     fn bigserial_to_integer() {
-        let results = translate(
-            "CREATE TABLE t (id BIGSERIAL PRIMARY KEY)",
-            Dialect::PostgreSQL,
-        )
-        .unwrap();
+        let results =
+            translate("CREATE TABLE t (id BIGSERIAL PRIMARY KEY)", Dialect::PostgreSQL).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(upper.contains("INTEGER"), "no INTEGER found: {sql}");

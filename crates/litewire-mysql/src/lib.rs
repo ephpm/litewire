@@ -4,6 +4,7 @@
 //! incoming SQL from MySQL dialect to SQLite, executes against the backend,
 //! and returns results in MySQL wire format.
 
+mod error_map;
 mod handler;
 mod resultset;
 mod types;

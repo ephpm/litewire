@@ -11,19 +11,21 @@ use opensrv_mysql::*;
 use tokio::io::AsyncWrite;
 use tracing::{debug, warn};
 
+use crate::error_map;
+
+/// Maximum number of prepared statements a single connection may hold at once.
+///
+/// MySQL's default `max_prepared_stmt_count` is 16382 (global, not per-connection),
+/// but here it's per-connection because litewire has no global registry. 1024
+/// per connection is generous for real workloads and prevents a runaway client
+/// from exhausting memory via COM_STMT_PREPARE without matching COM_STMT_CLOSE.
+const MAX_PREPARED_STMTS_PER_CONN: usize = 1024;
+
 /// Build an `OkResponse` with the correct transaction status flag.
 fn ok_response(affected_rows: u64, last_insert_id: u64, in_transaction: bool) -> OkResponse {
-    let status_flags = if in_transaction {
-        StatusFlags::SERVER_STATUS_IN_TRANS
-    } else {
-        StatusFlags::empty()
-    };
-    OkResponse {
-        affected_rows,
-        last_insert_id,
-        status_flags,
-        ..OkResponse::default()
-    }
+    let status_flags =
+        if in_transaction { StatusFlags::SERVER_STATUS_IN_TRANS } else { StatusFlags::empty() };
+    OkResponse { affected_rows, last_insert_id, status_flags, ..OkResponse::default() }
 }
 
 use crate::types::sqlite_to_mysql_column_type;
@@ -34,8 +36,6 @@ struct PreparedStmt {
     sqlite_sql: String,
     /// Whether this is a query (SELECT) or mutation (INSERT/UPDATE/DELETE).
     kind: StatementKind,
-    /// Number of `?` parameters.
-    param_count: usize,
 }
 
 /// Handler for a single MySQL client connection.
@@ -51,12 +51,7 @@ pub struct LiteWireHandler {
 
 impl LiteWireHandler {
     pub fn new(backend: SharedBackend) -> Self {
-        Self {
-            backend,
-            stmts: HashMap::new(),
-            next_stmt_id: 1,
-            in_transaction: false,
-        }
+        Self { backend, stmts: HashMap::new(), next_stmt_id: 1, in_transaction: false }
     }
 
     /// Execute a query and write result set.
@@ -96,11 +91,7 @@ impl LiteWireHandler {
 
                 rw.finish().await
             }
-            Err(e) => {
-                results
-                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
-                    .await
-            }
+            Err(e) => write_backend_error(results, &e.to_string()).await,
         }
     }
 
@@ -113,18 +104,15 @@ impl LiteWireHandler {
     ) -> Result<(), std::io::Error> {
         match self.backend.execute(sql, params).await {
             Ok(r) => {
-                let resp = ok_response(
-                    r.affected_rows,
-                    r.last_insert_rowid.unwrap_or(0) as u64,
-                    self.in_transaction,
-                );
+                // last_insert_rowid comes back as i64 -- clamp negatives (should
+                // never happen; SQLite rowids are always >= 1 for a real insert)
+                // to 0 rather than reinterpret via `as u64`.
+                let last_id_u64: u64 =
+                    r.last_insert_rowid.and_then(|v| u64::try_from(v.max(0)).ok()).unwrap_or(0);
+                let resp = ok_response(r.affected_rows, last_id_u64, self.in_transaction);
                 results.completed(resp).await
             }
-            Err(e) => {
-                results
-                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
-                    .await
-            }
+            Err(e) => write_backend_error(results, &e.to_string()).await,
         }
     }
 
@@ -145,18 +133,14 @@ impl LiteWireHandler {
                 let resp = ok_response(0, 0, self.in_transaction);
                 results.completed(resp).await
             }
-            Err(e) => {
-                results
-                    .error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes())
-                    .await
-            }
+            Err(e) => write_backend_error(results, &e.to_string()).await,
         }
     }
 
     /// Translate SQL and return the first translated result, or an error string.
     fn translate_sql(&self, query: &str) -> Result<(String, StatementKind), String> {
-        let translated = litewire_translate::translate(query, Dialect::MySQL)
-            .map_err(|e| e.to_string())?;
+        let translated =
+            litewire_translate::translate(query, Dialect::MySQL).map_err(|e| e.to_string())?;
 
         let Some(result) = translated.into_iter().next() else {
             return Ok((String::new(), StatementKind::Other));
@@ -174,6 +158,16 @@ impl LiteWireHandler {
             }
         }
     }
+}
+
+/// Convert a backend error string into a MySQL error packet with a specific
+/// error code + SQLSTATE (via [`crate::error_map::classify`]) and send it.
+async fn write_backend_error<W: AsyncWrite + Send + Unpin>(
+    results: QueryResultWriter<'_, W>,
+    err_msg: &str,
+) -> Result<(), std::io::Error> {
+    let mapped = error_map::classify(err_msg);
+    results.error(mapped.code, mapped.message.as_bytes()).await
 }
 
 /// Convert an opensrv-mysql parameter value to our backend Value type.
@@ -208,9 +202,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         let (sqlite_sql, kind) = match self.translate_sql(query) {
             Ok(r) => r,
             Err(e) => {
-                return info
-                    .error(ErrorKind::ER_PARSE_ERROR, e.as_bytes())
-                    .await;
+                return info.error(ErrorKind::ER_PARSE_ERROR, e.as_bytes()).await;
             }
         };
 
@@ -246,18 +238,31 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
             vec![]
         };
 
+        // Bound the per-connection prepared-statement cache so a client that
+        // never sends COM_STMT_CLOSE can't wedge the process. Return the same
+        // error code (1461) real MySQL uses when max_prepared_stmt_count is hit.
+        if self.stmts.len() >= MAX_PREPARED_STMTS_PER_CONN {
+            warn!(
+                stmts = self.stmts.len(),
+                "prepared-statement cap hit ({MAX_PREPARED_STMTS_PER_CONN}); rejecting COM_STMT_PREPARE"
+            );
+            return info
+                .error(
+                    ErrorKind::ER_MAX_PREPARED_STMT_COUNT_REACHED,
+                    format!(
+                        "Can't create more than {MAX_PREPARED_STMTS_PER_CONN} prepared statements \
+                         on this connection"
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+
         // Assign a statement ID and cache it.
         let stmt_id = self.next_stmt_id;
         self.next_stmt_id += 1;
 
-        self.stmts.insert(
-            stmt_id,
-            PreparedStmt {
-                sqlite_sql,
-                kind,
-                param_count,
-            },
-        );
+        self.stmts.insert(stmt_id, PreparedStmt { sqlite_sql, kind });
 
         info.reply(stmt_id, &params, &columns).await
     }
@@ -287,9 +292,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
 
         // Noop statements (empty SQL from SET NAMES etc.)
         if sql.is_empty() {
-            return results
-                .completed(ok_response(0, 0, self.in_transaction))
-                .await;
+            return results.completed(ok_response(0, 0, self.in_transaction)).await;
         }
 
         match kind {
@@ -315,9 +318,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
             Ok(r) => r,
             Err(e) => {
                 warn!("SQL translation error: {e}");
-                return results
-                    .error(ErrorKind::ER_PARSE_ERROR, e.to_string().as_bytes())
-                    .await;
+                return results.error(ErrorKind::ER_PARSE_ERROR, e.to_string().as_bytes()).await;
             }
         };
 
@@ -335,9 +336,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
                 let kind = classify(&sqlite_sql);
                 match kind {
                     StatementKind::Query => self.do_query(&sqlite_sql, &[], results).await,
-                    StatementKind::Transaction => {
-                        self.do_transaction(&sqlite_sql, results).await
-                    }
+                    StatementKind::Transaction => self.do_transaction(&sqlite_sql, results).await,
                     _ => self.do_execute(&sqlite_sql, &[], results).await,
                 }
             }

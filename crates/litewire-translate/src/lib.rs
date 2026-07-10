@@ -11,7 +11,7 @@ pub mod postgres;
 pub mod tds;
 
 use sqlparser::ast::Statement;
-use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, MsSqlDialect};
+use sqlparser::dialect::{MsSqlDialect, MySqlDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
 
 /// Source SQL dialect for translation.
@@ -57,6 +57,14 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
         return Ok(vec![TranslateResult::Metadata(meta)]);
     }
 
+    // Session/transaction statements that we handle textually before hitting
+    // sqlparser -- these either don't parse cleanly across dialects
+    // (`START TRANSACTION WITH CONSISTENT SNAPSHOT`, `BEGIN TRANSACTION named`)
+    // or are simple keyword substitutions (`LAST_INSERT_ID()` -> `last_insert_rowid()`).
+    if let Some(rewritten) = rewrite_transaction_statement(sql) {
+        return Ok(vec![TranslateResult::Sql(rewritten)]);
+    }
+
     // Check for no-op statements.
     if is_noop(sql, dialect) {
         return Ok(vec![TranslateResult::Noop]);
@@ -68,8 +76,8 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
         Dialect::TDS => Box::new(MsSqlDialect {}),
     };
 
-    let statements =
-        Parser::parse_sql(parser_dialect.as_ref(), sql).map_err(|e| TranslateError::Parse(e.to_string()))?;
+    let statements = Parser::parse_sql(parser_dialect.as_ref(), sql)
+        .map_err(|e| TranslateError::Parse(e.to_string()))?;
 
     let mut results = Vec::with_capacity(statements.len());
     for stmt in statements {
@@ -81,18 +89,96 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
     Ok(results)
 }
 
+/// Rewrite MySQL/T-SQL-flavored transaction control statements to a form
+/// SQLite accepts. Returns the rewritten SQL if the input matched a known
+/// transaction shape, or `None` to fall through to the parser / no-op check.
+///
+/// Handled:
+///   * `START TRANSACTION`, `START TRANSACTION READ ONLY`,
+///     `START TRANSACTION READ WRITE`, `START TRANSACTION WITH CONSISTENT SNAPSHOT`
+///     -> `BEGIN`
+///   * `BEGIN`, `BEGIN WORK`, `BEGIN TRANSACTION`, `BEGIN TRANSACTION <name>`
+///     (T-SQL named transactions) -> `BEGIN` (name is stripped; SQLite does not
+///     support named transactions -- callers should use SAVEPOINT if they want
+///     a nameable rollback point)
+///   * `COMMIT`, `COMMIT WORK`, `COMMIT TRANSACTION [name]` -> `COMMIT`
+///   * `ROLLBACK`, `ROLLBACK WORK`, `ROLLBACK TRANSACTION [name]` -> `ROLLBACK`
+///     (but *not* `ROLLBACK TO [SAVEPOINT] name`, which is passed through so
+///     SQLite's savepoint machinery handles it)
+fn rewrite_transaction_statement(sql: &str) -> Option<String> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_ascii_uppercase();
+
+    // START TRANSACTION ...  (MySQL / PG)
+    if upper == "START TRANSACTION" || upper.starts_with("START TRANSACTION ") {
+        return Some("BEGIN".to_string());
+    }
+
+    // BEGIN WORK / BEGIN TRANSACTION [name] -- T-SQL / SQL standard
+    // Do NOT eat plain "BEGIN" or "BEGIN;" (SQLite accepts it as-is; passing it
+    // through keeps `classify()` reporting Transaction and preserves any future
+    // dialect-specific handling in the caller).
+    if upper == "BEGIN WORK" {
+        return Some("BEGIN".to_string());
+    }
+    if upper == "BEGIN TRANSACTION" || upper.starts_with("BEGIN TRANSACTION ") {
+        return Some("BEGIN".to_string());
+    }
+
+    // COMMIT WORK / COMMIT TRANSACTION [name]
+    if upper == "COMMIT WORK" {
+        return Some("COMMIT".to_string());
+    }
+    if upper == "COMMIT TRANSACTION" || upper.starts_with("COMMIT TRANSACTION ") {
+        return Some("COMMIT".to_string());
+    }
+
+    // ROLLBACK WORK / ROLLBACK TRANSACTION [name]
+    // Careful: ROLLBACK TO SAVEPOINT name must pass through unchanged.
+    if upper == "ROLLBACK WORK" {
+        return Some("ROLLBACK".to_string());
+    }
+    if upper == "ROLLBACK TRANSACTION" {
+        return Some("ROLLBACK".to_string());
+    }
+    if let Some(rest) = upper.strip_prefix("ROLLBACK TRANSACTION ") {
+        // `ROLLBACK TRANSACTION TO SAVEPOINT foo` and `ROLLBACK TRANSACTION TO foo`
+        // are T-SQL savepoint rollback forms -- pass those through to SQLite as
+        // `ROLLBACK TO SAVEPOINT foo` / `ROLLBACK TO foo`.
+        let rest = rest.trim_start();
+        if let Some(after_to) = rest.strip_prefix("TO ") {
+            let after_to = after_to.trim_start();
+            let name_upper = if let Some(after_sp) = after_to.strip_prefix("SAVEPOINT ") {
+                after_sp.trim()
+            } else {
+                after_to.trim()
+            };
+            // Extract the original-case name by taking the same trailing chars from `trimmed`.
+            let orig_name = &trimmed[trimmed.len() - name_upper.len()..];
+            return Some(format!("ROLLBACK TO SAVEPOINT {orig_name}"));
+        }
+        // Plain `ROLLBACK TRANSACTION some_name` -- strip the name.
+        return Some("ROLLBACK".to_string());
+    }
+
+    None
+}
+
 /// Check if a SQL statement is a no-op for SQLite.
 fn is_noop(sql: &str, _dialect: Dialect) -> bool {
     let upper = sql.trim().to_ascii_uppercase();
 
     // SET statements that have no SQLite equivalent.
-    if upper.starts_with("SET ") {
-        let rest = upper["SET ".len()..].trim_start();
-        // SET NAMES, SET CHARACTER SET, SET SESSION, SET GLOBAL, SET time_zone, SET sql_mode
+    if let Some(after_set) = upper.strip_prefix("SET ") {
+        let rest = after_set.trim_start();
+        // Normalize `SET @@[session|global.]name` -> plain name, so autocommit-style
+        // rules downstream match regardless of the `@@`/`SESSION.`/`GLOBAL.` prefix.
+        let rest_norm = normalize_session_prefix(rest);
+        let rest = rest_norm.as_deref().unwrap_or(rest);
+
+        // Explicitly ignored no-ops (session/global toggles + T-SQL SET switches).
         if rest.starts_with("NAMES")
             || rest.starts_with("CHARACTER SET")
-            || rest.starts_with("SESSION")
-            || rest.starts_with("GLOBAL")
             || rest.starts_with("TIME_ZONE")
             || rest.starts_with("SQL_MODE")
             || rest.starts_with("NOCOUNT")
@@ -100,18 +186,97 @@ fn is_noop(sql: &str, _dialect: Dialect) -> bool {
             || rest.starts_with("QUOTED_IDENTIFIER")
             || rest.starts_with("XACT_ABORT")
         {
+            tracing::debug!(sql = %sql.trim(), "SET: treating as noop");
             return true;
         }
+
+        // SET autocommit = 1|0|ON|OFF|TRUE|FALSE
+        if let Some(val) = rest.strip_prefix("AUTOCOMMIT") {
+            let val = val.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
+            if val.starts_with('0') || val.starts_with("OFF") || val.starts_with("FALSE") {
+                tracing::warn!(
+                    "SET autocommit=0 requested but litewire does not emulate MySQL implicit \
+                     transactions -- statements will still auto-commit unless wrapped in BEGIN/COMMIT"
+                );
+            } else {
+                tracing::debug!("SET autocommit: noop (SQLite default matches)");
+            }
+            return true;
+        }
+
+        // SET [SESSION|GLOBAL] TRANSACTION ISOLATION LEVEL ... and bare
+        // SET TRANSACTION ... (post-normalization the SESSION/GLOBAL prefix is
+        // already stripped, so we only need to look for the TRANSACTION keyword here).
+        if rest.starts_with("TRANSACTION") {
+            tracing::debug!(
+                "SET TRANSACTION: noop (SQLite runs at serializable isolation by default)"
+            );
+            return true;
+        }
+
+        // Any remaining `SET SESSION ...` / `SET GLOBAL ...` that we didn't
+        // rewrite above (e.g. `SET SESSION wait_timeout=28800`) -- also noop.
+        if rest.starts_with("SESSION") || rest.starts_with("GLOBAL") {
+            tracing::debug!("SET SESSION/GLOBAL: noop");
+            return true;
+        }
+    }
+
+    // LOCK TABLES / UNLOCK TABLES -- SQLite has no equivalent; warn once so the
+    // user knows the requested locking semantics are not being enforced.
+    if upper.starts_with("LOCK TABLES") || upper.starts_with("LOCK TABLE ") {
+        tracing::warn!("LOCK TABLES: noop (SQLite provides file-level locking only)");
+        return true;
+    }
+    if upper == "UNLOCK TABLES" || upper.starts_with("UNLOCK TABLES ") {
+        tracing::warn!("UNLOCK TABLES: noop");
+        return true;
     }
 
     false
 }
 
+/// Strip a leading `@@` / `@@SESSION.` / `@@GLOBAL.` / `SESSION ` / `GLOBAL `
+/// prefix from an uppercased SET body, returning the trimmed remainder.
+/// Returns `None` if no prefix applied.
+fn normalize_session_prefix(rest: &str) -> Option<String> {
+    if let Some(after) = rest.strip_prefix("@@SESSION.") {
+        return Some(after.to_string());
+    }
+    if let Some(after) = rest.strip_prefix("@@GLOBAL.") {
+        return Some(after.to_string());
+    }
+    if let Some(after) = rest.strip_prefix("@@") {
+        return Some(after.to_string());
+    }
+    if let Some(after) = rest.strip_prefix("SESSION.") {
+        return Some(after.to_string());
+    }
+    if let Some(after) = rest.strip_prefix("GLOBAL.") {
+        return Some(after.to_string());
+    }
+    // `SET SESSION TRANSACTION ...` / `SET GLOBAL TRANSACTION ...`
+    if let Some(after) = rest.strip_prefix("SESSION ") {
+        // Preserve the leading keyword so downstream `.starts_with("TRANSACTION")`
+        // and `.starts_with("SESSION")` checks both remain accurate.
+        // For `SET SESSION TRANSACTION ISOLATION LEVEL ...` we want to fall
+        // through and match TRANSACTION; for `SET SESSION wait_timeout=...` we
+        // want to fall through and match SESSION. Return the tail with SESSION
+        // stripped only if TRANSACTION follows.
+        if after.trim_start().starts_with("TRANSACTION") {
+            return Some(after.trim_start().to_string());
+        }
+    }
+    if let Some(after) = rest.strip_prefix("GLOBAL ") {
+        if after.trim_start().starts_with("TRANSACTION") {
+            return Some(after.trim_start().to_string());
+        }
+    }
+    None
+}
+
 /// Rewrite a parsed statement from the source dialect to SQLite-compatible form.
-fn rewrite_statement(
-    mut stmt: Statement,
-    dialect: Dialect,
-) -> Result<Statement, TranslateError> {
+fn rewrite_statement(mut stmt: Statement, dialect: Dialect) -> Result<Statement, TranslateError> {
     // Apply common rewrites (expressions, types).
     common::rewrite_statement(&mut stmt)?;
 
@@ -185,42 +350,27 @@ mod tests {
 
     #[test]
     fn classify_insert() {
-        assert_eq!(
-            classify("INSERT INTO users VALUES (1)"),
-            StatementKind::Mutation
-        );
+        assert_eq!(classify("INSERT INTO users VALUES (1)"), StatementKind::Mutation);
     }
 
     #[test]
     fn classify_update() {
-        assert_eq!(
-            classify("UPDATE users SET name = 'x'"),
-            StatementKind::Mutation
-        );
+        assert_eq!(classify("UPDATE users SET name = 'x'"), StatementKind::Mutation);
     }
 
     #[test]
     fn classify_delete() {
-        assert_eq!(
-            classify("DELETE FROM users WHERE id = 1"),
-            StatementKind::Mutation
-        );
+        assert_eq!(classify("DELETE FROM users WHERE id = 1"), StatementKind::Mutation);
     }
 
     #[test]
     fn classify_replace() {
-        assert_eq!(
-            classify("REPLACE INTO users VALUES (1, 'x')"),
-            StatementKind::Mutation
-        );
+        assert_eq!(classify("REPLACE INTO users VALUES (1, 'x')"), StatementKind::Mutation);
     }
 
     #[test]
     fn classify_create() {
-        assert_eq!(
-            classify("CREATE TABLE users (id INT)"),
-            StatementKind::Ddl
-        );
+        assert_eq!(classify("CREATE TABLE users (id INT)"), StatementKind::Ddl);
     }
 
     #[test]
@@ -230,10 +380,7 @@ mod tests {
 
     #[test]
     fn classify_alter() {
-        assert_eq!(
-            classify("ALTER TABLE users ADD col TEXT"),
-            StatementKind::Ddl
-        );
+        assert_eq!(classify("ALTER TABLE users ADD col TEXT"), StatementKind::Ddl);
     }
 
     #[test]
@@ -276,11 +423,10 @@ mod tests {
     #[test]
     fn translate_empty_returns_empty() {
         // An empty input should still parse (to zero statements).
-        let results = translate("", Dialect::MySQL);
-        // sqlparser may return an error or empty vec — either is fine.
-        match results {
-            Ok(v) => assert!(v.is_empty()),
-            Err(_) => {} // parse error on empty string is acceptable
+        // sqlparser may return an error or empty vec -- either is fine; a parse
+        // error on empty input is acceptable.
+        if let Ok(v) = translate("", Dialect::MySQL) {
+            assert!(v.is_empty());
         }
     }
 
@@ -288,5 +434,158 @@ mod tests {
     fn translate_error_on_garbage() {
         let result = translate("NOT VALID SQL !!! @@@ {{{}}", Dialect::MySQL);
         assert!(result.is_err());
+    }
+
+    // -- Transaction rewrites --------------------------------------------------
+
+    fn expect_sql(sql: &str, dialect: Dialect) -> String {
+        let results = translate(sql, dialect).unwrap_or_else(|e| panic!("translate({sql:?}): {e}"));
+        match &results[0] {
+            TranslateResult::Sql(s) => s.clone(),
+            other => panic!("expected Sql, got: {other:?}"),
+        }
+    }
+
+    fn expect_noop(sql: &str, dialect: Dialect) {
+        let results = translate(sql, dialect).unwrap_or_else(|e| panic!("translate({sql:?}): {e}"));
+        assert!(
+            matches!(results[0], TranslateResult::Noop),
+            "expected Noop for {sql:?}, got: {:?}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn start_transaction_becomes_begin() {
+        assert_eq!(expect_sql("START TRANSACTION", Dialect::MySQL), "BEGIN");
+        assert_eq!(expect_sql("start transaction", Dialect::MySQL), "BEGIN");
+        assert_eq!(expect_sql("START TRANSACTION;", Dialect::MySQL), "BEGIN");
+    }
+
+    #[test]
+    fn start_transaction_read_only_becomes_begin() {
+        assert_eq!(expect_sql("START TRANSACTION READ ONLY", Dialect::MySQL), "BEGIN");
+    }
+
+    #[test]
+    fn start_transaction_with_consistent_snapshot_becomes_begin() {
+        assert_eq!(
+            expect_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT", Dialect::MySQL),
+            "BEGIN"
+        );
+    }
+
+    #[test]
+    fn tsql_begin_transaction_becomes_begin() {
+        assert_eq!(expect_sql("BEGIN TRANSACTION", Dialect::TDS), "BEGIN");
+    }
+
+    #[test]
+    fn tsql_named_begin_transaction_strips_name() {
+        assert_eq!(expect_sql("BEGIN TRANSACTION my_txn", Dialect::TDS), "BEGIN");
+    }
+
+    #[test]
+    fn begin_work_becomes_begin() {
+        assert_eq!(expect_sql("BEGIN WORK", Dialect::MySQL), "BEGIN");
+    }
+
+    #[test]
+    fn commit_work_and_named_become_commit() {
+        assert_eq!(expect_sql("COMMIT WORK", Dialect::MySQL), "COMMIT");
+        assert_eq!(expect_sql("COMMIT TRANSACTION my_txn", Dialect::TDS), "COMMIT");
+    }
+
+    #[test]
+    fn rollback_work_and_named_become_rollback() {
+        assert_eq!(expect_sql("ROLLBACK WORK", Dialect::MySQL), "ROLLBACK");
+        assert_eq!(expect_sql("ROLLBACK TRANSACTION my_txn", Dialect::TDS), "ROLLBACK");
+    }
+
+    #[test]
+    fn rollback_to_savepoint_passthrough() {
+        // Plain `ROLLBACK TO SAVEPOINT foo` is not a transaction control statement --
+        // it's a savepoint rollback and must reach the parser so SQLite gets it.
+        let results = translate("ROLLBACK TO SAVEPOINT foo", Dialect::MySQL).unwrap();
+        // Whatever emit produces, it must still be a Sql result containing SAVEPOINT and foo.
+        match &results[0] {
+            TranslateResult::Sql(s) => {
+                assert!(s.to_ascii_uppercase().contains("SAVEPOINT"), "got: {s}");
+                assert!(s.contains("foo"), "got: {s}");
+            }
+            other => panic!("expected Sql, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tsql_rollback_transaction_to_savepoint_rewritten() {
+        // T-SQL: ROLLBACK TRANSACTION TO SAVEPOINT foo -> ROLLBACK TO SAVEPOINT foo
+        let sql = expect_sql("ROLLBACK TRANSACTION TO SAVEPOINT foo", Dialect::TDS);
+        let up = sql.to_ascii_uppercase();
+        assert!(up.contains("ROLLBACK"), "got: {sql}");
+        assert!(up.contains("SAVEPOINT"), "got: {sql}");
+        assert!(sql.contains("foo"), "got: {sql}");
+    }
+
+    #[test]
+    fn savepoint_passthrough() {
+        // SAVEPOINT foo should reach the parser and come out as valid SAVEPOINT SQL.
+        let results = translate("SAVEPOINT foo", Dialect::MySQL).unwrap();
+        match &results[0] {
+            TranslateResult::Sql(s) => {
+                assert!(s.to_ascii_uppercase().contains("SAVEPOINT"), "got: {s}");
+                assert!(s.contains("foo"), "got: {s}");
+            }
+            other => panic!("expected Sql for SAVEPOINT, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn release_savepoint_passthrough() {
+        let results = translate("RELEASE SAVEPOINT foo", Dialect::MySQL).unwrap();
+        match &results[0] {
+            TranslateResult::Sql(s) => {
+                assert!(s.to_ascii_uppercase().contains("RELEASE"), "got: {s}");
+                assert!(s.contains("foo"), "got: {s}");
+            }
+            other => panic!("expected Sql for RELEASE SAVEPOINT, got: {other:?}"),
+        }
+    }
+
+    // -- SET session/global/autocommit noops -----------------------------------
+
+    #[test]
+    fn set_autocommit_1_is_noop() {
+        expect_noop("SET autocommit = 1", Dialect::MySQL);
+        expect_noop("SET AUTOCOMMIT=ON", Dialect::MySQL);
+        expect_noop("SET autocommit = true", Dialect::MySQL);
+    }
+
+    #[test]
+    fn set_autocommit_0_is_noop_with_warning() {
+        // We don't emulate implicit-transaction mode, but we do return Noop
+        // rather than an error -- log will be a WARN at runtime.
+        expect_noop("SET autocommit = 0", Dialect::MySQL);
+        expect_noop("SET autocommit = OFF", Dialect::MySQL);
+    }
+
+    #[test]
+    fn set_transaction_isolation_level_is_noop() {
+        expect_noop("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", Dialect::MySQL);
+        expect_noop("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", Dialect::MySQL);
+        expect_noop("SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ", Dialect::MySQL);
+    }
+
+    #[test]
+    fn set_at_at_session_variable_is_noop() {
+        expect_noop("SET @@session.autocommit = 1", Dialect::MySQL);
+        expect_noop("SET @@global.autocommit = 1", Dialect::MySQL);
+        expect_noop("SET @@autocommit = 1", Dialect::MySQL);
+    }
+
+    #[test]
+    fn lock_tables_is_noop() {
+        expect_noop("LOCK TABLES users WRITE", Dialect::MySQL);
+        expect_noop("UNLOCK TABLES", Dialect::MySQL);
     }
 }

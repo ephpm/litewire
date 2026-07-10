@@ -120,10 +120,7 @@ mod tests {
 
     #[test]
     fn display_blob() {
-        assert_eq!(
-            format!("{}", Value::Blob(vec![0xDE, 0xAD])),
-            "<blob 2 bytes>"
-        );
+        assert_eq!(format!("{}", Value::Blob(vec![0xDE, 0xAD])), "<blob 2 bytes>");
         assert_eq!(format!("{}", Value::Blob(vec![])), "<blob 0 bytes>");
     }
 
@@ -156,20 +153,14 @@ mod tests {
 
     #[test]
     fn column_with_decltype() {
-        let c = Column {
-            name: "id".into(),
-            decltype: Some("INTEGER".into()),
-        };
+        let c = Column { name: "id".into(), decltype: Some("INTEGER".into()) };
         assert_eq!(c.name, "id");
         assert_eq!(c.decltype.as_deref(), Some("INTEGER"));
     }
 
     #[test]
     fn column_without_decltype() {
-        let c = Column {
-            name: "expr".into(),
-            decltype: None,
-        };
+        let c = Column { name: "expr".into(), decltype: None };
         assert!(c.decltype.is_none());
     }
 
@@ -177,10 +168,7 @@ mod tests {
 
     #[test]
     fn execute_result_no_insert() {
-        let r = ExecuteResult {
-            affected_rows: 3,
-            last_insert_rowid: None,
-        };
+        let r = ExecuteResult { affected_rows: 3, last_insert_rowid: None };
         assert_eq!(r.affected_rows, 3);
         assert!(r.last_insert_rowid.is_none());
     }

@@ -11,8 +11,8 @@ use futures::stream;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldInfo,
-    QueryResponse, Response, Tag,
+    DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldInfo, QueryResponse,
+    Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, Type};
@@ -23,6 +23,7 @@ use tracing::{debug, warn};
 use litewire_backend::{SharedBackend, Value};
 use litewire_translate::{self, Dialect, StatementKind, TranslateResult, classify};
 
+use crate::error_map;
 use crate::types::sqlite_to_pg_type;
 
 /// Handler for a single PostgreSQL client connection.
@@ -33,16 +34,13 @@ pub struct PostgresHandler {
 
 impl PostgresHandler {
     pub fn new(backend: SharedBackend) -> Self {
-        Self {
-            backend,
-            query_parser: Arc::new(NoopQueryParser::new()),
-        }
+        Self { backend, query_parser: Arc::new(NoopQueryParser::new()) }
     }
 
     /// Translate SQL from PostgreSQL dialect to SQLite and classify it.
     fn translate_sql(&self, query: &str) -> Result<(String, StatementKind), String> {
-        let translated = litewire_translate::translate(query, Dialect::PostgreSQL)
-            .map_err(|e| e.to_string())?;
+        let translated =
+            litewire_translate::translate(query, Dialect::PostgreSQL).map_err(|e| e.to_string())?;
 
         let Some(result) = translated.into_iter().next() else {
             return Ok((String::new(), StatementKind::Other));
@@ -82,11 +80,7 @@ impl PostgresHandler {
         params: &[Value],
         format: &Format,
     ) -> PgWireResult<Response<'a>> {
-        let rs = self
-            .backend
-            .query(sql, params)
-            .await
-            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        let rs = self.backend.query(sql, params).await.map_err(|e| pg_backend_error(&e))?;
 
         // Build field info, inferring types from declared type first,
         // then falling back to the first row's actual values for expressions
@@ -106,13 +100,7 @@ impl PostgresHandler {
                         .map(value_to_pg_type)
                         .unwrap_or(Type::TEXT)
                 };
-                FieldInfo::new(
-                    col.name.clone(),
-                    None,
-                    None,
-                    pg_type,
-                    format.format_for(idx),
-                )
+                FieldInfo::new(col.name.clone(), None, None, pg_type, format.format_for(idx))
             })
             .collect();
 
@@ -127,10 +115,7 @@ impl PostgresHandler {
             rows.push(encoder.finish());
         }
 
-        Ok(Response::Query(QueryResponse::new(
-            schema,
-            stream::iter(rows),
-        )))
+        Ok(Response::Query(QueryResponse::new(schema, stream::iter(rows))))
     }
 
     /// Execute a mutation (INSERT/UPDATE/DELETE/DDL) and return an execution response.
@@ -143,10 +128,7 @@ impl PostgresHandler {
         // Transaction commands need special Response variants, handle before
         // the generic execute path to avoid double-execution.
         if *kind == StatementKind::Transaction {
-            self.backend
-                .execute(sql, params)
-                .await
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            self.backend.execute(sql, params).await.map_err(|e| pg_backend_error(&e))?;
 
             let upper = sql.trim().to_ascii_uppercase();
             if upper.starts_with("BEGIN") || upper.starts_with("START") {
@@ -161,11 +143,7 @@ impl PostgresHandler {
             return Ok(Response::Execution(Tag::new("OK")));
         }
 
-        let result = self
-            .backend
-            .execute(sql, params)
-            .await
-            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        let result = self.backend.execute(sql, params).await.map_err(|e| pg_backend_error(&e))?;
 
         let tag_name = match kind {
             StatementKind::Mutation => {
@@ -207,11 +185,7 @@ impl PostgresHandler {
     ///
     /// Uses LIMIT 1 (not LIMIT 0) so we can infer types from actual data
     /// when columns lack declared types (e.g. `SELECT 1 + 2`).
-    async fn probe_columns(
-        &self,
-        sql: &str,
-        format: &Format,
-    ) -> PgWireResult<Vec<FieldInfo>> {
+    async fn probe_columns(&self, sql: &str, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
         let probe = format!("{sql} LIMIT 1");
         match self.backend.query(&probe, &[]).await {
             Ok(rs) => Ok(rs
@@ -228,13 +202,7 @@ impl PostgresHandler {
                             .map(value_to_pg_type)
                             .unwrap_or(Type::TEXT)
                     };
-                    FieldInfo::new(
-                        col.name.clone(),
-                        None,
-                        None,
-                        pg_type,
-                        format.format_for(idx),
-                    )
+                    FieldInfo::new(col.name.clone(), None, None, pg_type, format.format_for(idx))
                 })
                 .collect()),
             Err(_) => Ok(vec![]),
@@ -256,11 +224,7 @@ fn value_to_pg_type(val: &Value) -> Type {
 }
 
 /// Encode a single backend `Value` into a pgwire `DataRowEncoder`.
-fn encode_value(
-    encoder: &mut DataRowEncoder,
-    val: &Value,
-    field: &FieldInfo,
-) -> PgWireResult<()> {
+fn encode_value(encoder: &mut DataRowEncoder, val: &Value, field: &FieldInfo) -> PgWireResult<()> {
     match val {
         Value::Null => encoder.encode_field(&None::<i8>),
         Value::Integer(i) => {
@@ -282,12 +246,7 @@ fn encode_value(
 fn extract_params(portal: &Portal<String>) -> Vec<Value> {
     let mut values = Vec::with_capacity(portal.parameter_len());
     for i in 0..portal.parameter_len() {
-        let param_type = portal
-            .statement
-            .parameter_types
-            .get(i)
-            .cloned()
-            .unwrap_or(Type::TEXT);
+        let param_type = portal.statement.parameter_types.get(i).cloned().unwrap_or(Type::TEXT);
 
         let val = match &param_type {
             t if *t == Type::BOOL => portal
@@ -312,7 +271,7 @@ fn extract_params(portal: &Portal<String>) -> Vec<Value> {
                 .parameter::<i64>(i, &param_type)
                 .ok()
                 .flatten()
-                .map_or(Value::Null, |v| Value::Integer(v)),
+                .map_or(Value::Null, Value::Integer),
 
             t if *t == Type::FLOAT4 => portal
                 .parameter::<f32>(i, &param_type)
@@ -324,7 +283,7 @@ fn extract_params(portal: &Portal<String>) -> Vec<Value> {
                 .parameter::<f64>(i, &param_type)
                 .ok()
                 .flatten()
-                .map_or(Value::Null, |v| Value::Float(v)),
+                .map_or(Value::Null, Value::Float),
 
             t if *t == Type::BYTEA => portal
                 .parameter::<Vec<u8>>(i, &param_type)
@@ -344,12 +303,25 @@ fn extract_params(portal: &Portal<String>) -> Vec<Value> {
     values
 }
 
-/// Build a PgWireError from an error string.
+/// Build a PgWireError from an arbitrary error string with SQLSTATE `XX000`
+/// (internal_error). Prefer [`pg_backend_error`] for messages that came from
+/// the backend so they get classified into a specific SQLSTATE.
 fn pg_error(msg: &str) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_owned(),
         "XX000".to_owned(),
         msg.to_owned(),
+    )))
+}
+
+/// Build a PgWireError from a litewire-backend error, classifying it into a
+/// real PostgreSQL SQLSTATE (see [`crate::error_map`]).
+fn pg_backend_error(err: &litewire_backend::BackendError) -> PgWireError {
+    let mapped = error_map::classify(&err.to_string());
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        mapped.sqlstate.to_owned(),
+        mapped.message,
     )))
 }
 
@@ -365,8 +337,8 @@ impl SimpleQueryHandler for PostgresHandler {
     {
         debug!(sql = %query, "PG simple query");
 
-        let translated = litewire_translate::translate(query, Dialect::PostgreSQL)
-            .map_err(|e| {
+        let translated =
+            litewire_translate::translate(query, Dialect::PostgreSQL).map_err(|e| {
                 warn!("SQL translation error: {e}");
                 pg_error(&e.to_string())
             })?;
@@ -375,20 +347,16 @@ impl SimpleQueryHandler for PostgresHandler {
 
         for result in translated {
             let resp = match result {
-                TranslateResult::Noop => {
-                    Response::Execution(Tag::new("SET"))
-                }
+                TranslateResult::Noop => Response::Execution(Tag::new("SET")),
                 TranslateResult::Metadata(meta) => {
                     let sqlite_sql = meta.to_sqlite_sql();
-                    self.exec_query(&sqlite_sql, &[], &Format::UnifiedText)
-                        .await?
+                    self.exec_query(&sqlite_sql, &[], &Format::UnifiedText).await?
                 }
                 TranslateResult::Sql(sqlite_sql) => {
                     if sqlite_sql.is_empty() {
                         Response::Execution(Tag::new("OK"))
                     } else {
-                        self.exec_query(&sqlite_sql, &[], &Format::UnifiedText)
-                            .await?
+                        self.exec_query(&sqlite_sql, &[], &Format::UnifiedText).await?
                     }
                 }
             };
@@ -431,8 +399,7 @@ impl ExtendedQueryHandler for PostgresHandler {
         }
 
         let params = extract_params(portal);
-        self.exec_query(&sqlite_sql, &params, &portal.result_column_format)
-            .await
+        self.exec_query(&sqlite_sql, &params, &portal.result_column_format).await
     }
 
     async fn do_describe_statement<C>(
@@ -443,16 +410,12 @@ impl ExtendedQueryHandler for PostgresHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let (sqlite_sql, kind) = self
-            .translate_sql(&stmt.statement)
-            .map_err(|e| pg_error(&e))?;
+        let (sqlite_sql, kind) = self.translate_sql(&stmt.statement).map_err(|e| pg_error(&e))?;
 
         let param_types = stmt.parameter_types.clone();
 
         if kind == StatementKind::Query && !sqlite_sql.is_empty() {
-            let fields = self
-                .probe_columns(&sqlite_sql, &Format::UnifiedBinary)
-                .await?;
+            let fields = self.probe_columns(&sqlite_sql, &Format::UnifiedBinary).await?;
             Ok(DescribeStatementResponse::new(param_types, fields))
         } else {
             Ok(DescribeStatementResponse::new(param_types, vec![]))
@@ -467,14 +430,11 @@ impl ExtendedQueryHandler for PostgresHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let (sqlite_sql, kind) = self
-            .translate_sql(&portal.statement.statement)
-            .map_err(|e| pg_error(&e))?;
+        let (sqlite_sql, kind) =
+            self.translate_sql(&portal.statement.statement).map_err(|e| pg_error(&e))?;
 
         if kind == StatementKind::Query && !sqlite_sql.is_empty() {
-            let fields = self
-                .probe_columns(&sqlite_sql, &portal.result_column_format)
-                .await?;
+            let fields = self.probe_columns(&sqlite_sql, &portal.result_column_format).await?;
             Ok(DescribePortalResponse::new(fields))
         } else {
             Ok(DescribePortalResponse::new(vec![]))
