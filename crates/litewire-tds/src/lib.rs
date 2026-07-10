@@ -56,6 +56,8 @@ impl TdsFrontend {
                     continue;
                 }
             };
+            // See litewire-mysql: Nagle + delayed ACK costs ~40ms per round trip.
+            let _ = stream.set_nodelay(true);
             debug!(%peer, "TDS client connected");
 
             let be = Arc::clone(&backend);

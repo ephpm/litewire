@@ -64,6 +64,8 @@ impl PostgresFrontend {
                     continue;
                 }
             };
+            // See litewire-mysql: Nagle + delayed ACK costs ~40ms per round trip.
+            let _ = stream.set_nodelay(true);
             debug!(%peer, "PostgreSQL client connected");
 
             let factory = Arc::clone(&factory);
