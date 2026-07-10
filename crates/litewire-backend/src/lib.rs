@@ -3,6 +3,24 @@
 //! The backend abstracts over how SQL gets executed. litewire doesn't care
 //! whether SQLite is in-process or remote -- it only needs `query` and
 //! `execute`.
+//!
+//! # Session isolation
+//!
+//! [`Backend`] is a **factory** for [`BackendConn`] instances. Each wire
+//! connection (one MySQL/Postgres/TDS client) obtains its own [`BackendConn`]
+//! via [`Backend::connect`] at session start, and drops it on disconnect.
+//!
+//! This is the whole point of the trait split: transactions are per-session
+//! state. Sharing one backend handle across many wire connections lets
+//! client B's statements land inside client A's open transaction, and lets
+//! either client's `COMMIT` finalize both. Per-`BackendConn` isolation makes
+//! transaction boundaries match wire-connection boundaries -- the property
+//! every SQL client already assumes.
+//!
+//! [`Backend::query`] and [`Backend::execute`] remain on the trait as a
+//! stateless convenience API: they take out a fresh short-lived connection
+//! per call. Callers that need transactions (i.e. all wire frontends) must
+//! use [`Backend::connect`].
 
 #[cfg(feature = "rusqlite")]
 pub mod rusqlite_backend;
@@ -69,9 +87,23 @@ pub enum BackendError {
     Other(String),
 }
 
-/// The core backend trait. Implementations execute SQL against a storage engine.
+/// A per-session backend handle.
+///
+/// A `BackendConn` corresponds to **one wire-protocol client connection**.
+/// Its state (open transactions, session variables, prepared statements
+/// cached inside the underlying driver) belongs to that client alone; a
+/// second wire client gets its own `BackendConn` via [`Backend::connect`]
+/// and cannot see or disturb the first one's transaction.
+///
+/// Dropping a `BackendConn` closes the underlying session (for `rusqlite`,
+/// closes the SQLite `Connection`; for Hrana, sends a best-effort `close`
+/// to release the sqld stream).
+///
+/// Implementations must be `Send + Sync` because wire frontends move them
+/// across `.await` points and (in some frontends) hand them to spawned
+/// tasks.
 #[async_trait::async_trait]
-pub trait Backend: Send + Sync + 'static {
+pub trait BackendConn: Send + Sync {
     /// Execute a query that returns rows.
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError>;
 
@@ -97,6 +129,63 @@ pub trait Backend: Send + Sync + 'static {
     }
 }
 
+/// The core backend trait -- a factory for per-session [`BackendConn`] handles.
+///
+/// Implementations execute SQL against a storage engine. `Backend` itself
+/// carries no session state; call [`Backend::connect`] to open a session.
+///
+/// The stateless [`Backend::query`] / [`Backend::execute`] shortcuts remain
+/// for callers that do not need transactions (metrics wrappers, one-off
+/// probes). They open a fresh `BackendConn` per call and drop it -- do **not**
+/// use them for BEGIN/COMMIT sequences.
+#[async_trait::async_trait]
+pub trait Backend: Send + Sync + 'static {
+    /// Open a new session against the underlying storage.
+    ///
+    /// Each returned [`BackendConn`] has its own transaction state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if opening a new session fails (e.g., the SQLite
+    /// file is unreachable, or the remote sqld is unhealthy).
+    async fn connect(&self) -> Result<Box<dyn BackendConn>, BackendError>;
+
+    /// Execute a query using a fresh, throw-away session.
+    ///
+    /// Convenience shim over [`Backend::connect`] for stateless callers.
+    /// Do not use this inside a transaction -- there is no cross-call
+    /// session state.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from opening the session or executing the query.
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> {
+        self.connect().await?.query(sql, params).await
+    }
+
+    /// Execute a mutation using a fresh, throw-away session.
+    ///
+    /// Convenience shim over [`Backend::connect`]. See [`Backend::query`].
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from opening the session or executing the statement.
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, BackendError> {
+        self.connect().await?.execute(sql, params).await
+    }
+
+    /// Describe the columns of a prepared SELECT via a throw-away session.
+    ///
+    /// Convenience shim over [`Backend::connect`] + [`BackendConn::describe_columns`].
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from opening the session or describing the statement.
+    async fn describe_columns(&self, sql: &str) -> Result<Vec<Column>, BackendError> {
+        self.connect().await?.describe_columns(sql).await
+    }
+}
+
 /// Type alias for a shared backend reference.
 pub type SharedBackend = Arc<dyn Backend>;
 
@@ -110,7 +199,7 @@ pub use hrana_client::HranaClient;
 mod tests {
     use super::*;
 
-    // ── Value Display ───────────────────────────────────────────────────────
+    // -- Value Display ---------------------------------------------------
 
     #[test]
     fn display_null() {
@@ -145,7 +234,7 @@ mod tests {
         assert_eq!(format!("{}", Value::Blob(vec![])), "<blob 0 bytes>");
     }
 
-    // ── Value PartialEq ─────────────────────────────────────────────────────
+    // -- Value PartialEq -------------------------------------------------
 
     #[test]
     fn value_equality() {
@@ -159,7 +248,7 @@ mod tests {
         assert_ne!(Value::Blob(vec![1]), Value::Blob(vec![2]));
     }
 
-    // ── BackendError Display ────────────────────────────────────────────────
+    // -- BackendError Display --------------------------------------------
 
     #[test]
     fn backend_error_display() {
@@ -170,7 +259,7 @@ mod tests {
         assert!(e.to_string().contains("connection failed"));
     }
 
-    // ── Column ──────────────────────────────────────────────────────────────
+    // -- Column ----------------------------------------------------------
 
     #[test]
     fn column_with_decltype() {
@@ -191,7 +280,7 @@ mod tests {
         assert!(c.decltype.is_none());
     }
 
-    // ── ExecuteResult ───────────────────────────────────────────────────────
+    // -- ExecuteResult ---------------------------------------------------
 
     #[test]
     fn execute_result_no_insert() {
@@ -203,7 +292,7 @@ mod tests {
         assert!(r.last_insert_rowid.is_none());
     }
 
-    // ── ResultSet ───────────────────────────────────────────────────────────
+    // -- ResultSet -------------------------------------------------------
 
     #[test]
     fn empty_result_set() {

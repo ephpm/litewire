@@ -3,14 +3,31 @@
 //! Implements the [`Backend`] trait by forwarding queries to a remote
 //! server (typically sqld) via the Hrana 3 pipeline protocol over HTTP.
 //!
+//! # Per-session isolation via Hrana baton
+//!
+//! sqld's Hrana protocol scopes transactions to a *stream*, identified by
+//! an opaque baton passed in each pipeline request. Without a baton every
+//! call lands on the default stream, and (as with the shared-`Mutex`
+//! rusqlite bug) `BEGIN` on one wire client would be visible to every
+//! other.
+//!
+//! Each [`HranaConn`] returned by [`HranaClient::connect`] carries its own
+//! baton and pins itself to a single sqld stream for the lifetime of the
+//! wire session. On drop the client sends a `close` request so sqld
+//! releases the stream promptly (best-effort -- sqld also times streams
+//! out on its own).
+//!
 //! The Hrana protocol types are defined inline here to avoid a cyclic
 //! dependency between `litewire-backend` and `litewire-hrana`.
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::{Backend, BackendError, Column, ExecuteResult, ResultSet, Value};
+use crate::{Backend, BackendConn, BackendError, Column, ExecuteResult, ResultSet, Value};
 
-// ── Hrana 3 wire types (inline) ─────────────────────────────────────────────
+// -- Hrana 3 wire types (inline) -------------------------------------------
 
 #[derive(Serialize)]
 struct PipelineRequest {
@@ -22,6 +39,7 @@ struct PipelineRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum StreamRequest {
     Execute(ExecuteRequest),
+    Close,
 }
 
 #[derive(Serialize)]
@@ -47,6 +65,16 @@ enum HranaValue {
 
 #[derive(Deserialize)]
 struct PipelineResponse {
+    /// Baton returned by sqld. Must be sent back on subsequent requests
+    /// on this stream so sqld keeps transaction state alive.
+    #[serde(default)]
+    baton: Option<String>,
+    /// If sqld wants us to move the stream to a different URL (redirect
+    /// / migration), it comes back here. We don't currently follow it --
+    /// noted for future work.
+    #[serde(default)]
+    #[allow(dead_code)]
+    base_url: Option<String>,
     results: Vec<StreamResult>,
 }
 
@@ -94,17 +122,26 @@ struct ErrorResponse {
     code: Option<String>,
 }
 
-// ── Client ──────────────────────────────────────────────────────────────────
+// -- Client ----------------------------------------------------------------
 
-/// A backend that talks to sqld (or any Hrana-compatible server) over HTTP.
-///
-/// Uses `reqwest` with HTTP/2 connection reuse for minimal overhead on
-/// localhost. Thread-safe and cheaply cloneable.
+/// Shared connection parameters. Cheap to clone.
 #[derive(Clone)]
-pub struct HranaClient {
+struct Endpoint {
     client: reqwest::Client,
     pipeline_url: String,
     health_url: String,
+}
+
+/// A backend that talks to sqld (or any Hrana-compatible server) over HTTP.
+///
+/// This is a **factory** -- [`Backend::connect`] returns a [`HranaConn`]
+/// that pins itself to a single sqld stream for transaction isolation.
+///
+/// The reqwest `Client` uses HTTP/2 connection reuse across all sessions,
+/// so opening a new [`HranaConn`] does not open a new TCP connection.
+#[derive(Clone)]
+pub struct HranaClient {
+    endpoint: Endpoint,
 }
 
 impl HranaClient {
@@ -120,9 +157,11 @@ impl HranaClient {
     pub fn new(base_url: &str) -> Self {
         let base = base_url.trim_end_matches('/');
         Self {
-            client: reqwest::Client::new(),
-            pipeline_url: format!("{base}/v2/pipeline"),
-            health_url: format!("{base}/health"),
+            endpoint: Endpoint {
+                client: reqwest::Client::new(),
+                pipeline_url: format!("{base}/v2/pipeline"),
+                health_url: format!("{base}/health"),
+            },
         }
     }
 
@@ -134,8 +173,9 @@ impl HranaClient {
     /// a non-success status.
     pub async fn health_check(&self) -> Result<(), BackendError> {
         let resp = self
+            .endpoint
             .client
-            .get(&self.health_url)
+            .get(&self.endpoint.health_url)
             .send()
             .await
             .map_err(|e| BackendError::Other(format!("health check failed: {e}")))?;
@@ -149,8 +189,34 @@ impl HranaClient {
             )))
         }
     }
+}
 
+#[async_trait::async_trait]
+impl Backend for HranaClient {
+    async fn connect(&self) -> Result<Box<dyn BackendConn>, BackendError> {
+        Ok(Box::new(HranaConn {
+            endpoint: self.endpoint.clone(),
+            baton: Arc::new(Mutex::new(None)),
+        }))
+    }
+}
+
+/// A per-session Hrana stream.
+///
+/// Carries the sqld-issued baton across successive `query`/`execute`
+/// calls so all statements run against the same sqld stream and share
+/// transaction state.
+pub struct HranaConn {
+    endpoint: Endpoint,
+    /// Baton from the last successful response. `None` on the very first
+    /// request; sqld's `_default` stream will pick us up and issue a
+    /// baton in the response.
+    baton: Arc<Mutex<Option<String>>>,
+}
+
+impl HranaConn {
     /// Send a single statement via the Hrana pipeline and return the response.
+    /// Updates the stored baton with whatever sqld returns.
     async fn execute_pipeline(
         &self,
         sql: &str,
@@ -158,8 +224,10 @@ impl HranaClient {
     ) -> Result<ExecuteResponse, BackendError> {
         let args: Vec<HranaValue> = params.iter().map(value_to_hrana).collect();
 
+        let current_baton = self.baton.lock().clone();
+
         let request = PipelineRequest {
-            baton: None,
+            baton: current_baton,
             requests: vec![StreamRequest::Execute(ExecuteRequest {
                 stmt: StmtRequest {
                     sql: sql.to_string(),
@@ -169,8 +237,9 @@ impl HranaClient {
         };
 
         let resp = self
+            .endpoint
             .client
-            .post(&self.pipeline_url)
+            .post(&self.endpoint.pipeline_url)
             .json(&request)
             .send()
             .await
@@ -188,6 +257,11 @@ impl HranaClient {
             .json()
             .await
             .map_err(|e| BackendError::Other(format!("failed to parse response: {e}")))?;
+
+        // Store the new baton so the next call stays on this stream. sqld
+        // rotates batons per request; if we drop this update the next call
+        // reverts to a fresh stream and transaction state is lost.
+        *self.baton.lock() = pipeline.baton;
 
         let result = pipeline
             .results
@@ -207,8 +281,35 @@ impl HranaClient {
     }
 }
 
+impl Drop for HranaConn {
+    fn drop(&mut self) {
+        // Best-effort stream close so sqld reclaims resources without
+        // waiting on its idle timer. We can't await inside Drop, so
+        // spawn a detached task with a cheap clone of the endpoint.
+        let baton = self.baton.lock().clone();
+        let Some(baton) = baton else { return };
+        let endpoint = self.endpoint.clone();
+        // Only fire the close if a tokio runtime is available. In tests
+        // that construct HranaConn outside a runtime this is a no-op.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let request = PipelineRequest {
+                    baton: Some(baton),
+                    requests: vec![StreamRequest::Close],
+                };
+                let _ = endpoint
+                    .client
+                    .post(&endpoint.pipeline_url)
+                    .json(&request)
+                    .send()
+                    .await;
+            });
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl Backend for HranaClient {
+impl BackendConn for HranaConn {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> {
         let exec = self.execute_pipeline(sql, params).await?;
         Ok(execute_response_to_result_set(exec))
@@ -226,7 +327,7 @@ impl Backend for HranaClient {
     }
 }
 
-// ── Conversions ─────────────────────────────────────────────────────────────
+// -- Conversions -----------------------------------------------------------
 
 /// Convert a backend [`Value`] to a Hrana wire value.
 fn value_to_hrana(val: &Value) -> HranaValue {

@@ -7,7 +7,7 @@ use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
-use litewire_backend::{SharedBackend, Value};
+use litewire_backend::{BackendConn, SharedBackend, Value};
 use litewire_translate::{self, Dialect, StatementKind, TranslateResult, classify};
 
 use crate::packet::{self, DEFAULT_PACKET_SIZE, PacketType};
@@ -49,6 +49,10 @@ impl TdsSession {
 }
 
 /// Handle a single TDS client connection from start to finish.
+///
+/// Opens a per-session `BackendConn` after Pre-Login/Login7 so this
+/// client's `BEGIN`/`COMMIT` are isolated from other TDS clients. See
+/// the `BackendConn` docs for the rationale.
 pub async fn handle_connection<S>(mut stream: S, backend: SharedBackend) -> std::io::Result<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
@@ -59,6 +63,13 @@ where
     // Phase 2: Login7
     let db_name = handle_login7(&mut stream).await?;
     debug!(database = %db_name, "TDS login complete");
+
+    // Open the per-session backend handle. If this fails we can't serve
+    // the client -- treat it as a session error.
+    let conn = backend
+        .connect()
+        .await
+        .map_err(|e| std::io::Error::other(format!("TDS: failed to open backend session: {e}")))?;
 
     let mut session = TdsSession::new();
 
@@ -74,11 +85,11 @@ where
 
         match msg.packet_type {
             PacketType::SqlBatch => {
-                handle_sql_batch(&mut stream, &backend, &msg.payload, &mut session).await?;
+                handle_sql_batch(&mut stream, conn.as_ref(), &msg.payload, &mut session).await?;
             }
             PacketType::RpcRequest => {
                 // Basic RPC support: try to extract SQL from sp_executesql.
-                handle_rpc_request(&mut stream, &backend, &msg.payload, &mut session).await?;
+                handle_rpc_request(&mut stream, conn.as_ref(), &msg.payload, &mut session).await?;
             }
             other => {
                 debug!(?other, "ignoring unexpected TDS packet type");
@@ -221,7 +232,7 @@ fn decode_utf16le(data: &[u8]) -> Option<String> {
 /// Handle a SQL Batch message.
 async fn handle_sql_batch<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
-    backend: &SharedBackend,
+    backend: &dyn BackendConn,
     payload: &[u8],
     session: &mut TdsSession,
 ) -> std::io::Result<()> {
@@ -262,7 +273,7 @@ fn skip_all_headers(payload: &[u8]) -> usize {
 /// Minimal implementation: extracts SQL from sp_executesql calls.
 async fn handle_rpc_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
-    backend: &SharedBackend,
+    backend: &dyn BackendConn,
     payload: &[u8],
     session: &mut TdsSession,
 ) -> std::io::Result<()> {
@@ -299,7 +310,7 @@ async fn handle_rpc_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 /// Extracts the SQL text from the first NVARCHAR parameter.
 async fn handle_sp_executesql<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
-    backend: &SharedBackend,
+    backend: &dyn BackendConn,
     data: &[u8],
     session: &mut TdsSession,
 ) -> std::io::Result<()> {
@@ -376,7 +387,7 @@ fn extract_nvarchar_param(data: &[u8]) -> Option<String> {
 /// Execute translated SQL and send the result as a TDS response.
 async fn execute_sql<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
-    backend: &SharedBackend,
+    backend: &dyn BackendConn,
     sql: &str,
     params: &[Value],
     session: &mut TdsSession,
@@ -434,7 +445,7 @@ async fn execute_sql<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 /// Execute a transaction command and write ENVCHANGE + DONE tokens.
 async fn write_transaction_result(
     resp: &mut BytesMut,
-    backend: &SharedBackend,
+    backend: &dyn BackendConn,
     sql: &str,
     session: &mut TdsSession,
 ) {
@@ -463,7 +474,7 @@ async fn write_transaction_result(
 /// Execute a SELECT and write COLMETADATA + ROW + DONE tokens.
 async fn write_query_result(
     resp: &mut BytesMut,
-    backend: &SharedBackend,
+    backend: &dyn BackendConn,
     sql: &str,
     params: &[Value],
 ) {
@@ -488,7 +499,7 @@ async fn write_query_result(
 /// Execute a mutation and write a DONE token with row count.
 async fn write_exec_result(
     resp: &mut BytesMut,
-    backend: &SharedBackend,
+    backend: &dyn BackendConn,
     sql: &str,
     params: &[Value],
 ) {

@@ -20,26 +20,39 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use tracing::{debug, warn};
 
-use litewire_backend::{SharedBackend, Value};
+use litewire_backend::{BackendConn, BackendError, SharedBackend, Value};
 use litewire_translate::{self, Dialect, StatementKind, TranslateCache, TranslateResult, classify};
 
 use crate::error_map;
 use crate::types::sqlite_to_pg_type;
 
 /// Handler for a single PostgreSQL client connection.
+///
+/// Owns a per-session [`BackendConn`] so `BEGIN`/`COMMIT`/`ROLLBACK` are
+/// isolated from other pgwire clients. See the `BackendConn` docs.
 pub struct PostgresHandler {
-    backend: SharedBackend,
+    conn: Box<dyn BackendConn>,
     query_parser: Arc<NoopQueryParser>,
     translate_cache: Arc<TranslateCache>,
 }
 
 impl PostgresHandler {
-    pub fn new(backend: SharedBackend, translate_cache: Arc<TranslateCache>) -> Self {
-        Self {
-            backend,
+    /// Open a fresh backend session for this pgwire client.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's error if the underlying session cannot be
+    /// opened.
+    pub async fn new(
+        backend: SharedBackend,
+        translate_cache: Arc<TranslateCache>,
+    ) -> Result<Self, BackendError> {
+        let conn = backend.connect().await?;
+        Ok(Self {
+            conn,
             query_parser: Arc::new(NoopQueryParser::new()),
             translate_cache,
-        }
+        })
     }
 
     /// Translate SQL from PostgreSQL dialect to SQLite and classify it.
@@ -87,7 +100,7 @@ impl PostgresHandler {
         format: &Format,
     ) -> PgWireResult<Response<'a>> {
         let rs = self
-            .backend
+            .conn
             .query(sql, params)
             .await
             .map_err(|e| pg_backend_error(&e))?;
@@ -147,7 +160,7 @@ impl PostgresHandler {
         // Transaction commands need special Response variants, handle before
         // the generic execute path to avoid double-execution.
         if *kind == StatementKind::Transaction {
-            self.backend
+            self.conn
                 .execute(sql, params)
                 .await
                 .map_err(|e| pg_backend_error(&e))?;
@@ -166,7 +179,7 @@ impl PostgresHandler {
         }
 
         let result = self
-            .backend
+            .conn
             .execute(sql, params)
             .await
             .map_err(|e| pg_backend_error(&e))?;
@@ -215,7 +228,7 @@ impl PostgresHandler {
     /// expression columns like `SELECT 1 + 2`), fall back to a `LIMIT 1`
     /// probe so we can infer from an actual value.
     async fn probe_columns(&self, sql: &str, format: &Format) -> PgWireResult<Vec<FieldInfo>> {
-        let cols = match self.backend.describe_columns(sql).await {
+        let cols = match self.conn.describe_columns(sql).await {
             Ok(c) => c,
             Err(_) => return Ok(vec![]),
         };
@@ -239,7 +252,7 @@ impl PostgresHandler {
 
         // At least one expression column; probe for a real row to infer.
         let probe = format!("{sql} LIMIT 1");
-        match self.backend.query(&probe, &[]).await {
+        match self.conn.query(&probe, &[]).await {
             Ok(rs) => Ok(rs
                 .columns
                 .iter()

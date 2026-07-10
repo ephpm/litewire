@@ -610,3 +610,108 @@ async fn describe_table() {
 
     drop(conn);
 }
+
+/// Regression test for the "one shared rusqlite Connection" bug.
+///
+/// Two MySQL clients on the same litewire instance. Client A opens a
+/// transaction and inserts a row; client B must NOT see that row until
+/// A commits, and B's own COMMIT (which SQLite rejects because B has no
+/// open tx) must not affect A. Before this PR the two clients shared one
+/// backend `Connection`, so B saw the uncommitted row and either client's
+/// COMMIT could finalize A's tx.
+#[tokio::test]
+async fn two_client_transaction_isolation() {
+    init_tracing();
+    let port = free_port().await;
+    let _server = start_litewire(port).await;
+    let mut a = connect(port).await;
+    let mut b = connect(port).await;
+
+    a.query_drop("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+
+    a.query_drop("BEGIN").await.unwrap();
+    a.query_drop("INSERT INTO t VALUES (1, 'from-a')")
+        .await
+        .unwrap();
+
+    // B must not see A's uncommitted row.
+    let count: Vec<(i64,)> = b.query("SELECT COUNT(*) FROM t").await.unwrap();
+    assert_eq!(
+        count[0].0, 0,
+        "B saw A's uncommitted row -- isolation broken"
+    );
+
+    // B's rogue COMMIT (there is no open tx on B) must not touch A's tx.
+    // SQLite returns an error; we don't care about the error, only that A
+    // can still commit afterwards.
+    let _ = b.query_drop("COMMIT").await;
+
+    a.query_drop("COMMIT").await.unwrap();
+
+    // Now both clients see the committed row.
+    let count: Vec<(i64,)> = b.query("SELECT COUNT(*) FROM t").await.unwrap();
+    assert_eq!(count[0].0, 1);
+    let rows: Vec<(i64, String)> = a.query("SELECT id, v FROM t").await.unwrap();
+    assert_eq!(rows, vec![(1, "from-a".into())]);
+
+    drop(a);
+    drop(b);
+}
+
+/// Regression test: BEGIN on client A must not leak transaction state
+/// into client B. Verifies that B can immediately open its OWN
+/// transaction without inheriting A's.
+///
+/// Under the shared-`Mutex<Connection>` bug B's `BEGIN` would fail with
+/// "cannot start a transaction within a transaction" because rusqlite
+/// would see BEGIN twice on the same handle. The specifics of which
+/// writer wins the SQLite write lock are secondary; the essential
+/// property is that both `BEGIN`s succeed and are seen as *distinct*
+/// transactions.
+#[tokio::test]
+async fn two_client_independent_transactions() {
+    init_tracing();
+    let port = free_port().await;
+    let _server = start_litewire(port).await;
+    let mut a = connect(port).await;
+    let mut b = connect(port).await;
+
+    a.query_drop("CREATE TABLE t (id INTEGER PRIMARY KEY, who TEXT)")
+        .await
+        .unwrap();
+
+    // Both clients open their own transactions. Under the old shared-
+    // conn bug, B's BEGIN would either fail with a nested-txn error or
+    // (worse) silently no-op inside A's txn.
+    a.query_drop("BEGIN").await.unwrap();
+    b.query_drop("BEGIN").await.unwrap();
+
+    // A writes inside its tx. B stays read-only for this test to avoid
+    // SQLite's single-writer lock -- the goal is to prove txn state is
+    // isolated, not to test concurrent writers (which SQLite serializes
+    // by design).
+    a.query_drop("INSERT INTO t VALUES (1, 'A')").await.unwrap();
+
+    // B, on its own txn, must not see A's uncommitted write. This is
+    // the READ side of the same isolation guarantee.
+    let count: Vec<(i64,)> = b.query("SELECT COUNT(*) FROM t").await.unwrap();
+    assert_eq!(
+        count[0].0, 0,
+        "B saw A's uncommitted row from within its own txn"
+    );
+
+    // B ends its own tx (nothing to commit or rollback -- but this
+    // proves the txn actually exists and is B's own).
+    b.query_drop("ROLLBACK").await.unwrap();
+
+    // A commits.
+    a.query_drop("COMMIT").await.unwrap();
+
+    let rows: Vec<(i64, String)> = a.query("SELECT id, who FROM t").await.unwrap();
+    assert_eq!(rows, vec![(1, "A".into())]);
+
+    drop(a);
+    drop(b);
+}
