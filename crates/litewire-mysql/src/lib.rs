@@ -58,6 +58,10 @@ impl MysqlFrontend {
                     continue;
                 }
             };
+            // MySQL wire is small request/response packets; without this,
+            // Nagle + delayed ACK stalls every round trip ~40ms on Linux
+            // loopback (measured 44ms/query via PDO, 2026-07-09).
+            let _ = stream.set_nodelay(true);
             debug!(%peer, "MySQL client connected");
 
             let be = Arc::clone(&backend);
