@@ -77,6 +77,24 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Execute a statement that modifies data.
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, BackendError>;
+
+    /// Describe the columns a prepared SELECT would produce, *without*
+    /// executing it. Used by wire frontends to answer `COM_STMT_PREPARE`
+    /// (MySQL) / `Describe` (Postgres) without a `LIMIT 0` round trip
+    /// through the query planner.
+    ///
+    /// Default implementation falls back to running the statement with a
+    /// `LIMIT 0` wrapper (the previous behaviour). Backends that can
+    /// inspect the prepared statement directly (rusqlite) override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`BackendError`] on parse / prepare failure.
+    async fn describe_columns(&self, sql: &str) -> Result<Vec<Column>, BackendError> {
+        let probe = format!("{sql} LIMIT 0");
+        let rs = self.query(&probe, &[]).await?;
+        Ok(rs.columns)
+    }
 }
 
 /// Type alias for a shared backend reference.

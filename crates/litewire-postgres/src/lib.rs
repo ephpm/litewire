@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use litewire_backend::SharedBackend;
+use litewire_translate::TranslateCache;
 use pgwire::api::NoopErrorHandler;
 use pgwire::api::PgWireServerHandlers;
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -53,8 +54,14 @@ impl PostgresFrontend {
         let listener = TcpListener::bind(self.config.listen).await?;
         info!(listen = %self.config.listen, "PostgreSQL frontend listening");
 
+        // Shared parse+rewrite cache across every accepted connection --
+        // same rationale as the MySQL frontend.
+        let translate_cache = Arc::new(TranslateCache::default());
         let factory = Arc::new(LiteWireHandlerFactory {
-            handler: Arc::new(PostgresHandler::new(Arc::clone(&self.backend))),
+            handler: Arc::new(PostgresHandler::new(
+                Arc::clone(&self.backend),
+                translate_cache,
+            )),
         });
 
         loop {

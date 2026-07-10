@@ -1689,6 +1689,8 @@ dependencies = [
 name = "litewire-translate"
 version = "0.1.0"
 dependencies = [
+ "lru",
+ "parking_lot",
  "sqlparser",
  "thiserror 2.0.18",
  "tracing",

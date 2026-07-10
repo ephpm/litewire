@@ -66,15 +66,42 @@ fn bind_params(params: &[Value]) -> Vec<Box<dyn rusqlite::types::ToSql>> {
 }
 
 /// Extract a [`Value`] from a rusqlite row at the given column index.
+///
+/// TEXT handling: SQLite `TEXT` cells hold raw bytes that are *supposed* to
+/// be UTF-8. If they are not, this used to lossy-decode via
+/// `String::from_utf8_lossy`, which silently replaces bytes with U+FFFD and
+/// corrupts round-trips (e.g. arbitrary latin-1 or WTF-8 stored by a
+/// previous client). Instead, we surface invalid UTF-8 as a `Blob` so the
+/// caller / wire frontend can decide how to send it back to the client.
 fn extract_value(row: &rusqlite::Row<'_>, idx: usize) -> Result<Value, rusqlite::Error> {
     use rusqlite::types::ValueRef;
     match row.get_ref(idx)? {
         ValueRef::Null => Ok(Value::Null),
         ValueRef::Integer(i) => Ok(Value::Integer(i)),
         ValueRef::Real(f) => Ok(Value::Float(f)),
-        ValueRef::Text(s) => Ok(Value::Text(String::from_utf8_lossy(s).into_owned())),
+        ValueRef::Text(s) => match std::str::from_utf8(s) {
+            Ok(v) => Ok(Value::Text(v.to_string())),
+            Err(_) => Ok(Value::Blob(s.to_vec())),
+        },
         ValueRef::Blob(b) => Ok(Value::Blob(b.to_vec())),
     }
+}
+
+/// Read the column metadata off a prepared `Statement`, using rusqlite's
+/// `column_decltype` feature to populate `Column.decltype`.
+///
+/// This is called *without* stepping the statement -- SELECTs on empty
+/// tables now get real column types on the wire, which fixes clients
+/// (Laravel `Query::exists()`, PDO `getColumnMeta()`) that would otherwise
+/// see everything as `NULL` / `TEXT`.
+fn describe_columns(stmt: &rusqlite::Statement<'_>) -> Vec<Column> {
+    stmt.columns()
+        .iter()
+        .map(|c| Column {
+            name: c.name().to_string(),
+            decltype: c.decl_type().map(str::to_string),
+        })
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -86,17 +113,16 @@ impl Backend for Rusqlite {
 
         task::spawn_blocking(move || {
             let conn = conn.lock();
+            // `prepare_cached` interns the parsed statement in rusqlite's
+            // per-connection LRU. Repeated identical SQL (which is the norm
+            // for prepared-statement heavy workloads and for the KV/session
+            // handler path) then avoids the sqlite3_prepare_v2 cost.
             let mut stmt = conn
-                .prepare(&sql)
+                .prepare_cached(&sql)
                 .map_err(|e| BackendError::Sqlite(e.to_string()))?;
 
-            let col_count = stmt.column_count();
-            let columns: Vec<Column> = (0..col_count)
-                .map(|i| Column {
-                    name: stmt.column_name(i).unwrap_or("?").to_string(),
-                    decltype: None, // rusqlite 0.32 does not expose column_decltype on Statement
-                })
-                .collect();
+            let columns = describe_columns(&stmt);
+            let col_count = columns.len();
 
             let bound = bind_params(&params);
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -129,6 +155,21 @@ impl Backend for Rusqlite {
         .map_err(|e| BackendError::Other(format!("spawn_blocking join error: {e}")))?
     }
 
+    async fn describe_columns(&self, sql: &str) -> Result<Vec<Column>, BackendError> {
+        let conn = Arc::clone(&self.conn);
+        let sql = sql.to_string();
+
+        task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let stmt = conn
+                .prepare_cached(&sql)
+                .map_err(|e| BackendError::Sqlite(e.to_string()))?;
+            Ok(describe_columns(&stmt))
+        })
+        .await
+        .map_err(|e| BackendError::Other(format!("spawn_blocking join error: {e}")))?
+    }
+
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, BackendError> {
         let conn = Arc::clone(&self.conn);
         let sql = sql.to_string();
@@ -141,8 +182,11 @@ impl Backend for Rusqlite {
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 bound.iter().map(|b| b.as_ref()).collect();
 
-            let affected = conn
-                .execute(&sql, param_refs.as_slice())
+            let mut stmt = conn
+                .prepare_cached(&sql)
+                .map_err(|e| BackendError::Sqlite(e.to_string()))?;
+            let affected = stmt
+                .execute(param_refs.as_slice())
                 .map_err(|e| BackendError::Sqlite(e.to_string()))?;
 
             let last_id = conn.last_insert_rowid();
@@ -405,6 +449,74 @@ mod tests {
         assert_eq!(rs.columns[0].name, "id");
         assert_eq!(rs.columns[1].name, "name");
         assert_eq!(rs.columns[2].name, "email");
+    }
+
+    #[tokio::test]
+    async fn describe_columns_returns_decltypes() {
+        // Verify the fix for the previous "decltype is always None" behaviour:
+        // describe_columns must fill in the declared type without executing
+        // the statement.
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL)",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let cols = backend
+            .describe_columns("SELECT id, name, score FROM users")
+            .await
+            .unwrap();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[0].decltype.as_deref(), Some("INTEGER"));
+        assert_eq!(cols[1].name, "name");
+        assert_eq!(cols[1].decltype.as_deref(), Some("TEXT"));
+        assert_eq!(cols[2].name, "score");
+        assert_eq!(cols[2].decltype.as_deref(), Some("REAL"));
+    }
+
+    #[tokio::test]
+    async fn describe_columns_null_decltype_for_expressions() {
+        // Bare expressions like `SELECT 1 + 2` have no declared type.
+        let backend = Rusqlite::memory().unwrap();
+        let cols = backend.describe_columns("SELECT 1 + 2 AS x").await.unwrap();
+        assert_eq!(cols.len(), 1);
+        assert!(cols[0].decltype.is_none(), "got: {:?}", cols[0].decltype);
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_in_text_column_surfaces_as_blob() {
+        // Store a byte sequence that is *not* valid UTF-8 into a TEXT column.
+        // The old code used `String::from_utf8_lossy`, which would silently
+        // corrupt the bytes with U+FFFD replacements; the new code must
+        // surface the raw bytes intact as a Blob so callers can round-trip.
+        let backend = Rusqlite::memory().unwrap();
+        backend
+            .execute("CREATE TABLE t (v TEXT)", &[])
+            .await
+            .unwrap();
+
+        // Direct-write invalid UTF-8 via CAST -- x'ffff' is 0xFF 0xFF which
+        // is not a valid UTF-8 sequence.
+        backend
+            .execute("INSERT INTO t VALUES (CAST(x'ffff' AS TEXT))", &[])
+            .await
+            .unwrap();
+
+        let rs = backend.query("SELECT v FROM t", &[]).await.unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        match &rs.rows[0][0] {
+            Value::Blob(b) => assert_eq!(b.as_slice(), &[0xFF, 0xFF][..]),
+            Value::Text(s) => panic!(
+                "expected Blob fallback for invalid UTF-8, got Text({:?}) with bytes {:?}",
+                s,
+                s.as_bytes()
+            ),
+            other => panic!("expected Blob for invalid UTF-8, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

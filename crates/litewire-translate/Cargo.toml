@@ -10,3 +10,8 @@ license.workspace = true
 sqlparser = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# LRU cache in front of the parse+rewrite pipeline. Small dep (no proc-macros,
+# hashbrown-only), already transitively pulled in by other workspace members.
+lru = "0.12"
+parking_lot = { workspace = true }

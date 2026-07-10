@@ -3,6 +3,7 @@
 //! Translates MySQL, PostgreSQL, and T-SQL dialects to SQLite-compatible SQL
 //! using `sqlparser-rs` for parsing and AST manipulation.
 
+pub mod cache;
 pub mod common;
 pub mod emit;
 pub mod metadata;
@@ -10,12 +11,14 @@ pub mod mysql;
 pub mod postgres;
 pub mod tds;
 
+pub use cache::TranslateCache;
+
 use sqlparser::ast::Statement;
 use sqlparser::dialect::{MsSqlDialect, MySqlDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
 
 /// Source SQL dialect for translation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dialect {
     MySQL,
     PostgreSQL,
@@ -33,7 +36,7 @@ pub enum TranslateError {
 }
 
 /// Result of translating a SQL statement.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TranslateResult {
     /// Translated SQL string to execute against SQLite.
     Sql(String),
@@ -86,6 +89,30 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
         results.push(TranslateResult::Sql(sqlite_sql));
     }
 
+    Ok(results)
+}
+
+/// Translate a SQL string, using a bounded LRU cache in front of the
+/// parser + rewriter. See [`TranslateCache`].
+///
+/// Cache hits are O(1); misses fall through to [`translate`] and populate
+/// the cache before returning. Errors are *not* cached -- a repeatedly-bad
+/// statement will re-parse each time.
+///
+/// # Errors
+///
+/// Returns a [`TranslateError`] if the SQL cannot be parsed or contains
+/// unsupported constructs.
+pub fn translate_cached(
+    cache: &TranslateCache,
+    sql: &str,
+    dialect: Dialect,
+) -> Result<Vec<TranslateResult>, TranslateError> {
+    if let Some(hit) = cache.get(dialect, sql) {
+        return Ok(hit);
+    }
+    let results = translate(sql, dialect)?;
+    cache.put(dialect, sql.to_string(), results.clone());
     Ok(results)
 }
 
@@ -623,5 +650,75 @@ mod tests {
     fn lock_tables_is_noop() {
         expect_noop("LOCK TABLES users WRITE", Dialect::MySQL);
         expect_noop("UNLOCK TABLES", Dialect::MySQL);
+    }
+
+    // -- Cache -----------------------------------------------------------------
+
+    #[test]
+    fn translate_cached_hit_matches_uncached() {
+        let cache = TranslateCache::new(16);
+        let sql = "SELECT id, name FROM users WHERE id = ? ORDER BY id DESC LIMIT 10";
+        let cold = translate(sql, Dialect::MySQL).unwrap();
+        let warm = translate_cached(&cache, sql, Dialect::MySQL).unwrap();
+        // Both should produce a single Sql result and be equal shape-wise.
+        assert_eq!(cold.len(), warm.len());
+        // Second call must hit the cache.
+        assert_eq!(cache.len(), 1);
+        let _ = translate_cached(&cache, sql, Dialect::MySQL).unwrap();
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn translate_cached_errors_are_not_stored() {
+        let cache = TranslateCache::new(16);
+        let bad = "!!! NOT SQL @@@";
+        assert!(translate_cached(&cache, bad, Dialect::MySQL).is_err());
+        assert_eq!(cache.len(), 0);
+    }
+
+    /// Micro-benchmark: translating the same WordPress-shaped query 5000
+    /// times, cold vs cached. Not a criterion bench (we don't want a dev-dep
+    /// on criterion); numbers get printed via `cargo test -- --nocapture
+    /// translate_cache_speedup`.
+    #[test]
+    fn translate_cache_speedup() {
+        use std::time::Instant;
+
+        // A representative WP query with joins, ORDER BY, LIMIT.
+        let sql = "SELECT wp_posts.* FROM wp_posts \
+                   INNER JOIN wp_term_relationships \
+                     ON wp_posts.ID = wp_term_relationships.object_id \
+                   WHERE wp_posts.post_status = 'publish' \
+                     AND wp_term_relationships.term_taxonomy_id IN (?, ?, ?) \
+                   ORDER BY wp_posts.post_date DESC LIMIT 10";
+        let iters = 5_000;
+
+        // Cold path: no cache, translate() every time.
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let _ = translate(sql, Dialect::MySQL).unwrap();
+        }
+        let cold = t0.elapsed();
+
+        // Warm path: shared cache, one miss then N hits.
+        let cache = TranslateCache::new(16);
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let _ = translate_cached(&cache, sql, Dialect::MySQL).unwrap();
+        }
+        let warm = t0.elapsed();
+
+        let cold_ns = cold.as_nanos() as f64 / f64::from(iters);
+        let warm_ns = warm.as_nanos() as f64 / f64::from(iters);
+        println!(
+            "translate_cache_speedup: {iters} iters | cold={cold_ns:.0}ns/call \
+             warm={warm_ns:.0}ns/call speedup={:.1}x",
+            cold_ns / warm_ns
+        );
+        // Sanity: cached path must be strictly faster.
+        assert!(
+            warm < cold,
+            "cached path is not faster: cold={cold:?} warm={warm:?}"
+        );
     }
 }
