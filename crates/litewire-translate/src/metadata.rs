@@ -21,13 +21,9 @@ pub enum MetadataQuery {
     /// `SELECT @@variable` queries — MySQL system variables.
     SystemVariables { variables: Vec<String> },
     /// `SELECT ... FROM information_schema.tables` — table listing.
-    InformationSchemaTables {
-        schema_filter: Option<String>,
-    },
+    InformationSchemaTables { schema_filter: Option<String> },
     /// `SELECT ... FROM information_schema.columns` — column listing.
-    InformationSchemaColumns {
-        table_filter: Option<String>,
-    },
+    InformationSchemaColumns { table_filter: Option<String> },
     /// `SELECT ... FROM information_schema.schemata` — schema listing.
     InformationSchemata,
     /// `SELECT ... FROM pg_catalog.pg_tables` or similar.
@@ -138,8 +134,8 @@ impl MetadataQuery {
 /// Return a synthetic value for a MySQL system variable.
 fn system_variable_value(name: &str) -> &'static str {
     match name.to_ascii_lowercase().as_str() {
-        "max_allowed_packet" => "67108864",  // 64 MiB
-        "wait_timeout" => "28800",           // 8 hours
+        "max_allowed_packet" => "67108864", // 64 MiB
+        "wait_timeout" => "28800",          // 8 hours
         "interactive_timeout" => "28800",
         "net_write_timeout" => "60",
         "net_read_timeout" => "30",
@@ -314,6 +310,9 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
 /// Extract a simple `column = 'value'` filter from a WHERE clause.
 /// Searches on the uppercased SQL for the column name, but extracts the
 /// value from the original SQL to preserve case.
+// WIP scaffolding: not yet wired up. Kept alongside `extract_where_value_original`
+// while the metadata WHERE-clause extraction is being reworked.
+#[allow(dead_code)]
 fn extract_where_value(upper_sql: &str, column: &str) -> Option<String> {
     let pattern = format!("{column} = ");
     if let Some(pos) = upper_sql.find(&pattern) {
@@ -338,7 +337,7 @@ fn extract_where_value_original(original_sql: &str, column: &str) -> Option<Stri
     if let Some(pos) = upper.find(&pattern) {
         let after = &original_sql[pos + pattern.len()..];
         let after_trimmed = after.trim_start();
-        let trim_offset = after.len() - after_trimmed.len();
+        let _trim_offset = after.len() - after_trimmed.len();
         let after = after_trimmed;
         if after.starts_with('\'') || after.starts_with('"') {
             let quote = after.as_bytes()[0] as char;
@@ -650,22 +649,18 @@ mod tests {
 
     #[test]
     fn detect_information_schema_tables() {
-        let q = detect_metadata_query(
-            "SELECT * FROM information_schema.tables",
-            Dialect::MySQL,
-        );
+        let q = detect_metadata_query("SELECT * FROM information_schema.tables", Dialect::MySQL);
         assert!(matches!(
             q,
-            Some(MetadataQuery::InformationSchemaTables { schema_filter: None })
+            Some(MetadataQuery::InformationSchemaTables {
+                schema_filter: None
+            })
         ));
     }
 
     #[test]
     fn detect_information_schema_tables_with_backticks() {
-        let q = detect_metadata_query(
-            "SELECT * FROM INFORMATION_SCHEMA.`TABLES`",
-            Dialect::MySQL,
-        );
+        let q = detect_metadata_query("SELECT * FROM INFORMATION_SCHEMA.`TABLES`", Dialect::MySQL);
         assert!(matches!(
             q,
             Some(MetadataQuery::InformationSchemaTables { .. })
@@ -681,7 +676,9 @@ mod tests {
         match q {
             Some(MetadataQuery::InformationSchemaTables {
                 schema_filter: Some(schema),
-            }) => assert_eq!(schema, "mydb"),
+            }) => {
+                assert_eq!(schema, "mydb")
+            }
             other => panic!("expected InformationSchemaTables with filter, got: {other:?}"),
         }
     }
@@ -695,31 +692,25 @@ mod tests {
         match q {
             Some(MetadataQuery::InformationSchemaColumns {
                 table_filter: Some(table),
-            }) => assert_eq!(table, "users"),
+            }) => {
+                assert_eq!(table, "users")
+            }
             other => panic!("expected InformationSchemaColumns with filter, got: {other:?}"),
         }
     }
 
     #[test]
     fn detect_information_schema_columns_no_filter() {
-        let q = detect_metadata_query(
-            "SELECT * FROM INFORMATION_SCHEMA.COLUMNS",
-            Dialect::MySQL,
-        );
+        let q = detect_metadata_query("SELECT * FROM INFORMATION_SCHEMA.COLUMNS", Dialect::MySQL);
         assert!(matches!(
             q,
-            Some(MetadataQuery::InformationSchemaColumns {
-                table_filter: None
-            })
+            Some(MetadataQuery::InformationSchemaColumns { table_filter: None })
         ));
     }
 
     #[test]
     fn detect_information_schema_schemata() {
-        let q = detect_metadata_query(
-            "SELECT * FROM INFORMATION_SCHEMA.SCHEMATA",
-            Dialect::MySQL,
-        );
+        let q = detect_metadata_query("SELECT * FROM INFORMATION_SCHEMA.SCHEMATA", Dialect::MySQL);
         assert!(matches!(q, Some(MetadataQuery::InformationSchemata)));
     }
 
@@ -770,10 +761,7 @@ mod tests {
 
     #[test]
     fn information_schema_columns_no_table_fallback() {
-        let sql = MetadataQuery::InformationSchemaColumns {
-            table_filter: None,
-        }
-        .to_sqlite_sql();
+        let sql = MetadataQuery::InformationSchemaColumns { table_filter: None }.to_sqlite_sql();
         // Falls back to listing tables.
         assert!(sql.contains("sqlite_master"), "got: {sql}");
     }
@@ -827,11 +815,11 @@ mod tests {
 
     #[test]
     fn detect_pg_catalog_tables() {
-        let q = detect_metadata_query(
-            "SELECT * FROM pg_catalog.pg_tables",
-            Dialect::PostgreSQL,
+        let q = detect_metadata_query("SELECT * FROM pg_catalog.pg_tables", Dialect::PostgreSQL);
+        assert!(
+            matches!(q, Some(MetadataQuery::PgCatalogTables)),
+            "got: {q:?}"
         );
-        assert!(matches!(q, Some(MetadataQuery::PgCatalogTables)), "got: {q:?}");
     }
 
     #[test]
@@ -840,7 +828,10 @@ mod tests {
             "SELECT * FROM pg_catalog.pg_class WHERE relkind = 'r'",
             Dialect::PostgreSQL,
         );
-        assert!(matches!(q, Some(MetadataQuery::PgCatalogTables)), "got: {q:?}");
+        assert!(
+            matches!(q, Some(MetadataQuery::PgCatalogTables)),
+            "got: {q:?}"
+        );
     }
 
     #[test]

@@ -47,9 +47,7 @@ impl HranaValue {
     pub fn to_backend_value(&self) -> Value {
         match self {
             Self::Null => Value::Null,
-            Self::Integer { value } => {
-                Value::Integer(value.parse().unwrap_or(0))
-            }
+            Self::Integer { value } => Value::Integer(value.parse().unwrap_or(0)),
             Self::Float { value } => Value::Float(*value),
             Self::Text { value } => Value::Text(value.clone()),
             Self::Blob { base64 } => {
@@ -119,9 +117,7 @@ impl ResponseValue {
                 value: i.to_string(),
             },
             Value::Float(f) => Self::Float { value: *f },
-            Value::Text(s) => Self::Text {
-                value: s.clone(),
-            },
+            Value::Text(s) => Self::Text { value: s.clone() },
             Value::Blob(b) => {
                 use base64::Engine;
                 Self::Blob {
@@ -153,9 +149,7 @@ mod tests {
 
     #[test]
     fn integer_to_backend() {
-        let v = HranaValue::Integer {
-            value: "42".into(),
-        };
+        let v = HranaValue::Integer { value: "42".into() };
         assert!(matches!(v.to_backend_value(), Value::Integer(42)));
     }
 
@@ -297,9 +291,7 @@ mod tests {
                                 name: "id".into(),
                                 decltype: Some("INTEGER".into()),
                             }],
-                            rows: vec![vec![ResponseValue::Integer {
-                                value: "1".into(),
-                            }]],
+                            rows: vec![vec![ResponseValue::Integer { value: "1".into() }]],
                             affected_row_count: 0,
                             last_insert_rowid: None,
                         },

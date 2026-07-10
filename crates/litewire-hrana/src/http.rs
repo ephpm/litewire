@@ -74,11 +74,8 @@ async fn execute_stmt(
     backend: &SharedBackend,
     stmt: &StmtRequest,
 ) -> Result<StreamResult, litewire_backend::BackendError> {
-    let params: Vec<litewire_backend::Value> = stmt
-        .args
-        .iter()
-        .map(|a| a.to_backend_value())
-        .collect();
+    let params: Vec<litewire_backend::Value> =
+        stmt.args.iter().map(|a| a.to_backend_value()).collect();
 
     // Hrana sends SQLite SQL natively -- no translation needed.
     let sql_upper = stmt.sql.trim().to_ascii_uppercase();
@@ -257,10 +254,7 @@ mod tests {
             .await
             .unwrap();
         backend
-            .execute(
-                "INSERT INTO t VALUES (1, 'Alice')",
-                &[],
-            )
+            .execute("INSERT INTO t VALUES (1, 'Alice')", &[])
             .await
             .unwrap();
 
@@ -356,10 +350,12 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(resp["results"][0]["type"], "error");
-        assert!(resp["results"][0]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("nonexistent_table"));
+        assert!(
+            resp["results"][0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("nonexistent_table")
+        );
     }
 
     #[tokio::test]

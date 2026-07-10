@@ -239,10 +239,7 @@ async fn multiple_connections() {
 
     // Second connection should see the data (same in-memory SQLite).
     let mut conn2 = connect(port).await;
-    let rows: Vec<(i64, String)> = conn2
-        .query("SELECT id, val FROM shared")
-        .await
-        .unwrap();
+    let rows: Vec<(i64, String)> = conn2.query("SELECT id, val FROM shared").await.unwrap();
     assert_eq!(rows, vec![(1, "from_conn1".into())]);
 
     drop(conn2);
@@ -315,10 +312,7 @@ async fn prepared_insert() {
         .unwrap();
     assert_eq!(
         rows,
-        vec![
-            (1, "Widget".into(), 10),
-            (2, "Gadget".into(), 20),
-        ]
+        vec![(1, "Widget".into(), 10), (2, "Gadget".into(), 20),]
     );
 
     drop(conn);
@@ -424,11 +418,9 @@ async fn on_duplicate_key_update() {
         .unwrap();
 
     // MySQL ON DUPLICATE KEY UPDATE -> SQLite ON CONFLICT DO UPDATE
-    conn.query_drop(
-        "INSERT INTO kv (k, v) VALUES ('a', 99) ON DUPLICATE KEY UPDATE v = 99",
-    )
-    .await
-    .unwrap();
+    conn.query_drop("INSERT INTO kv (k, v) VALUES ('a', 99) ON DUPLICATE KEY UPDATE v = 99")
+        .await
+        .unwrap();
 
     let rows: Vec<(String, i64)> = conn
         .query("SELECT k, v FROM kv WHERE k = 'a'")
@@ -437,16 +429,11 @@ async fn on_duplicate_key_update() {
     assert_eq!(rows, vec![("a".into(), 99)]);
 
     // Insert new row (no conflict).
-    conn.query_drop(
-        "INSERT INTO kv (k, v) VALUES ('b', 2) ON DUPLICATE KEY UPDATE v = 2",
-    )
-    .await
-    .unwrap();
-
-    let rows: Vec<(String, i64)> = conn
-        .query("SELECT k, v FROM kv ORDER BY k")
+    conn.query_drop("INSERT INTO kv (k, v) VALUES ('b', 2) ON DUPLICATE KEY UPDATE v = 2")
         .await
         .unwrap();
+
+    let rows: Vec<(String, i64)> = conn.query("SELECT k, v FROM kv ORDER BY k").await.unwrap();
     assert_eq!(rows, vec![("a".into(), 99), ("b".into(), 2)]);
 
     drop(conn);
@@ -472,10 +459,7 @@ async fn transaction_commit() {
     conn.query_drop("COMMIT").await.unwrap();
 
     // Data should be visible after commit.
-    let rows: Vec<(i64, String)> = conn
-        .query("SELECT id, val FROM txn_t")
-        .await
-        .unwrap();
+    let rows: Vec<(i64, String)> = conn.query("SELECT id, val FROM txn_t").await.unwrap();
     assert_eq!(rows, vec![(1, "inside_txn".into())]);
 
     drop(conn);
@@ -534,10 +518,7 @@ async fn transaction_atomicity() {
         .unwrap();
     conn.query_drop("ROLLBACK").await.unwrap();
 
-    let rows: Vec<(i64, i64)> = conn
-        .query("SELECT id, val FROM txn_atom")
-        .await
-        .unwrap();
+    let rows: Vec<(i64, i64)> = conn.query("SELECT id, val FROM txn_atom").await.unwrap();
     assert_eq!(rows, vec![(1, 100)]);
 
     drop(conn);
@@ -585,15 +566,25 @@ async fn information_schema_columns() {
         .query("SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.columns WHERE TABLE_NAME = 'users'")
         .await
         .unwrap();
-    assert!(rows.len() >= 3, "expected at least 3 columns, got {}", rows.len());
+    assert!(
+        rows.len() >= 3,
+        "expected at least 3 columns, got {}",
+        rows.len()
+    );
     // Check that column names are present in the result.
     let col_names: Vec<String> = rows
         .iter()
         .map(|r| r.get::<String, _>(1).unwrap_or_default())
         .collect();
     assert!(col_names.contains(&"id".to_string()), "got: {col_names:?}");
-    assert!(col_names.contains(&"name".to_string()), "got: {col_names:?}");
-    assert!(col_names.contains(&"email".to_string()), "got: {col_names:?}");
+    assert!(
+        col_names.contains(&"name".to_string()),
+        "got: {col_names:?}"
+    );
+    assert!(
+        col_names.contains(&"email".to_string()),
+        "got: {col_names:?}"
+    );
 
     drop(conn);
 }
@@ -611,7 +602,11 @@ async fn describe_table() {
 
     // DESCRIBE should return column info via PRAGMA table_info.
     let rows: Vec<mysql_async::Row> = conn.query("DESCRIBE items").await.unwrap();
-    assert!(rows.len() >= 3, "expected at least 3 columns, got {}", rows.len());
+    assert!(
+        rows.len() >= 3,
+        "expected at least 3 columns, got {}",
+        rows.len()
+    );
 
     drop(conn);
 }

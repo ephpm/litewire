@@ -31,7 +31,7 @@ libsql SDK (Rust, JS, Python, Go)
 # Start with a MySQL frontend
 litewire --mysql-listen 127.0.0.1:3306 --db app.db
 
-# Start with all frontends
+# Start with all frontends (postgres + tds require --features postgres,tds at build time)
 litewire --mysql-listen 127.0.0.1:3306 --postgres-listen 127.0.0.1:5432 --tds-listen 127.0.0.1:1433 --hrana-listen 127.0.0.1:8080 --db app.db
 
 # Connect from any MySQL client
@@ -110,17 +110,29 @@ litewire translates MySQL and PostgreSQL SQL dialects to SQLite on the fly:
 | `SET NAMES utf8mb4` / `SET NOCOUNT ON` | No-op |
 | Backtick / `[bracket]` quoting | Passed through or converted |
 
-See [docs/architecture.md](docs/architecture.md) for the full translation reference.
+See [docs/architecture.md](docs/architecture.md) for the full architecture and translation reference.
 
-## Tested With
+## Compatibility
 
-- WordPress (via `pdo_mysql`)
-- Laravel (via `pdo_mysql` / `pdo_pgsql` / `pdo_sqlsrv`)
-- Drupal
-- `mysql` CLI
-- `psql` CLI
-- `sqlcmd` CLI
-- DBeaver, pgAdmin, SSMS, TablePlus
+The MySQL frontend is exercised end-to-end by an in-process test suite
+(`crates/litewire/tests/mysql_e2e.rs`) that drives the wire protocol via
+`mysql_async` -- CRUD, prepared statements, transactions (`START TRANSACTION` /
+`BEGIN` / `COMMIT` / `ROLLBACK`), `LAST_INSERT_ID()`, `SHOW TABLES`,
+`DESCRIBE`, `INFORMATION_SCHEMA` probes, `SET NAMES` / `SET autocommit`, and
+the metadata queries used at connection setup.
+
+The PostgreSQL and TDS frontends are wire-compatible enough for basic CRUD
+against `psql` / `sqlcmd` and the extended-query flow used by `pdo_pgsql` /
+`pdo_sqlsrv`; the TDS frontend is **experimental** -- authentication is
+simplified, the type coverage is a subset (BigInt / Float8 / NVARCHAR /
+VarBinary), and the SSL handshake is not implemented. Real SQL Server tools
+(SSMS, sqlcmd with encryption) will not connect until those land.
+
+Anywhere you would normally point at MySQL/PG/SQL Server -- PHP PDO drivers,
+`mysql` / `psql` / `sqlcmd` CLIs, DBeaver, pgAdmin -- should work for standard
+CRUD workloads. Anything that depends on server-side features SQLite doesn't
+have (stored procedures, `SQL_CALC_FOUND_ROWS`, `LOCK TABLES` isolation,
+row-level locking semantics, dollar-quoted PL/pgSQL bodies, etc.) will not.
 
 ## Limitations
 

@@ -33,7 +33,7 @@ fn rewrite_top_to_limit(query: &mut sqlparser::ast::Query) {
                 let limit_expr = match quantity {
                     TopQuantity::Expr(e) => e,
                     TopQuantity::Constant(n) => Expr::Value(sqlparser::ast::ValueWithSpan {
-                        value: sqlparser::ast::Value::Number(n.to_string().into(), false),
+                        value: sqlparser::ast::Value::Number(n.to_string(), false),
                         span: sqlparser::tokenizer::Span::empty(),
                     }),
                 };
@@ -63,18 +63,18 @@ fn rewrite_data_type(dt: &DataType) -> DataType {
         | DataType::Decimal(..)
         | DataType::Numeric(..) => DataType::Real,
 
-        DataType::Varchar(_)
-        | DataType::Char(_)
-        | DataType::Nvarchar(_)
-        | DataType::Text => DataType::Text,
+        DataType::Varchar(_) | DataType::Char(_) | DataType::Nvarchar(_) | DataType::Text => {
+            DataType::Text
+        }
 
         DataType::Binary(_) | DataType::Varbinary(_) => DataType::Blob(None),
 
         DataType::Boolean | DataType::Bit(_) => DataType::Integer(None),
 
-        DataType::Date | DataType::Datetime(_) | DataType::Timestamp(_, _) | DataType::Time(_, _) => {
-            DataType::Text
-        }
+        DataType::Date
+        | DataType::Datetime(_)
+        | DataType::Timestamp(_, _)
+        | DataType::Time(_, _) => DataType::Text,
 
         DataType::Custom(name, _) => {
             let upper = name.to_string().to_ascii_uppercase();
@@ -92,7 +92,7 @@ fn rewrite_data_type(dt: &DataType) -> DataType {
 
 #[cfg(test)]
 mod tests {
-    use crate::{translate, Dialect, TranslateResult};
+    use crate::{Dialect, TranslateResult, translate};
 
     fn extract_sql(result: &TranslateResult) -> &str {
         match result {
@@ -117,11 +117,7 @@ mod tests {
 
     #[test]
     fn nvarchar_to_text() {
-        let results = translate(
-            "CREATE TABLE t (name NVARCHAR(255))",
-            Dialect::TDS,
-        )
-        .unwrap();
+        let results = translate("CREATE TABLE t (name NVARCHAR(255))", Dialect::TDS).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("NVARCHAR"), "NVARCHAR not rewritten: {sql}");
@@ -133,14 +129,16 @@ mod tests {
         let results = translate("CREATE TABLE t (data VARBINARY(MAX))", Dialect::TDS).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
-        assert!(!upper.contains("VARBINARY"), "VARBINARY not rewritten: {sql}");
+        assert!(
+            !upper.contains("VARBINARY"),
+            "VARBINARY not rewritten: {sql}"
+        );
         assert!(upper.contains("BLOB"), "no BLOB found: {sql}");
     }
 
     #[test]
     fn datetime_to_text() {
-        let results =
-            translate("CREATE TABLE t (created DATETIME)", Dialect::TDS).unwrap();
+        let results = translate("CREATE TABLE t (created DATETIME)", Dialect::TDS).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("DATETIME"), "DATETIME not rewritten: {sql}");
@@ -149,11 +147,7 @@ mod tests {
 
     #[test]
     fn float_types_to_real() {
-        let results = translate(
-            "CREATE TABLE t (a FLOAT, b DECIMAL(10,2))",
-            Dialect::TDS,
-        )
-        .unwrap();
+        let results = translate("CREATE TABLE t (a FLOAT, b DECIMAL(10,2))", Dialect::TDS).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(upper.contains("REAL"), "no REAL found: {sql}");
@@ -210,11 +204,7 @@ mod tests {
 
     #[test]
     fn uniqueidentifier_to_text() {
-        let results = translate(
-            "CREATE TABLE t (id UNIQUEIDENTIFIER)",
-            Dialect::TDS,
-        )
-        .unwrap();
+        let results = translate("CREATE TABLE t (id UNIQUEIDENTIFIER)", Dialect::TDS).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(

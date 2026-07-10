@@ -4,6 +4,7 @@
 //! incoming SQL from PostgreSQL dialect to SQLite, executes against the
 //! backend, and returns results in PostgreSQL wire format.
 
+mod error_map;
 mod handler;
 mod types;
 
@@ -11,10 +12,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use litewire_backend::SharedBackend;
+use pgwire::api::NoopErrorHandler;
+use pgwire::api::PgWireServerHandlers;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::NoopCopyHandler;
-use pgwire::api::PgWireServerHandlers;
-use pgwire::api::NoopErrorHandler;
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};

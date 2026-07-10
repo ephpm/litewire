@@ -191,8 +191,14 @@ mod tests {
     fn empty_result_set() {
         let rs = ResultSet {
             columns: vec![
-                Column { name: "a".into(), decltype: None },
-                Column { name: "b".into(), decltype: None },
+                Column {
+                    name: "a".into(),
+                    decltype: None,
+                },
+                Column {
+                    name: "b".into(),
+                    decltype: None,
+                },
             ],
             rows: vec![],
         };

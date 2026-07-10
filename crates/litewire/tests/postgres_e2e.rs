@@ -191,10 +191,7 @@ async fn now_function_translates() {
     assert_eq!(rows.len(), 1);
     let val: &str = rows[0].get(0);
     // Should look like "2024-01-15 12:34:56".
-    assert!(
-        val.contains('-'),
-        "expected datetime string, got: {val}",
-    );
+    assert!(val.contains('-'), "expected datetime string, got: {val}",);
 }
 
 #[tokio::test]
@@ -205,10 +202,7 @@ async fn set_names_noop() {
     let client = connect(port).await;
 
     // SET NAMES should succeed as a no-op.
-    client
-        .execute("SET NAMES 'utf8mb4'", &[])
-        .await
-        .unwrap();
+    client.execute("SET NAMES 'utf8mb4'", &[]).await.unwrap();
 
     // Connection still works after.
     let rows = client.query("SELECT 42", &[]).await.unwrap();
@@ -255,7 +249,10 @@ async fn empty_table_query() {
     let client = connect(port).await;
 
     client
-        .execute("CREATE TABLE empty_t (id INTEGER PRIMARY KEY, val TEXT)", &[])
+        .execute(
+            "CREATE TABLE empty_t (id INTEGER PRIMARY KEY, val TEXT)",
+            &[],
+        )
         .await
         .unwrap();
 
@@ -402,10 +399,7 @@ async fn large_result_set() {
     // Insert 100 rows.
     for i in 0..100 {
         client
-            .execute(
-                &format!("INSERT INTO big_t VALUES ({i}, 'row_{i}')"),
-                &[],
-            )
+            .execute(&format!("INSERT INTO big_t VALUES ({i}, 'row_{i}')"), &[])
             .await
             .unwrap();
     }

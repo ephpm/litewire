@@ -56,7 +56,10 @@ async fn create_table_and_insert() {
 
     // Create table
     let result = client
-        .execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &[])
+        .execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
         .await
         .expect("CREATE TABLE failed");
     assert_eq!(result.affected_rows, 0);
@@ -89,7 +92,10 @@ async fn query_rows() {
     let (client, _server) = start_server().await;
 
     client
-        .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, price REAL)", &[])
+        .execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, price REAL)",
+            &[],
+        )
         .await
         .unwrap();
     client
@@ -183,7 +189,10 @@ async fn blob_roundtrip() {
     let (client, _server) = start_server().await;
 
     client
-        .execute("CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)", &[])
+        .execute(
+            "CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)",
+            &[],
+        )
         .await
         .unwrap();
 
@@ -234,9 +243,7 @@ async fn null_values() {
 async fn sql_error_returns_backend_error() {
     let (client, _server) = start_server().await;
 
-    let result = client
-        .query("SELECT * FROM nonexistent_table", &[])
-        .await;
+    let result = client.query("SELECT * FROM nonexistent_table", &[]).await;
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -255,18 +262,12 @@ async fn update_and_delete() {
         .await
         .unwrap();
     client
-        .execute(
-            "INSERT INTO counters VALUES ('hits', 0)",
-            &[],
-        )
+        .execute("INSERT INTO counters VALUES ('hits', 0)", &[])
         .await
         .unwrap();
 
     let result = client
-        .execute(
-            "UPDATE counters SET val = val + 1 WHERE name = 'hits'",
-            &[],
-        )
+        .execute("UPDATE counters SET val = val + 1 WHERE name = 'hits'", &[])
         .await
         .unwrap();
     assert_eq!(result.affected_rows, 1);

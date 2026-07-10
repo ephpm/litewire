@@ -7,8 +7,8 @@
 mod http;
 mod types;
 
-use std::net::SocketAddr;
 use litewire_backend::SharedBackend;
+use std::net::SocketAddr;
 use tracing::info;
 
 /// Configuration for the Hrana HTTP frontend.

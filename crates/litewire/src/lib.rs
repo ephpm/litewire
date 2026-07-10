@@ -137,8 +137,7 @@ impl LiteWire {
         #[cfg(feature = "tds")]
         if let Some(addr) = self.tds_listen {
             let config = litewire_tds::TdsFrontendConfig { listen: addr };
-            let frontend =
-                litewire_tds::TdsFrontend::new(config, Arc::clone(&self.backend));
+            let frontend = litewire_tds::TdsFrontend::new(config, Arc::clone(&self.backend));
             handles.push(tokio::spawn(async move {
                 frontend.serve().await.map_err(Into::into)
             }));

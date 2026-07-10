@@ -20,7 +20,6 @@ pub const TOKEN_ERROR: u8 = 0xAA;
 // ── DONE status flags ──────────────────────────────────────────────────────
 
 pub const DONE_FINAL: u16 = 0x0000;
-pub const DONE_MORE: u16 = 0x0001;
 pub const DONE_COUNT: u16 = 0x0010;
 
 // ── TDS type IDs for COLMETADATA ───────────────────────────────────────────
@@ -185,7 +184,8 @@ pub fn write_error(buf: &mut BytesMut, number: u32, message: &str) {
     write_info_or_error(buf, TOKEN_ERROR, number, 14, message, "", "", 0);
 }
 
-/// Shared writer for INFO (0xAB) and ERROR (0xAA) tokens — same format.
+/// Shared writer for INFO (0xAB) and ERROR (0xAA) tokens -- same format.
+#[allow(clippy::too_many_arguments)]
 fn write_info_or_error(
     buf: &mut BytesMut,
     token: u8,
@@ -354,10 +354,7 @@ fn write_value(buf: &mut BytesMut, val: &Value, tds_type: TdsType) {
 
 /// Write a UTF-16LE NVARCHAR value with u16 byte-length prefix.
 fn write_nvarchar(buf: &mut BytesMut, s: &str) {
-    let utf16: Vec<u8> = s
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
+    let utf16: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
     buf.put_u16_le(utf16.len() as u16);
     buf.put_slice(&utf16);
 }

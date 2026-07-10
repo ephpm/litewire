@@ -22,8 +22,7 @@ async fn start_litewire(port: u16) -> tokio::task::JoinHandle<()> {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let backend = litewire::backend::Rusqlite::memory().unwrap();
     let config = litewire::litewire_tds::TdsFrontendConfig { listen: addr };
-    let frontend =
-        litewire::litewire_tds::TdsFrontend::new(config, std::sync::Arc::new(backend));
+    let frontend = litewire::litewire_tds::TdsFrontend::new(config, std::sync::Arc::new(backend));
 
     tokio::spawn(async move {
         frontend.serve().await.unwrap();
@@ -212,10 +211,7 @@ async fn empty_table_query() {
         .await
         .unwrap();
 
-    let stream = client
-        .simple_query("SELECT * FROM empty_t")
-        .await
-        .unwrap();
+    let stream = client.simple_query("SELECT * FROM empty_t").await.unwrap();
     let rows = stream.into_first_result().await.unwrap();
     assert!(rows.is_empty());
 }
@@ -537,10 +533,7 @@ async fn getdate_translates() {
     let row = stream.into_row().await.unwrap().unwrap();
     let val: &str = row.get(0).unwrap();
     // Should look like a datetime string.
-    assert!(
-        val.contains('-'),
-        "expected datetime string, got: {val}",
-    );
+    assert!(val.contains('-'), "expected datetime string, got: {val}",);
 }
 
 #[tokio::test]

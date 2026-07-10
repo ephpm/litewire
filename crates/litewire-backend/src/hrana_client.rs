@@ -236,9 +236,7 @@ fn value_to_hrana(val: &Value) -> HranaValue {
             value: i.to_string(),
         },
         Value::Float(f) => HranaValue::Float { value: *f },
-        Value::Text(s) => HranaValue::Text {
-            value: s.clone(),
-        },
+        Value::Text(s) => HranaValue::Text { value: s.clone() },
         Value::Blob(b) => {
             use base64::Engine;
             HranaValue::Blob {
@@ -375,17 +373,13 @@ mod tests {
             ],
             rows: vec![
                 vec![
-                    ResponseValue::Integer {
-                        value: "1".into(),
-                    },
+                    ResponseValue::Integer { value: "1".into() },
                     ResponseValue::Text {
                         value: "alice".into(),
                     },
                 ],
                 vec![
-                    ResponseValue::Integer {
-                        value: "2".into(),
-                    },
+                    ResponseValue::Integer { value: "2".into() },
                     ResponseValue::Text {
                         value: "bob".into(),
                     },

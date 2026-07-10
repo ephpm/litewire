@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use litewire_backend::{SharedBackend, Value};
 use litewire_translate::{self, Dialect, StatementKind, TranslateResult, classify};
 
-use crate::packet::{self, PacketType, DEFAULT_PACKET_SIZE};
+use crate::packet::{self, DEFAULT_PACKET_SIZE, PacketType};
 use crate::token;
 
 /// Per-connection transaction state for TDS.
@@ -167,7 +167,11 @@ async fn handle_login7<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     token::write_loginack(&mut resp, "litewire");
     token::write_envchange_database(&mut resp, &db_name);
     token::write_envchange_packet_size(&mut resp, DEFAULT_PACKET_SIZE as u32);
-    token::write_info(&mut resp, 5701, &format!("Changed database context to '{db_name}'."));
+    token::write_info(
+        &mut resp,
+        5701,
+        &format!("Changed database context to '{db_name}'."),
+    );
     token::write_done(&mut resp, token::DONE_FINAL, 0);
 
     packet::write_message(stream, PacketType::Response, &resp, DEFAULT_PACKET_SIZE).await?;
@@ -245,8 +249,7 @@ fn skip_all_headers(payload: &[u8]) -> usize {
     if payload.len() < 4 {
         return 0;
     }
-    let total_len =
-        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let total_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
     if total_len >= 4 && total_len <= payload.len() {
         total_len
     } else {
@@ -408,10 +411,8 @@ async fn execute_sql<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                             write_query_result(&mut resp, backend, &sqlite_sql, params).await;
                         }
                         StatementKind::Transaction => {
-                            write_transaction_result(
-                                &mut resp, backend, &sqlite_sql, session,
-                            )
-                            .await;
+                            write_transaction_result(&mut resp, backend, &sqlite_sql, session)
+                                .await;
                         }
                         _ => {
                             write_exec_result(&mut resp, backend, &sqlite_sql, params).await;

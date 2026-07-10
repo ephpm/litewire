@@ -4,8 +4,8 @@
 //! type casts, and parameter placeholders.
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, ObjectName, Statement, Value, ValueWithSpan,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+    ObjectName, Statement, Value, ValueWithSpan,
 };
 
 use crate::TranslateError;
@@ -230,6 +230,46 @@ fn rewrite_function(func: &mut Function) {
         "ISNULL" => {
             func.name = func_name("IFNULL");
         }
+        // MySQL LAST_INSERT_ID() -> SQLite last_insert_rowid().
+        // Note: the MySQL 2-arg form LAST_INSERT_ID(expr) sets the session's
+        // last-insert-id; SQLite has no equivalent. We rewrite the name and let
+        // SQLite's function-arity check reject the 2-arg form loudly rather
+        // than silently changing semantics.
+        "LAST_INSERT_ID" => {
+            func.name = func_name("last_insert_rowid");
+        }
+        // MySQL ROW_COUNT() -> SQLite changes().
+        "ROW_COUNT" => {
+            func.name = func_name("changes");
+        }
+        // Session-identity built-ins. SQLite has no analogue, so we return
+        // constant placeholders that mirror the values used by the metadata
+        // fast path in `metadata::system_variable_value`.
+        //   DATABASE() / SCHEMA()       -> 'main'
+        //   VERSION()                   -> '8.0.0-litewire'
+        //   USER() / CURRENT_USER() /
+        //   SESSION_USER() / SYSTEM_USER() -> 'root@localhost'
+        //   CONNECTION_ID()             -> 0  (SQLite has no per-connection ID)
+        "DATABASE" | "SCHEMA" => {
+            func.name = func_name("coalesce");
+            func.args = func_args(vec![value_expr(Value::SingleQuotedString("main".into()))]);
+        }
+        "VERSION" => {
+            func.name = func_name("coalesce");
+            func.args = func_args(vec![value_expr(Value::SingleQuotedString(
+                "8.0.0-litewire".into(),
+            ))]);
+        }
+        "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => {
+            func.name = func_name("coalesce");
+            func.args = func_args(vec![value_expr(Value::SingleQuotedString(
+                "root@localhost".into(),
+            ))]);
+        }
+        "CONNECTION_ID" => {
+            func.name = func_name("coalesce");
+            func.args = func_args(vec![value_expr(Value::Number("0".into(), false))]);
+        }
         "NEWID" => {
             // NEWID() -> lower(hex(randomblob(16)))
             func.name = func_name("lower");
@@ -277,7 +317,7 @@ fn rewrite_value(val: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{translate, Dialect, TranslateResult};
+    use crate::{Dialect, TranslateResult, translate};
 
     #[test]
     fn boolean_rewrite() {
@@ -341,30 +381,22 @@ mod tests {
 
     #[test]
     fn boolean_in_where_clause() {
-        let results =
-            translate("SELECT * FROM t WHERE active = TRUE", Dialect::MySQL).unwrap();
+        let results = translate("SELECT * FROM t WHERE active = TRUE", Dialect::MySQL).unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.contains('1'), "got: {sql}");
     }
 
     #[test]
     fn function_in_insert_values() {
-        let results = translate(
-            "INSERT INTO t (created) VALUES (NOW())",
-            Dialect::MySQL,
-        )
-        .unwrap();
+        let results = translate("INSERT INTO t (created) VALUES (NOW())", Dialect::MySQL).unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.to_ascii_lowercase().contains("datetime"), "got: {sql}");
     }
 
     #[test]
     fn function_in_update_set() {
-        let results = translate(
-            "UPDATE t SET updated = NOW() WHERE id = 1",
-            Dialect::MySQL,
-        )
-        .unwrap();
+        let results =
+            translate("UPDATE t SET updated = NOW() WHERE id = 1", Dialect::MySQL).unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.to_ascii_lowercase().contains("datetime"), "got: {sql}");
     }
@@ -380,7 +412,67 @@ mod tests {
         assert!(sql.contains('1'), "got: {sql}");
     }
 
-    // ── NEWID rewrite ────────────────────────────────────────────────────
+    // -- LAST_INSERT_ID / ROW_COUNT / DATABASE / VERSION / USER / CONNECTION_ID --
+
+    #[test]
+    fn last_insert_id_rewrite() {
+        let results = translate("SELECT LAST_INSERT_ID()", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(
+            sql.to_ascii_lowercase().contains("last_insert_rowid"),
+            "got: {sql}"
+        );
+        assert!(
+            !sql.to_ascii_uppercase().contains("LAST_INSERT_ID("),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn row_count_rewrite() {
+        let results = translate("SELECT ROW_COUNT()", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.to_ascii_lowercase().contains("changes"), "got: {sql}");
+        assert!(
+            !sql.to_ascii_uppercase().contains("ROW_COUNT("),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn database_rewrite() {
+        let results = translate("SELECT DATABASE()", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("'main'"), "got: {sql}");
+    }
+
+    #[test]
+    fn version_rewrite() {
+        let results = translate("SELECT VERSION()", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("8.0.0-litewire"), "got: {sql}");
+    }
+
+    #[test]
+    fn current_user_rewrite() {
+        let results = translate("SELECT CURRENT_USER()", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("'root@localhost'"), "got: {sql}");
+    }
+
+    #[test]
+    fn connection_id_rewrite() {
+        let results = translate("SELECT CONNECTION_ID()", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        // Must produce a numeric literal 0 in the emitted SQL.
+        assert!(sql.contains('0'), "got: {sql}");
+        assert!(
+            !sql.to_ascii_uppercase().contains("CONNECTION_ID("),
+            "got: {sql}"
+        );
+    }
+
+    // -- NEWID rewrite --------------------------------------------------------
 
     #[test]
     fn newid_rewrite() {

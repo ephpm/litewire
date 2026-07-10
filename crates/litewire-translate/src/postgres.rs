@@ -35,10 +35,9 @@ fn rewrite_data_type(dt: &DataType) -> DataType {
 
         DataType::Boolean => DataType::Integer(None),
 
-        DataType::Date
-        | DataType::Timestamp(_, _)
-        | DataType::Time(_, _)
-        | DataType::Interval => DataType::Text,
+        DataType::Date | DataType::Timestamp(_, _) | DataType::Time(_, _) | DataType::Interval => {
+            DataType::Text
+        }
 
         DataType::JSON | DataType::JSONB => DataType::Text,
 
@@ -56,7 +55,7 @@ fn rewrite_data_type(dt: &DataType) -> DataType {
 
 #[cfg(test)]
 mod tests {
-    use crate::{translate, Dialect, TranslateResult};
+    use crate::{Dialect, TranslateResult, translate};
 
     fn extract_sql(result: &TranslateResult) -> &str {
         match result {
@@ -139,7 +138,10 @@ mod tests {
         .unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
-        assert!(!upper.contains("TIMESTAMP"), "TIMESTAMP not rewritten: {sql}");
+        assert!(
+            !upper.contains("TIMESTAMP"),
+            "TIMESTAMP not rewritten: {sql}"
+        );
     }
 
     #[test]

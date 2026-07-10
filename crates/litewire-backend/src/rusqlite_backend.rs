@@ -42,8 +42,7 @@ impl Rusqlite {
     ///
     /// Returns an error if the database cannot be opened.
     pub fn memory() -> Result<Self, BackendError> {
-        let conn =
-            Connection::open_in_memory().map_err(|e| BackendError::Sqlite(e.to_string()))?;
+        let conn = Connection::open_in_memory().map_err(|e| BackendError::Sqlite(e.to_string()))?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -73,9 +72,7 @@ fn extract_value(row: &rusqlite::Row<'_>, idx: usize) -> Result<Value, rusqlite:
         ValueRef::Null => Ok(Value::Null),
         ValueRef::Integer(i) => Ok(Value::Integer(i)),
         ValueRef::Real(f) => Ok(Value::Float(f)),
-        ValueRef::Text(s) => Ok(Value::Text(
-            String::from_utf8_lossy(s).into_owned(),
-        )),
+        ValueRef::Text(s) => Ok(Value::Text(String::from_utf8_lossy(s).into_owned())),
         ValueRef::Blob(b) => Ok(Value::Blob(b.to_vec())),
     }
 }
@@ -110,12 +107,14 @@ impl Backend for Rusqlite {
                 .query(param_refs.as_slice())
                 .map_err(|e| BackendError::Sqlite(e.to_string()))?;
 
-            while let Some(row) = rows.next().map_err(|e| BackendError::Sqlite(e.to_string()))? {
+            while let Some(row) = rows
+                .next()
+                .map_err(|e| BackendError::Sqlite(e.to_string()))?
+            {
                 let mut values = Vec::with_capacity(col_count);
                 for i in 0..col_count {
                     values.push(
-                        extract_value(row, i)
-                            .map_err(|e| BackendError::Sqlite(e.to_string()))?,
+                        extract_value(row, i).map_err(|e| BackendError::Sqlite(e.to_string()))?,
                     );
                 }
                 result_rows.push(values);
@@ -193,7 +192,10 @@ mod tests {
             .unwrap();
         assert_eq!(result.last_insert_rowid, Some(2));
 
-        let rs = backend.query("SELECT id, name FROM users ORDER BY id", &[]).await.unwrap();
+        let rs = backend
+            .query("SELECT id, name FROM users ORDER BY id", &[])
+            .await
+            .unwrap();
         assert_eq!(rs.columns.len(), 2);
         assert_eq!(rs.columns[0].name, "id");
         assert_eq!(rs.columns[1].name, "name");
@@ -243,7 +245,10 @@ mod tests {
     #[tokio::test]
     async fn null_handling() {
         let backend = Rusqlite::memory().unwrap();
-        backend.execute("CREATE TABLE t (v TEXT)", &[]).await.unwrap();
+        backend
+            .execute("CREATE TABLE t (v TEXT)", &[])
+            .await
+            .unwrap();
         backend
             .execute("INSERT INTO t VALUES (?1)", &[Value::Null])
             .await
@@ -286,10 +291,10 @@ mod tests {
             .unwrap();
 
         let rs = backend
-            .query("SELECT * FROM t WHERE a = ?1 AND b = ?2", &[
-                Value::Integer(1),
-                Value::Text("hello".into()),
-            ])
+            .query(
+                "SELECT * FROM t WHERE a = ?1 AND b = ?2",
+                &[Value::Integer(1), Value::Text("hello".into())],
+            )
             .await
             .unwrap();
         assert_eq!(rs.rows.len(), 1);
@@ -386,11 +391,17 @@ mod tests {
     async fn column_names_preserved() {
         let backend = Rusqlite::memory().unwrap();
         backend
-            .execute("CREATE TABLE users (id INTEGER, name TEXT, email TEXT)", &[])
+            .execute(
+                "CREATE TABLE users (id INTEGER, name TEXT, email TEXT)",
+                &[],
+            )
             .await
             .unwrap();
 
-        let rs = backend.query("SELECT id, name, email FROM users", &[]).await.unwrap();
+        let rs = backend
+            .query("SELECT id, name, email FROM users", &[])
+            .await
+            .unwrap();
         assert_eq!(rs.columns[0].name, "id");
         assert_eq!(rs.columns[1].name, "name");
         assert_eq!(rs.columns[2].name, "email");
@@ -399,7 +410,10 @@ mod tests {
     #[tokio::test]
     async fn query_with_alias() {
         let backend = Rusqlite::memory().unwrap();
-        let rs = backend.query("SELECT 1 AS num, 'hello' AS greeting", &[]).await.unwrap();
+        let rs = backend
+            .query("SELECT 1 AS num, 'hello' AS greeting", &[])
+            .await
+            .unwrap();
         assert_eq!(rs.columns[0].name, "num");
         assert_eq!(rs.columns[1].name, "greeting");
         assert_eq!(rs.rows[0][0], Value::Integer(1));
