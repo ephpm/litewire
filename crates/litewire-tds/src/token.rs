@@ -99,7 +99,10 @@ pub fn build_columns(columns: &[Column], first_row: Option<&[Value]>) -> Vec<Tds
                     .map(value_to_tds_type)
                     .unwrap_or(TdsType::NVarChar)
             };
-            TdsColumn { name: col.name.clone(), tds_type }
+            TdsColumn {
+                name: col.name.clone(),
+                tds_type,
+            }
         })
         .collect()
 }
@@ -110,7 +113,10 @@ pub fn build_columns(columns: &[Column], first_row: Option<&[Value]>) -> Vec<Tds
 ///
 /// Confirms successful login with server name and TDS version.
 pub fn write_loginack(buf: &mut BytesMut, server_name: &str) {
-    let name_utf16: Vec<u8> = server_name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    let name_utf16: Vec<u8> = server_name
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
 
     // Token + length(u16) + interface(u8) + tds_version(u32) + name_len(u8) + name + version(u32)
     let body_len = 1 + 4 + 1 + name_utf16.len() + 4;
@@ -126,7 +132,10 @@ pub fn write_loginack(buf: &mut BytesMut, server_name: &str) {
 
 /// Write an ENVCHANGE token for database change.
 pub fn write_envchange_database(buf: &mut BytesMut, db_name: &str) {
-    let name_utf16: Vec<u8> = db_name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    let name_utf16: Vec<u8> = db_name
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
     let char_len = db_name.chars().count() as u8;
 
     // type(1) + new_len(1) + new_value + old_len(1) + old_value
@@ -144,9 +153,15 @@ pub fn write_envchange_database(buf: &mut BytesMut, db_name: &str) {
 /// Write an ENVCHANGE token for packet size.
 pub fn write_envchange_packet_size(buf: &mut BytesMut, size: u32) {
     let new_str = size.to_string();
-    let new_utf16: Vec<u8> = new_str.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    let new_utf16: Vec<u8> = new_str
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
     let old_str = "4096";
-    let old_utf16: Vec<u8> = old_str.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    let old_utf16: Vec<u8> = old_str
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
 
     let body_len = 1 + 1 + new_utf16.len() + 1 + old_utf16.len();
 
@@ -181,9 +196,18 @@ fn write_info_or_error(
     proc_name: &str,
     line: u32,
 ) {
-    let msg_utf16: Vec<u8> = message.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-    let srv_utf16: Vec<u8> = server_name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-    let proc_utf16: Vec<u8> = proc_name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    let msg_utf16: Vec<u8> = message
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    let srv_utf16: Vec<u8> = server_name
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    let proc_utf16: Vec<u8> = proc_name
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
 
     // number(4) + state(1) + class(1) + msg_len(2) + msg + srv_len(1) + srv + proc_len(1) + proc + line(4)
     let body_len = 4 + 1 + 1 + 2 + msg_utf16.len() + 1 + srv_utf16.len() + 1 + proc_utf16.len() + 4;
@@ -233,7 +257,11 @@ pub fn write_colmetadata(buf: &mut BytesMut, columns: &[TdsColumn]) {
         }
 
         // Column name (B_VARCHAR: length in chars as u8, then UTF-16LE).
-        let name_utf16: Vec<u8> = col.name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let name_utf16: Vec<u8> = col
+            .name
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
         buf.put_u8(col.name.chars().count() as u8);
         buf.put_slice(&name_utf16);
     }

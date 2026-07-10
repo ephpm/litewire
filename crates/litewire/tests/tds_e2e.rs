@@ -67,7 +67,10 @@ async fn connect(port: u16) -> Client<tokio_util::compat::Compat<tokio::net::Tcp
 }
 
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt().with_env_filter("debug").with_test_writer().try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .with_test_writer()
+        .try_init();
 }
 
 // ── Simple query tests ─────────────────────────────────────────────────────
@@ -116,7 +119,10 @@ async fn create_table_insert_select() {
         .await
         .unwrap();
 
-    let stream = client.simple_query("SELECT id, name FROM users ORDER BY id").await.unwrap();
+    let stream = client
+        .simple_query("SELECT id, name FROM users ORDER BY id")
+        .await
+        .unwrap();
     let rows = stream.into_first_result().await.unwrap();
     assert_eq!(rows.len(), 2);
 
@@ -164,7 +170,10 @@ async fn update_and_delete() {
         .await
         .unwrap();
 
-    let stream = client.simple_query("SELECT id, qty FROM items ORDER BY id").await.unwrap();
+    let stream = client
+        .simple_query("SELECT id, qty FROM items ORDER BY id")
+        .await
+        .unwrap();
     let rows = stream.into_first_result().await.unwrap();
     assert_eq!(rows.len(), 2);
 
@@ -179,7 +188,10 @@ async fn update_and_delete() {
         .await
         .unwrap();
 
-    let stream = client.simple_query("SELECT id, qty FROM items").await.unwrap();
+    let stream = client
+        .simple_query("SELECT id, qty FROM items")
+        .await
+        .unwrap();
     let rows = stream.into_first_result().await.unwrap();
     assert_eq!(rows.len(), 1);
 }
@@ -219,7 +231,13 @@ async fn drop_table() {
         .await
         .unwrap();
 
-    client.simple_query("DROP TABLE temp_t").await.unwrap().into_results().await.unwrap();
+    client
+        .simple_query("DROP TABLE temp_t")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
 
     // Selecting from dropped table should fail.
     let result = client.simple_query("SELECT * FROM temp_t").await;
@@ -256,7 +274,10 @@ async fn null_handling() {
         .await
         .unwrap();
 
-    let stream = client.simple_query("SELECT id, val FROM nullable ORDER BY id").await.unwrap();
+    let stream = client
+        .simple_query("SELECT id, val FROM nullable ORDER BY id")
+        .await
+        .unwrap();
     let rows = stream.into_first_result().await.unwrap();
     assert_eq!(rows.len(), 2);
 
@@ -293,7 +314,10 @@ async fn multiple_connections() {
     // client1 dropped
 
     let mut client2 = connect(port).await;
-    let stream = client2.simple_query("SELECT id, val FROM shared").await.unwrap();
+    let stream = client2
+        .simple_query("SELECT id, val FROM shared")
+        .await
+        .unwrap();
     let rows = stream.into_first_result().await.unwrap();
     assert_eq!(rows.len(), 1);
     let val: &str = rows[0].get(1).unwrap();
@@ -326,7 +350,10 @@ async fn large_result_set() {
             .unwrap();
     }
 
-    let stream = client.simple_query("SELECT id, val FROM big_t ORDER BY id").await.unwrap();
+    let stream = client
+        .simple_query("SELECT id, val FROM big_t ORDER BY id")
+        .await
+        .unwrap();
     let rows = stream.into_first_result().await.unwrap();
     assert_eq!(rows.len(), 100);
 }
@@ -348,7 +375,13 @@ async fn transaction_commit() {
         .await
         .unwrap();
 
-    client.simple_query("BEGIN TRANSACTION").await.unwrap().into_results().await.unwrap();
+    client
+        .simple_query("BEGIN TRANSACTION")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
     client
         .simple_query("INSERT INTO txn_t VALUES (1, 'inside_txn')")
         .await
@@ -356,10 +389,19 @@ async fn transaction_commit() {
         .into_results()
         .await
         .unwrap();
-    client.simple_query("COMMIT").await.unwrap().into_results().await.unwrap();
+    client
+        .simple_query("COMMIT")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
 
     // Data should be visible after commit.
-    let stream = client.simple_query("SELECT id, val FROM txn_t").await.unwrap();
+    let stream = client
+        .simple_query("SELECT id, val FROM txn_t")
+        .await
+        .unwrap();
     let rows = stream.into_first_result().await.unwrap();
     assert_eq!(rows.len(), 1);
     let val: &str = rows[0].get(1).unwrap();
@@ -389,7 +431,13 @@ async fn transaction_rollback() {
         .await
         .unwrap();
 
-    client.simple_query("BEGIN TRANSACTION").await.unwrap().into_results().await.unwrap();
+    client
+        .simple_query("BEGIN TRANSACTION")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
     client
         .simple_query("INSERT INTO txn_rb VALUES (2, 'rolled_back')")
         .await
@@ -397,10 +445,19 @@ async fn transaction_rollback() {
         .into_results()
         .await
         .unwrap();
-    client.simple_query("ROLLBACK").await.unwrap().into_results().await.unwrap();
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
 
     // Only the row inserted before the transaction should exist.
-    let stream = client.simple_query("SELECT id, val FROM txn_rb ORDER BY id").await.unwrap();
+    let stream = client
+        .simple_query("SELECT id, val FROM txn_rb ORDER BY id")
+        .await
+        .unwrap();
     let rows = stream.into_first_result().await.unwrap();
     assert_eq!(rows.len(), 1);
     let val: &str = rows[0].get(1).unwrap();
@@ -431,7 +488,13 @@ async fn transaction_atomicity() {
         .unwrap();
 
     // Begin a transaction, update, then rollback — value should remain 100.
-    client.simple_query("BEGIN TRANSACTION").await.unwrap().into_results().await.unwrap();
+    client
+        .simple_query("BEGIN TRANSACTION")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
     client
         .simple_query("UPDATE txn_atom SET val = 200 WHERE id = 1")
         .await
@@ -439,9 +502,18 @@ async fn transaction_atomicity() {
         .into_results()
         .await
         .unwrap();
-    client.simple_query("ROLLBACK").await.unwrap().into_results().await.unwrap();
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
 
-    let stream = client.simple_query("SELECT id, val FROM txn_atom").await.unwrap();
+    let stream = client
+        .simple_query("SELECT id, val FROM txn_atom")
+        .await
+        .unwrap();
     let rows = stream.into_first_result().await.unwrap();
     assert_eq!(rows.len(), 1);
     let val: i64 = rows[0].get(1).unwrap();
@@ -487,8 +559,10 @@ async fn integer_column_types() {
         .await
         .unwrap();
 
-    let stream =
-        client.simple_query("SELECT id, count FROM typed_ints WHERE id = 1").await.unwrap();
+    let stream = client
+        .simple_query("SELECT id, count FROM typed_ints WHERE id = 1")
+        .await
+        .unwrap();
     let row = stream.into_row().await.unwrap().unwrap();
     let count: i64 = row.get(1).unwrap();
     assert_eq!(count, 42);
@@ -517,7 +591,10 @@ async fn float_column_types() {
         .await
         .unwrap();
 
-    let stream = client.simple_query("SELECT val FROM typed_floats WHERE id = 1").await.unwrap();
+    let stream = client
+        .simple_query("SELECT val FROM typed_floats WHERE id = 1")
+        .await
+        .unwrap();
     let row = stream.into_row().await.unwrap().unwrap();
     let val: f64 = row.get(0).unwrap();
     assert!((val - 3.14).abs() < 0.001);

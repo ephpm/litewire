@@ -52,8 +52,9 @@ impl HranaValue {
             Self::Text { value } => Value::Text(value.clone()),
             Self::Blob { base64 } => {
                 use base64::Engine;
-                let bytes =
-                    base64::engine::general_purpose::STANDARD.decode(base64).unwrap_or_default();
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(base64)
+                    .unwrap_or_default();
                 Value::Blob(bytes)
             }
         }
@@ -112,12 +113,16 @@ impl ResponseValue {
     pub fn from_backend_value(val: &Value) -> Self {
         match val {
             Value::Null => Self::Null,
-            Value::Integer(i) => Self::Integer { value: i.to_string() },
+            Value::Integer(i) => Self::Integer {
+                value: i.to_string(),
+            },
             Value::Float(f) => Self::Float { value: *f },
             Value::Text(s) => Self::Text { value: s.clone() },
             Value::Blob(b) => {
                 use base64::Engine;
-                Self::Blob { base64: base64::engine::general_purpose::STANDARD.encode(b) }
+                Self::Blob {
+                    base64: base64::engine::general_purpose::STANDARD.encode(b),
+                }
             }
         }
     }
@@ -150,7 +155,9 @@ mod tests {
 
     #[test]
     fn integer_invalid_to_backend() {
-        let v = HranaValue::Integer { value: "not_a_number".into() };
+        let v = HranaValue::Integer {
+            value: "not_a_number".into(),
+        };
         assert!(matches!(v.to_backend_value(), Value::Integer(0)));
     }
 
@@ -162,7 +169,9 @@ mod tests {
 
     #[test]
     fn text_to_backend() {
-        let v = HranaValue::Text { value: "hello".into() };
+        let v = HranaValue::Text {
+            value: "hello".into(),
+        };
         assert!(matches!(v.to_backend_value(), Value::Text(s) if s == "hello"));
     }
 
@@ -177,7 +186,9 @@ mod tests {
 
     #[test]
     fn blob_invalid_base64_to_backend() {
-        let v = HranaValue::Blob { base64: "!!!invalid!!!".into() };
+        let v = HranaValue::Blob {
+            base64: "!!!invalid!!!".into(),
+        };
         // Invalid base64 should return empty blob.
         assert!(matches!(v.to_backend_value(), Value::Blob(b) if b.is_empty()));
     }
@@ -224,7 +235,9 @@ mod tests {
         match rv {
             ResponseValue::Blob { base64: encoded } => {
                 use base64::Engine;
-                let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded).unwrap();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&encoded)
+                    .unwrap();
                 assert_eq!(decoded, data);
             }
             other => panic!("expected Blob, got: {other:?}"),

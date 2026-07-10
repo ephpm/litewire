@@ -16,7 +16,9 @@ use litewire_hrana::HranaFrontendConfig;
 /// Start a Hrana server on a random port, return the client and server task handle.
 async fn start_server() -> (HranaClient, tokio::task::JoinHandle<()>) {
     // Bind to port 0 to get a random available port.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("failed to bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind");
     let addr: SocketAddr = listener.local_addr().unwrap();
 
     let backend = Rusqlite::memory().expect("failed to create in-memory SQLite");
@@ -54,14 +56,20 @@ async fn create_table_and_insert() {
 
     // Create table
     let result = client
-        .execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &[])
+        .execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
         .await
         .expect("CREATE TABLE failed");
     assert_eq!(result.affected_rows, 0);
 
     // Insert
     let result = client
-        .execute("INSERT INTO users (name) VALUES (?)", &[Value::Text("alice".into())])
+        .execute(
+            "INSERT INTO users (name) VALUES (?)",
+            &[Value::Text("alice".into())],
+        )
         .await
         .expect("INSERT failed");
     assert_eq!(result.affected_rows, 1);
@@ -69,7 +77,10 @@ async fn create_table_and_insert() {
 
     // Insert another
     let result = client
-        .execute("INSERT INTO users (name) VALUES (?)", &[Value::Text("bob".into())])
+        .execute(
+            "INSERT INTO users (name) VALUES (?)",
+            &[Value::Text("bob".into())],
+        )
         .await
         .expect("INSERT failed");
     assert_eq!(result.affected_rows, 1);
@@ -81,7 +92,10 @@ async fn query_rows() {
     let (client, _server) = start_server().await;
 
     client
-        .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, price REAL)", &[])
+        .execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, price REAL)",
+            &[],
+        )
         .await
         .unwrap();
     client
@@ -121,7 +135,10 @@ async fn query_rows() {
 async fn query_with_params() {
     let (client, _server) = start_server().await;
 
-    client.execute("CREATE TABLE kv (key TEXT, val TEXT)", &[]).await.unwrap();
+    client
+        .execute("CREATE TABLE kv (key TEXT, val TEXT)", &[])
+        .await
+        .unwrap();
     client
         .execute(
             "INSERT INTO kv (key, val) VALUES (?, ?)",
@@ -137,8 +154,13 @@ async fn query_with_params() {
         .await
         .unwrap();
 
-    let rs =
-        client.query("SELECT val FROM kv WHERE key = ?", &[Value::Text("b".into())]).await.unwrap();
+    let rs = client
+        .query(
+            "SELECT val FROM kv WHERE key = ?",
+            &[Value::Text("b".into())],
+        )
+        .await
+        .unwrap();
 
     assert_eq!(rs.rows.len(), 1);
     assert_eq!(rs.rows[0][0], Value::Text("2".into()));
@@ -148,9 +170,15 @@ async fn query_with_params() {
 async fn query_empty_result() {
     let (client, _server) = start_server().await;
 
-    client.execute("CREATE TABLE empty_test (id INTEGER)", &[]).await.unwrap();
+    client
+        .execute("CREATE TABLE empty_test (id INTEGER)", &[])
+        .await
+        .unwrap();
 
-    let rs = client.query("SELECT id FROM empty_test", &[]).await.unwrap();
+    let rs = client
+        .query("SELECT id FROM empty_test", &[])
+        .await
+        .unwrap();
 
     assert_eq!(rs.columns.len(), 1);
     assert!(rs.rows.is_empty());
@@ -160,15 +188,27 @@ async fn query_empty_result() {
 async fn blob_roundtrip() {
     let (client, _server) = start_server().await;
 
-    client.execute("CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)", &[]).await.unwrap();
-
-    let blob_data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF];
     client
-        .execute("INSERT INTO blobs (data) VALUES (?)", &[Value::Blob(blob_data.clone())])
+        .execute(
+            "CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)",
+            &[],
+        )
         .await
         .unwrap();
 
-    let rs = client.query("SELECT data FROM blobs WHERE id = 1", &[]).await.unwrap();
+    let blob_data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF];
+    client
+        .execute(
+            "INSERT INTO blobs (data) VALUES (?)",
+            &[Value::Blob(blob_data.clone())],
+        )
+        .await
+        .unwrap();
+
+    let rs = client
+        .query("SELECT data FROM blobs WHERE id = 1", &[])
+        .await
+        .unwrap();
 
     assert_eq!(rs.rows.len(), 1);
     assert_eq!(rs.rows[0][0], Value::Blob(blob_data));
@@ -178,13 +218,22 @@ async fn blob_roundtrip() {
 async fn null_values() {
     let (client, _server) = start_server().await;
 
-    client.execute("CREATE TABLE nullable (id INTEGER, val TEXT)", &[]).await.unwrap();
     client
-        .execute("INSERT INTO nullable (id, val) VALUES (?, ?)", &[Value::Integer(1), Value::Null])
+        .execute("CREATE TABLE nullable (id INTEGER, val TEXT)", &[])
+        .await
+        .unwrap();
+    client
+        .execute(
+            "INSERT INTO nullable (id, val) VALUES (?, ?)",
+            &[Value::Integer(1), Value::Null],
+        )
         .await
         .unwrap();
 
-    let rs = client.query("SELECT val FROM nullable WHERE id = 1", &[]).await.unwrap();
+    let rs = client
+        .query("SELECT val FROM nullable WHERE id = 1", &[])
+        .await
+        .unwrap();
 
     assert_eq!(rs.rows.len(), 1);
     assert_eq!(rs.rows[0][0], Value::Null);
@@ -208,16 +257,30 @@ async fn sql_error_returns_backend_error() {
 async fn update_and_delete() {
     let (client, _server) = start_server().await;
 
-    client.execute("CREATE TABLE counters (name TEXT, val INTEGER)", &[]).await.unwrap();
-    client.execute("INSERT INTO counters VALUES ('hits', 0)", &[]).await.unwrap();
+    client
+        .execute("CREATE TABLE counters (name TEXT, val INTEGER)", &[])
+        .await
+        .unwrap();
+    client
+        .execute("INSERT INTO counters VALUES ('hits', 0)", &[])
+        .await
+        .unwrap();
 
-    let result =
-        client.execute("UPDATE counters SET val = val + 1 WHERE name = 'hits'", &[]).await.unwrap();
+    let result = client
+        .execute("UPDATE counters SET val = val + 1 WHERE name = 'hits'", &[])
+        .await
+        .unwrap();
     assert_eq!(result.affected_rows, 1);
 
-    let result = client.execute("DELETE FROM counters WHERE name = 'hits'", &[]).await.unwrap();
+    let result = client
+        .execute("DELETE FROM counters WHERE name = 'hits'", &[])
+        .await
+        .unwrap();
     assert_eq!(result.affected_rows, 1);
 
-    let rs = client.query("SELECT COUNT(*) FROM counters", &[]).await.unwrap();
+    let rs = client
+        .query("SELECT COUNT(*) FROM counters", &[])
+        .await
+        .unwrap();
     assert_eq!(rs.rows[0][0], Value::Integer(0));
 }

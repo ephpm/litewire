@@ -1,0 +1,3 @@
+# Pin rustfmt to its defaults so local runs match CI regardless of any
+# rustfmt.toml in parent directories (stable rustfmt walks up the tree).
+edition = "2024"

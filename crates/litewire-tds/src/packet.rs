@@ -93,10 +93,14 @@ pub async fn read_message<R: AsyncReadExt + Unpin>(
     }
 
     match msg_type {
-        Some(pt) => Ok(Some(TdsMessage { packet_type: pt, payload })),
-        None => {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown TDS packet type"))
-        }
+        Some(pt) => Ok(Some(TdsMessage {
+            packet_type: pt,
+            payload,
+        })),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unknown TDS packet type",
+        )),
     }
 }
 

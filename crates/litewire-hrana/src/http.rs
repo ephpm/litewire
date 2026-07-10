@@ -44,14 +44,19 @@ async fn pipeline_handler(
     for stream_req in &req.requests {
         let result = match stream_req {
             StreamRequest::Execute(exec) => execute_stmt(&state.backend, &exec.stmt).await,
-            StreamRequest::Close => Ok(StreamResult::Ok { response: StreamResponse::Close }),
+            StreamRequest::Close => Ok(StreamResult::Ok {
+                response: StreamResponse::Close,
+            }),
         };
 
         match result {
             Ok(r) => results.push(r),
             Err(e) => {
                 results.push(StreamResult::Error {
-                    error: ErrorResponse { message: e.to_string(), code: None },
+                    error: ErrorResponse {
+                        message: e.to_string(),
+                        code: None,
+                    },
                 });
             }
         }
@@ -84,7 +89,10 @@ async fn execute_stmt(
         let cols: Vec<ColResponse> = rs
             .columns
             .iter()
-            .map(|c| ColResponse { name: c.name.clone(), decltype: c.decltype.clone() })
+            .map(|c| ColResponse {
+                name: c.name.clone(),
+                decltype: c.decltype.clone(),
+            })
             .collect();
 
         let rows: Vec<Vec<ResponseValue>> = rs
@@ -146,7 +154,12 @@ mod tests {
     async fn health_check() {
         let app = build_router(test_backend());
         let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -159,7 +172,12 @@ mod tests {
     async fn version_endpoint() {
         let app = build_router(test_backend());
         let resp = app
-            .oneshot(Request::builder().uri("/version").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -231,8 +249,14 @@ mod tests {
         let backend = test_backend();
 
         // Pre-create table.
-        backend.execute("CREATE TABLE t (id INTEGER, name TEXT)", &[]).await.unwrap();
-        backend.execute("INSERT INTO t VALUES (1, 'Alice')", &[]).await.unwrap();
+        backend
+            .execute("CREATE TABLE t (id INTEGER, name TEXT)", &[])
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO t VALUES (1, 'Alice')", &[])
+            .await
+            .unwrap();
 
         let app = build_router(backend);
 
@@ -327,17 +351,32 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(resp["results"][0]["type"], "error");
         assert!(
-            resp["results"][0]["error"]["message"].as_str().unwrap().contains("nonexistent_table")
+            resp["results"][0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("nonexistent_table")
         );
     }
 
     #[tokio::test]
     async fn pipeline_mutation_returns_affected_rows() {
         let backend = test_backend();
-        backend.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", &[]).await.unwrap();
-        backend.execute("INSERT INTO t VALUES (1, 'a')", &[]).await.unwrap();
-        backend.execute("INSERT INTO t VALUES (2, 'b')", &[]).await.unwrap();
-        backend.execute("INSERT INTO t VALUES (3, 'c')", &[]).await.unwrap();
+        backend
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", &[])
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO t VALUES (1, 'a')", &[])
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO t VALUES (2, 'b')", &[])
+            .await
+            .unwrap();
+        backend
+            .execute("INSERT INTO t VALUES (3, 'c')", &[])
+            .await
+            .unwrap();
 
         let app = build_router(backend);
 
@@ -374,7 +413,10 @@ mod tests {
     async fn pipeline_insert_returns_last_insert_rowid() {
         let backend = test_backend();
         backend
-            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)", &[])
+            .execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)",
+                &[],
+            )
             .await
             .unwrap();
 
@@ -440,7 +482,10 @@ mod tests {
     #[tokio::test]
     async fn pipeline_pragma_is_query() {
         let backend = test_backend();
-        backend.execute("CREATE TABLE t (id INTEGER, name TEXT)", &[]).await.unwrap();
+        backend
+            .execute("CREATE TABLE t (id INTEGER, name TEXT)", &[])
+            .await
+            .unwrap();
 
         let app = build_router(backend);
 
@@ -479,7 +524,10 @@ mod tests {
     #[tokio::test]
     async fn pipeline_with_blob_param() {
         let backend = test_backend();
-        backend.execute("CREATE TABLE t (data BLOB)", &[]).await.unwrap();
+        backend
+            .execute("CREATE TABLE t (data BLOB)", &[])
+            .await
+            .unwrap();
 
         let app = build_router(backend);
 

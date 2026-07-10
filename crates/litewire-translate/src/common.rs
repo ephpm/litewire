@@ -25,7 +25,11 @@ fn rewrite_statement_exprs(stmt: &mut Statement) {
                 rewrite_query_exprs(source);
             }
         }
-        Statement::Update { assignments, selection, .. } => {
+        Statement::Update {
+            assignments,
+            selection,
+            ..
+        } => {
             for assign in assignments {
                 rewrite_expr(&mut assign.value);
             }
@@ -100,18 +104,30 @@ fn rewrite_expr(expr: &mut Expr) {
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
             rewrite_expr(inner);
         }
-        Expr::InList { expr: inner, list, .. } => {
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
             rewrite_expr(inner);
             for e in list {
                 rewrite_expr(e);
             }
         }
-        Expr::Between { expr: inner, low, high, .. } => {
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
             rewrite_expr(inner);
             rewrite_expr(low);
             rewrite_expr(high);
         }
-        Expr::Case { operand, conditions, else_result, .. } => {
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
             if let Some(op) = operand {
                 rewrite_expr(op);
             }
@@ -127,8 +143,11 @@ fn rewrite_expr(expr: &mut Expr) {
             rewrite_query_exprs(q);
         }
         Expr::CompoundIdentifier(parts) => {
-            let joined =
-                parts.iter().map(|p| p.value.to_ascii_uppercase()).collect::<Vec<_>>().join(".");
+            let joined = parts
+                .iter()
+                .map(|p| p.value.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(".");
             match joined.as_str() {
                 "@@IDENTITY" => {
                     *expr = Expr::Function(Function {
@@ -163,18 +182,26 @@ fn rewrite_expr(expr: &mut Expr) {
 
 /// Helper to create a `ValueWithSpan` from a `Value`.
 fn value_expr(val: Value) -> Expr {
-    Expr::Value(ValueWithSpan { value: val, span: sqlparser::tokenizer::Span::empty() })
+    Expr::Value(ValueWithSpan {
+        value: val,
+        span: sqlparser::tokenizer::Span::empty(),
+    })
 }
 
 /// Helper to build a function name `ObjectName`.
 fn func_name(name: &str) -> ObjectName {
-    ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(Ident::new(name))])
+    ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
+        Ident::new(name),
+    )])
 }
 
 /// Helper to build function args list.
 fn func_args(args: Vec<Expr>) -> FunctionArguments {
     FunctionArguments::List(FunctionArgumentList {
-        args: args.into_iter().map(|e| FunctionArg::Unnamed(FunctionArgExpr::Expr(e))).collect(),
+        args: args
+            .into_iter()
+            .map(|e| FunctionArg::Unnamed(FunctionArgExpr::Expr(e)))
+            .collect(),
         duplicate_treatment: None,
         clauses: vec![],
     })
@@ -229,13 +256,15 @@ fn rewrite_function(func: &mut Function) {
         }
         "VERSION" => {
             func.name = func_name("coalesce");
-            func.args =
-                func_args(vec![value_expr(Value::SingleQuotedString("8.0.0-litewire".into()))]);
+            func.args = func_args(vec![value_expr(Value::SingleQuotedString(
+                "8.0.0-litewire".into(),
+            ))]);
         }
         "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => {
             func.name = func_name("coalesce");
-            func.args =
-                func_args(vec![value_expr(Value::SingleQuotedString("root@localhost".into()))]);
+            func.args = func_args(vec![value_expr(Value::SingleQuotedString(
+                "root@localhost".into(),
+            ))]);
         }
         "CONNECTION_ID" => {
             func.name = func_name("coalesce");
@@ -374,9 +403,11 @@ mod tests {
 
     #[test]
     fn boolean_in_case_expression() {
-        let results =
-            translate("SELECT CASE WHEN x = TRUE THEN 'yes' ELSE 'no' END FROM t", Dialect::MySQL)
-                .unwrap();
+        let results = translate(
+            "SELECT CASE WHEN x = TRUE THEN 'yes' ELSE 'no' END FROM t",
+            Dialect::MySQL,
+        )
+        .unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.contains('1'), "got: {sql}");
     }
@@ -387,8 +418,14 @@ mod tests {
     fn last_insert_id_rewrite() {
         let results = translate("SELECT LAST_INSERT_ID()", Dialect::MySQL).unwrap();
         let sql = extract_sql(&results[0]);
-        assert!(sql.to_ascii_lowercase().contains("last_insert_rowid"), "got: {sql}");
-        assert!(!sql.to_ascii_uppercase().contains("LAST_INSERT_ID("), "got: {sql}");
+        assert!(
+            sql.to_ascii_lowercase().contains("last_insert_rowid"),
+            "got: {sql}"
+        );
+        assert!(
+            !sql.to_ascii_uppercase().contains("LAST_INSERT_ID("),
+            "got: {sql}"
+        );
     }
 
     #[test]
@@ -396,7 +433,10 @@ mod tests {
         let results = translate("SELECT ROW_COUNT()", Dialect::MySQL).unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.to_ascii_lowercase().contains("changes"), "got: {sql}");
-        assert!(!sql.to_ascii_uppercase().contains("ROW_COUNT("), "got: {sql}");
+        assert!(
+            !sql.to_ascii_uppercase().contains("ROW_COUNT("),
+            "got: {sql}"
+        );
     }
 
     #[test]
@@ -426,7 +466,10 @@ mod tests {
         let sql = extract_sql(&results[0]);
         // Must produce a numeric literal 0 in the emitted SQL.
         assert!(sql.contains('0'), "got: {sql}");
-        assert!(!sql.to_ascii_uppercase().contains("CONNECTION_ID("), "got: {sql}");
+        assert!(
+            !sql.to_ascii_uppercase().contains("CONNECTION_ID("),
+            "got: {sql}"
+        );
     }
 
     // -- NEWID rewrite --------------------------------------------------------
@@ -453,8 +496,11 @@ mod tests {
 
     #[test]
     fn multiple_dollar_placeholders() {
-        let results =
-            translate("SELECT * FROM t WHERE a = $1 AND b = $2", Dialect::PostgreSQL).unwrap();
+        let results = translate(
+            "SELECT * FROM t WHERE a = $1 AND b = $2",
+            Dialect::PostgreSQL,
+        )
+        .unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.contains("?1"), "got: {sql}");
         assert!(sql.contains("?2"), "got: {sql}");

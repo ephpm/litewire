@@ -143,7 +143,10 @@ impl HranaClient {
         if resp.status().is_success() {
             Ok(())
         } else {
-            Err(BackendError::Other(format!("health check returned {}", resp.status())))
+            Err(BackendError::Other(format!(
+                "health check returned {}",
+                resp.status()
+            )))
         }
     }
 
@@ -158,7 +161,10 @@ impl HranaClient {
         let request = PipelineRequest {
             baton: None,
             requests: vec![StreamRequest::Execute(ExecuteRequest {
-                stmt: StmtRequest { sql: sql.to_string(), args },
+                stmt: StmtRequest {
+                    sql: sql.to_string(),
+                    args,
+                },
             })],
         };
 
@@ -173,7 +179,9 @@ impl HranaClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(BackendError::Other(format!("sqld returned {status}: {body}")));
+            return Err(BackendError::Other(format!(
+                "sqld returned {status}: {body}"
+            )));
         }
 
         let pipeline: PipelineResponse = resp
@@ -210,7 +218,10 @@ impl Backend for HranaClient {
         let exec = self.execute_pipeline(sql, params).await?;
         Ok(ExecuteResult {
             affected_rows: exec.affected_row_count,
-            last_insert_rowid: exec.last_insert_rowid.as_deref().and_then(|s| s.parse().ok()),
+            last_insert_rowid: exec
+                .last_insert_rowid
+                .as_deref()
+                .and_then(|s| s.parse().ok()),
         })
     }
 }
@@ -221,12 +232,16 @@ impl Backend for HranaClient {
 fn value_to_hrana(val: &Value) -> HranaValue {
     match val {
         Value::Null => HranaValue::Null,
-        Value::Integer(i) => HranaValue::Integer { value: i.to_string() },
+        Value::Integer(i) => HranaValue::Integer {
+            value: i.to_string(),
+        },
         Value::Float(f) => HranaValue::Float { value: *f },
         Value::Text(s) => HranaValue::Text { value: s.clone() },
         Value::Blob(b) => {
             use base64::Engine;
-            HranaValue::Blob { base64: base64::engine::general_purpose::STANDARD.encode(b) }
+            HranaValue::Blob {
+                base64: base64::engine::general_purpose::STANDARD.encode(b),
+            }
         }
     }
 }
@@ -240,7 +255,9 @@ fn response_value_to_backend(rv: &ResponseValue) -> Value {
         ResponseValue::Text { value } => Value::Text(value.clone()),
         ResponseValue::Blob { base64: b64 } => {
             use base64::Engine;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap_or_default();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap_or_default();
             Value::Blob(bytes)
         }
     }
@@ -251,11 +268,17 @@ fn execute_response_to_result_set(exec: ExecuteResponse) -> ResultSet {
     let columns = exec
         .cols
         .iter()
-        .map(|c| Column { name: c.name.clone(), decltype: c.decltype.clone() })
+        .map(|c| Column {
+            name: c.name.clone(),
+            decltype: c.decltype.clone(),
+        })
         .collect();
 
-    let rows =
-        exec.rows.iter().map(|row| row.iter().map(response_value_to_backend).collect()).collect();
+    let rows = exec
+        .rows
+        .iter()
+        .map(|row| row.iter().map(response_value_to_backend).collect())
+        .collect();
 
     ResultSet { columns, rows }
 }
@@ -301,7 +324,9 @@ mod tests {
         match value_to_hrana(&Value::Blob(data.clone())) {
             HranaValue::Blob { base64: b64 } => {
                 use base64::Engine;
-                let decoded = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .unwrap();
                 assert_eq!(decoded, data);
             }
             other => panic!("expected Blob, got: {other:?}"),
@@ -312,9 +337,19 @@ mod tests {
     fn response_value_roundtrip() {
         let cases = vec![
             (Value::Null, ResponseValue::Null),
-            (Value::Integer(123), ResponseValue::Integer { value: "123".into() }),
+            (
+                Value::Integer(123),
+                ResponseValue::Integer {
+                    value: "123".into(),
+                },
+            ),
             (Value::Float(3.14), ResponseValue::Float { value: 3.14 }),
-            (Value::Text("test".into()), ResponseValue::Text { value: "test".into() }),
+            (
+                Value::Text("test".into()),
+                ResponseValue::Text {
+                    value: "test".into(),
+                },
+            ),
         ];
 
         for (val, rv) in cases {
@@ -327,17 +362,27 @@ mod tests {
     fn execute_response_to_result_set_maps_correctly() {
         let exec = ExecuteResponse {
             cols: vec![
-                ColResponse { name: "id".into(), decltype: Some("INTEGER".into()) },
-                ColResponse { name: "name".into(), decltype: Some("TEXT".into()) },
+                ColResponse {
+                    name: "id".into(),
+                    decltype: Some("INTEGER".into()),
+                },
+                ColResponse {
+                    name: "name".into(),
+                    decltype: Some("TEXT".into()),
+                },
             ],
             rows: vec![
                 vec![
                     ResponseValue::Integer { value: "1".into() },
-                    ResponseValue::Text { value: "alice".into() },
+                    ResponseValue::Text {
+                        value: "alice".into(),
+                    },
                 ],
                 vec![
                     ResponseValue::Integer { value: "2".into() },
-                    ResponseValue::Text { value: "bob".into() },
+                    ResponseValue::Text {
+                        value: "bob".into(),
+                    },
                 ],
             ],
             affected_row_count: 0,
@@ -368,8 +413,10 @@ mod tests {
 
     #[test]
     fn hrana_generic_error() {
-        let err =
-            hrana_error_to_backend(ErrorResponse { message: "something broke".into(), code: None });
+        let err = hrana_error_to_backend(ErrorResponse {
+            message: "something broke".into(),
+            code: None,
+        });
         match err {
             BackendError::Other(msg) => assert_eq!(msg, "something broke"),
             other => panic!("expected Other error, got: {other:?}"),

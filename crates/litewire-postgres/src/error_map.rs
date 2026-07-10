@@ -25,22 +25,34 @@ pub fn classify(err_msg: &str) -> PgError {
     // Unique / primary key violation -> 23505 unique_violation
     if lower.contains("unique constraint failed") || lower.contains("primary key constraint failed")
     {
-        return PgError { sqlstate: "23505", message: err_msg.to_string() };
+        return PgError {
+            sqlstate: "23505",
+            message: err_msg.to_string(),
+        };
     }
 
     // Foreign key violation -> 23503 foreign_key_violation
     if lower.contains("foreign key constraint failed") {
-        return PgError { sqlstate: "23503", message: err_msg.to_string() };
+        return PgError {
+            sqlstate: "23503",
+            message: err_msg.to_string(),
+        };
     }
 
     // NOT NULL violation -> 23502 not_null_violation
     if lower.contains("not null constraint failed") {
-        return PgError { sqlstate: "23502", message: err_msg.to_string() };
+        return PgError {
+            sqlstate: "23502",
+            message: err_msg.to_string(),
+        };
     }
 
     // CHECK constraint -> 23514 check_violation
     if lower.contains("check constraint failed") {
-        return PgError { sqlstate: "23514", message: err_msg.to_string() };
+        return PgError {
+            sqlstate: "23514",
+            message: err_msg.to_string(),
+        };
     }
 
     // SQLITE_BUSY / SQLITE_LOCKED -> 55P03 lock_not_available
@@ -49,7 +61,10 @@ pub fn classify(err_msg: &str) -> PgError {
         || lower.contains("sqlite_busy")
         || lower.contains("sqlite_locked")
     {
-        return PgError { sqlstate: "55P03", message: err_msg.to_string() };
+        return PgError {
+            sqlstate: "55P03",
+            message: err_msg.to_string(),
+        };
     }
 
     // SQLITE_READONLY -> 25006 read_only_sql_transaction
@@ -57,11 +72,17 @@ pub fn classify(err_msg: &str) -> PgError {
         || lower.contains("readonly database")
         || lower.contains("sqlite_readonly")
     {
-        return PgError { sqlstate: "25006", message: err_msg.to_string() };
+        return PgError {
+            sqlstate: "25006",
+            message: err_msg.to_string(),
+        };
     }
 
     // Fallback: internal_error
-    PgError { sqlstate: "XX000", message: err_msg.to_string() }
+    PgError {
+        sqlstate: "XX000",
+        message: err_msg.to_string(),
+    }
 }
 
 #[cfg(test)]

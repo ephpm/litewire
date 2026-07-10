@@ -110,14 +110,18 @@ impl LiteWire {
         if let Some(addr) = self.mysql_listen {
             let config = litewire_mysql::MysqlFrontendConfig { listen: addr };
             let frontend = litewire_mysql::MysqlFrontend::new(config, Arc::clone(&self.backend));
-            handles.push(tokio::spawn(async move { frontend.serve().await.map_err(Into::into) }));
+            handles.push(tokio::spawn(async move {
+                frontend.serve().await.map_err(Into::into)
+            }));
         }
 
         #[cfg(feature = "hrana")]
         if let Some(addr) = self.hrana_listen {
             let config = litewire_hrana::HranaFrontendConfig { listen: addr };
             let frontend = litewire_hrana::HranaFrontend::new(config, Arc::clone(&self.backend));
-            handles.push(tokio::spawn(async move { frontend.serve().await.map_err(Into::into) }));
+            handles.push(tokio::spawn(async move {
+                frontend.serve().await.map_err(Into::into)
+            }));
         }
 
         #[cfg(feature = "postgres")]
@@ -125,14 +129,18 @@ impl LiteWire {
             let config = litewire_postgres::PostgresFrontendConfig { listen: addr };
             let frontend =
                 litewire_postgres::PostgresFrontend::new(config, Arc::clone(&self.backend));
-            handles.push(tokio::spawn(async move { frontend.serve().await.map_err(Into::into) }));
+            handles.push(tokio::spawn(async move {
+                frontend.serve().await.map_err(Into::into)
+            }));
         }
 
         #[cfg(feature = "tds")]
         if let Some(addr) = self.tds_listen {
             let config = litewire_tds::TdsFrontendConfig { listen: addr };
             let frontend = litewire_tds::TdsFrontend::new(config, Arc::clone(&self.backend));
-            handles.push(tokio::spawn(async move { frontend.serve().await.map_err(Into::into) }));
+            handles.push(tokio::spawn(async move {
+                frontend.serve().await.map_err(Into::into)
+            }));
         }
 
         if handles.is_empty() {

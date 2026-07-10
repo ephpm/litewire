@@ -50,7 +50,10 @@ async fn connect(port: u16) -> Conn {
 }
 
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt().with_env_filter("debug").with_test_writer().try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .with_test_writer()
+        .try_init();
 }
 
 #[tokio::test]
@@ -77,11 +80,17 @@ async fn create_table_insert_select() {
         .await
         .unwrap();
 
-    conn.query_drop("INSERT INTO users (id, name) VALUES (1, 'Alice')").await.unwrap();
-    conn.query_drop("INSERT INTO users (id, name) VALUES (2, 'Bob')").await.unwrap();
+    conn.query_drop("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO users (id, name) VALUES (2, 'Bob')")
+        .await
+        .unwrap();
 
-    let rows: Vec<(i64, String)> =
-        conn.query("SELECT id, name FROM users ORDER BY id").await.unwrap();
+    let rows: Vec<(i64, String)> = conn
+        .query("SELECT id, name FROM users ORDER BY id")
+        .await
+        .unwrap();
     assert_eq!(rows, vec![(1, "Alice".into()), (2, "Bob".into())]);
 
     drop(conn);
@@ -98,7 +107,11 @@ async fn now_function_translates() {
     let result: Vec<(String,)> = conn.query("SELECT NOW()").await.unwrap();
     assert_eq!(result.len(), 1);
     // Should look like "2024-01-15 12:34:56".
-    assert!(result[0].0.contains('-'), "expected datetime string, got: {}", result[0].0);
+    assert!(
+        result[0].0.contains('-'),
+        "expected datetime string, got: {}",
+        result[0].0
+    );
 
     drop(conn);
 }
@@ -123,8 +136,12 @@ async fn show_tables() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE alpha (id INTEGER PRIMARY KEY)").await.unwrap();
-    conn.query_drop("CREATE TABLE beta (id INTEGER PRIMARY KEY)").await.unwrap();
+    conn.query_drop("CREATE TABLE alpha (id INTEGER PRIMARY KEY)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE beta (id INTEGER PRIMARY KEY)")
+        .await
+        .unwrap();
 
     let result: Vec<(String,)> = conn.query("SHOW TABLES").await.unwrap();
     let names: Vec<&str> = result.iter().map(|r| r.0.as_str()).collect();
@@ -173,16 +190,29 @@ async fn update_and_delete() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)").await.unwrap();
-    conn.query_drop("INSERT INTO items VALUES (1, 10)").await.unwrap();
-    conn.query_drop("INSERT INTO items VALUES (2, 20)").await.unwrap();
+    conn.query_drop("CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO items VALUES (1, 10)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO items VALUES (2, 20)")
+        .await
+        .unwrap();
 
-    conn.query_drop("UPDATE items SET qty = 15 WHERE id = 1").await.unwrap();
+    conn.query_drop("UPDATE items SET qty = 15 WHERE id = 1")
+        .await
+        .unwrap();
 
-    let rows: Vec<(i64, i64)> = conn.query("SELECT id, qty FROM items ORDER BY id").await.unwrap();
+    let rows: Vec<(i64, i64)> = conn
+        .query("SELECT id, qty FROM items ORDER BY id")
+        .await
+        .unwrap();
     assert_eq!(rows, vec![(1, 15), (2, 20)]);
 
-    conn.query_drop("DELETE FROM items WHERE id = 2").await.unwrap();
+    conn.query_drop("DELETE FROM items WHERE id = 2")
+        .await
+        .unwrap();
 
     let rows: Vec<(i64, i64)> = conn.query("SELECT id, qty FROM items").await.unwrap();
     assert_eq!(rows, vec![(1, 15)]);
@@ -197,8 +227,14 @@ async fn multiple_connections() {
     let _server = start_litewire(port).await;
 
     let mut conn1 = connect(port).await;
-    conn1.query_drop("CREATE TABLE shared (id INTEGER PRIMARY KEY, val TEXT)").await.unwrap();
-    conn1.query_drop("INSERT INTO shared VALUES (1, 'from_conn1')").await.unwrap();
+    conn1
+        .query_drop("CREATE TABLE shared (id INTEGER PRIMARY KEY, val TEXT)")
+        .await
+        .unwrap();
+    conn1
+        .query_drop("INSERT INTO shared VALUES (1, 'from_conn1')")
+        .await
+        .unwrap();
     drop(conn1);
 
     // Second connection should see the data (same in-memory SQLite).
@@ -218,17 +254,27 @@ async fn prepared_select_with_param() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").await.unwrap();
-    conn.query_drop("INSERT INTO users VALUES (1, 'Alice')").await.unwrap();
-    conn.query_drop("INSERT INTO users VALUES (2, 'Bob')").await.unwrap();
+    conn.query_drop("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO users VALUES (1, 'Alice')")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO users VALUES (2, 'Bob')")
+        .await
+        .unwrap();
 
     // Prepared SELECT with parameter binding.
-    let rows: Vec<(i64, String)> =
-        conn.exec("SELECT id, name FROM users WHERE id = ?", (1_i64,)).await.unwrap();
+    let rows: Vec<(i64, String)> = conn
+        .exec("SELECT id, name FROM users WHERE id = ?", (1_i64,))
+        .await
+        .unwrap();
     assert_eq!(rows, vec![(1, "Alice".into())]);
 
-    let rows: Vec<(i64, String)> =
-        conn.exec("SELECT id, name FROM users WHERE id = ?", (2_i64,)).await.unwrap();
+    let rows: Vec<(i64, String)> = conn
+        .exec("SELECT id, name FROM users WHERE id = ?", (2_i64,))
+        .await
+        .unwrap();
     assert_eq!(rows, vec![(2, "Bob".into())]);
 
     drop(conn);
@@ -246,17 +292,28 @@ async fn prepared_insert() {
         .unwrap();
 
     // Prepared INSERT with parameters.
-    conn.exec_drop("INSERT INTO items (id, name, qty) VALUES (?, ?, ?)", (1_i64, "Widget", 10_i64))
+    conn.exec_drop(
+        "INSERT INTO items (id, name, qty) VALUES (?, ?, ?)",
+        (1_i64, "Widget", 10_i64),
+    )
+    .await
+    .unwrap();
+
+    conn.exec_drop(
+        "INSERT INTO items (id, name, qty) VALUES (?, ?, ?)",
+        (2_i64, "Gadget", 20_i64),
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, String, i64)> = conn
+        .query("SELECT id, name, qty FROM items ORDER BY id")
         .await
         .unwrap();
-
-    conn.exec_drop("INSERT INTO items (id, name, qty) VALUES (?, ?, ?)", (2_i64, "Gadget", 20_i64))
-        .await
-        .unwrap();
-
-    let rows: Vec<(i64, String, i64)> =
-        conn.query("SELECT id, name, qty FROM items ORDER BY id").await.unwrap();
-    assert_eq!(rows, vec![(1, "Widget".into(), 10), (2, "Gadget".into(), 20),]);
+    assert_eq!(
+        rows,
+        vec![(1, "Widget".into(), 10), (2, "Gadget".into(), 20),]
+    );
 
     drop(conn);
 }
@@ -268,15 +325,23 @@ async fn prepared_update_and_delete() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").await.unwrap();
-    conn.query_drop("INSERT INTO t VALUES (1, 'old')").await.unwrap();
+    conn.query_drop("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO t VALUES (1, 'old')")
+        .await
+        .unwrap();
 
-    conn.exec_drop("UPDATE t SET val = ? WHERE id = ?", ("new", 1_i64)).await.unwrap();
+    conn.exec_drop("UPDATE t SET val = ? WHERE id = ?", ("new", 1_i64))
+        .await
+        .unwrap();
 
     let rows: Vec<(i64, String)> = conn.query("SELECT id, val FROM t").await.unwrap();
     assert_eq!(rows, vec![(1, "new".into())]);
 
-    conn.exec_drop("DELETE FROM t WHERE id = ?", (1_i64,)).await.unwrap();
+    conn.exec_drop("DELETE FROM t WHERE id = ?", (1_i64,))
+        .await
+        .unwrap();
 
     let rows: Vec<(i64, String)> = conn.query("SELECT id, val FROM t").await.unwrap();
     assert!(rows.is_empty());
@@ -291,11 +356,16 @@ async fn prepared_with_null_param() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").await.unwrap();
-
-    conn.exec_drop("INSERT INTO t (id, val) VALUES (?, ?)", (1_i64, Option::<String>::None))
+    conn.query_drop("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .await
         .unwrap();
+
+    conn.exec_drop(
+        "INSERT INTO t (id, val) VALUES (?, ?)",
+        (1_i64, Option::<String>::None),
+    )
+    .await
+    .unwrap();
 
     let rows: Vec<(i64, Option<String>)> = conn.query("SELECT id, val FROM t").await.unwrap();
     assert_eq!(rows, vec![(1, None)]);
@@ -310,7 +380,9 @@ async fn prepared_reuse_same_statement() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE t (id INTEGER PRIMARY KEY)").await.unwrap();
+    conn.query_drop("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .await
+        .unwrap();
 
     // Execute the same prepared statement multiple times.
     let stmt = conn.prep("INSERT INTO t (id) VALUES (?)").await.unwrap();
@@ -337,16 +409,23 @@ async fn on_duplicate_key_update() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER)").await.unwrap();
+    conn.query_drop("CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER)")
+        .await
+        .unwrap();
 
-    conn.query_drop("INSERT INTO kv (k, v) VALUES ('a', 1)").await.unwrap();
+    conn.query_drop("INSERT INTO kv (k, v) VALUES ('a', 1)")
+        .await
+        .unwrap();
 
     // MySQL ON DUPLICATE KEY UPDATE -> SQLite ON CONFLICT DO UPDATE
     conn.query_drop("INSERT INTO kv (k, v) VALUES ('a', 99) ON DUPLICATE KEY UPDATE v = 99")
         .await
         .unwrap();
 
-    let rows: Vec<(String, i64)> = conn.query("SELECT k, v FROM kv WHERE k = 'a'").await.unwrap();
+    let rows: Vec<(String, i64)> = conn
+        .query("SELECT k, v FROM kv WHERE k = 'a'")
+        .await
+        .unwrap();
     assert_eq!(rows, vec![("a".into(), 99)]);
 
     // Insert new row (no conflict).
@@ -369,10 +448,14 @@ async fn transaction_commit() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE txn_t (id INTEGER PRIMARY KEY, val TEXT)").await.unwrap();
+    conn.query_drop("CREATE TABLE txn_t (id INTEGER PRIMARY KEY, val TEXT)")
+        .await
+        .unwrap();
 
     conn.query_drop("BEGIN").await.unwrap();
-    conn.query_drop("INSERT INTO txn_t VALUES (1, 'inside_txn')").await.unwrap();
+    conn.query_drop("INSERT INTO txn_t VALUES (1, 'inside_txn')")
+        .await
+        .unwrap();
     conn.query_drop("COMMIT").await.unwrap();
 
     // Data should be visible after commit.
@@ -389,17 +472,25 @@ async fn transaction_rollback() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE txn_rb (id INTEGER PRIMARY KEY, val TEXT)").await.unwrap();
+    conn.query_drop("CREATE TABLE txn_rb (id INTEGER PRIMARY KEY, val TEXT)")
+        .await
+        .unwrap();
 
-    conn.query_drop("INSERT INTO txn_rb VALUES (1, 'before')").await.unwrap();
+    conn.query_drop("INSERT INTO txn_rb VALUES (1, 'before')")
+        .await
+        .unwrap();
 
     conn.query_drop("BEGIN").await.unwrap();
-    conn.query_drop("INSERT INTO txn_rb VALUES (2, 'rolled_back')").await.unwrap();
+    conn.query_drop("INSERT INTO txn_rb VALUES (2, 'rolled_back')")
+        .await
+        .unwrap();
     conn.query_drop("ROLLBACK").await.unwrap();
 
     // Only the row inserted before the transaction should exist.
-    let rows: Vec<(i64, String)> =
-        conn.query("SELECT id, val FROM txn_rb ORDER BY id").await.unwrap();
+    let rows: Vec<(i64, String)> = conn
+        .query("SELECT id, val FROM txn_rb ORDER BY id")
+        .await
+        .unwrap();
     assert_eq!(rows, vec![(1, "before".into())]);
 
     drop(conn);
@@ -412,13 +503,19 @@ async fn transaction_atomicity() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE txn_atom (id INTEGER PRIMARY KEY, val INTEGER)").await.unwrap();
+    conn.query_drop("CREATE TABLE txn_atom (id INTEGER PRIMARY KEY, val INTEGER)")
+        .await
+        .unwrap();
 
-    conn.query_drop("INSERT INTO txn_atom VALUES (1, 100)").await.unwrap();
+    conn.query_drop("INSERT INTO txn_atom VALUES (1, 100)")
+        .await
+        .unwrap();
 
     // Begin a transaction, update, then rollback — value should remain 100.
     conn.query_drop("BEGIN").await.unwrap();
-    conn.query_drop("UPDATE txn_atom SET val = 200 WHERE id = 1").await.unwrap();
+    conn.query_drop("UPDATE txn_atom SET val = 200 WHERE id = 1")
+        .await
+        .unwrap();
     conn.query_drop("ROLLBACK").await.unwrap();
 
     let rows: Vec<(i64, i64)> = conn.query("SELECT id, val FROM txn_atom").await.unwrap();
@@ -434,12 +531,18 @@ async fn information_schema_tables() {
     let _server = start_litewire(port).await;
     let mut conn = connect(port).await;
 
-    conn.query_drop("CREATE TABLE users (id INTEGER PRIMARY KEY)").await.unwrap();
-    conn.query_drop("CREATE TABLE posts (id INTEGER PRIMARY KEY)").await.unwrap();
+    conn.query_drop("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE TABLE posts (id INTEGER PRIMARY KEY)")
+        .await
+        .unwrap();
 
     // Returns TABLE_NAME, TABLE_TYPE, TABLE_SCHEMA columns.
-    let rows: Vec<(String, String, String)> =
-        conn.query("SELECT TABLE_NAME FROM information_schema.tables").await.unwrap();
+    let rows: Vec<(String, String, String)> = conn
+        .query("SELECT TABLE_NAME FROM information_schema.tables")
+        .await
+        .unwrap();
     let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
     assert!(names.contains(&"users"), "got: {names:?}");
     assert!(names.contains(&"posts"), "got: {names:?}");
@@ -463,13 +566,25 @@ async fn information_schema_columns() {
         .query("SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.columns WHERE TABLE_NAME = 'users'")
         .await
         .unwrap();
-    assert!(rows.len() >= 3, "expected at least 3 columns, got {}", rows.len());
+    assert!(
+        rows.len() >= 3,
+        "expected at least 3 columns, got {}",
+        rows.len()
+    );
     // Check that column names are present in the result.
-    let col_names: Vec<String> =
-        rows.iter().map(|r| r.get::<String, _>(1).unwrap_or_default()).collect();
+    let col_names: Vec<String> = rows
+        .iter()
+        .map(|r| r.get::<String, _>(1).unwrap_or_default())
+        .collect();
     assert!(col_names.contains(&"id".to_string()), "got: {col_names:?}");
-    assert!(col_names.contains(&"name".to_string()), "got: {col_names:?}");
-    assert!(col_names.contains(&"email".to_string()), "got: {col_names:?}");
+    assert!(
+        col_names.contains(&"name".to_string()),
+        "got: {col_names:?}"
+    );
+    assert!(
+        col_names.contains(&"email".to_string()),
+        "got: {col_names:?}"
+    );
 
     drop(conn);
 }
@@ -487,7 +602,11 @@ async fn describe_table() {
 
     // DESCRIBE should return column info via PRAGMA table_info.
     let rows: Vec<mysql_async::Row> = conn.query("DESCRIBE items").await.unwrap();
-    assert!(rows.len() >= 3, "expected at least 3 columns, got {}", rows.len());
+    assert!(
+        rows.len() >= 3,
+        "expected at least 3 columns, got {}",
+        rows.len()
+    );
 
     drop(conn);
 }

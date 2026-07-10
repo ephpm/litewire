@@ -350,22 +350,34 @@ mod tests {
 
     #[test]
     fn classify_insert() {
-        assert_eq!(classify("INSERT INTO users VALUES (1)"), StatementKind::Mutation);
+        assert_eq!(
+            classify("INSERT INTO users VALUES (1)"),
+            StatementKind::Mutation
+        );
     }
 
     #[test]
     fn classify_update() {
-        assert_eq!(classify("UPDATE users SET name = 'x'"), StatementKind::Mutation);
+        assert_eq!(
+            classify("UPDATE users SET name = 'x'"),
+            StatementKind::Mutation
+        );
     }
 
     #[test]
     fn classify_delete() {
-        assert_eq!(classify("DELETE FROM users WHERE id = 1"), StatementKind::Mutation);
+        assert_eq!(
+            classify("DELETE FROM users WHERE id = 1"),
+            StatementKind::Mutation
+        );
     }
 
     #[test]
     fn classify_replace() {
-        assert_eq!(classify("REPLACE INTO users VALUES (1, 'x')"), StatementKind::Mutation);
+        assert_eq!(
+            classify("REPLACE INTO users VALUES (1, 'x')"),
+            StatementKind::Mutation
+        );
     }
 
     #[test]
@@ -380,7 +392,10 @@ mod tests {
 
     #[test]
     fn classify_alter() {
-        assert_eq!(classify("ALTER TABLE users ADD col TEXT"), StatementKind::Ddl);
+        assert_eq!(
+            classify("ALTER TABLE users ADD col TEXT"),
+            StatementKind::Ddl
+        );
     }
 
     #[test]
@@ -464,7 +479,10 @@ mod tests {
 
     #[test]
     fn start_transaction_read_only_becomes_begin() {
-        assert_eq!(expect_sql("START TRANSACTION READ ONLY", Dialect::MySQL), "BEGIN");
+        assert_eq!(
+            expect_sql("START TRANSACTION READ ONLY", Dialect::MySQL),
+            "BEGIN"
+        );
     }
 
     #[test]
@@ -482,7 +500,10 @@ mod tests {
 
     #[test]
     fn tsql_named_begin_transaction_strips_name() {
-        assert_eq!(expect_sql("BEGIN TRANSACTION my_txn", Dialect::TDS), "BEGIN");
+        assert_eq!(
+            expect_sql("BEGIN TRANSACTION my_txn", Dialect::TDS),
+            "BEGIN"
+        );
     }
 
     #[test]
@@ -493,13 +514,19 @@ mod tests {
     #[test]
     fn commit_work_and_named_become_commit() {
         assert_eq!(expect_sql("COMMIT WORK", Dialect::MySQL), "COMMIT");
-        assert_eq!(expect_sql("COMMIT TRANSACTION my_txn", Dialect::TDS), "COMMIT");
+        assert_eq!(
+            expect_sql("COMMIT TRANSACTION my_txn", Dialect::TDS),
+            "COMMIT"
+        );
     }
 
     #[test]
     fn rollback_work_and_named_become_rollback() {
         assert_eq!(expect_sql("ROLLBACK WORK", Dialect::MySQL), "ROLLBACK");
-        assert_eq!(expect_sql("ROLLBACK TRANSACTION my_txn", Dialect::TDS), "ROLLBACK");
+        assert_eq!(
+            expect_sql("ROLLBACK TRANSACTION my_txn", Dialect::TDS),
+            "ROLLBACK"
+        );
     }
 
     #[test]
@@ -571,9 +598,18 @@ mod tests {
 
     #[test]
     fn set_transaction_isolation_level_is_noop() {
-        expect_noop("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", Dialect::MySQL);
-        expect_noop("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", Dialect::MySQL);
-        expect_noop("SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ", Dialect::MySQL);
+        expect_noop(
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            Dialect::MySQL,
+        );
+        expect_noop(
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            Dialect::MySQL,
+        );
+        expect_noop(
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            Dialect::MySQL,
+        );
     }
 
     #[test]

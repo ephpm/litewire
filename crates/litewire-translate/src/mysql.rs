@@ -35,7 +35,10 @@ fn rewrite_insert_on_duplicate(insert: &mut sqlparser::ast::Insert) {
     if let Some(OnInsert::DuplicateKeyUpdate(assignments)) = insert.on.take() {
         insert.on = Some(OnInsert::OnConflict(OnConflict {
             conflict_target: None,
-            action: OnConflictAction::DoUpdate(DoUpdate { assignments, selection: None }),
+            action: OnConflictAction::DoUpdate(DoUpdate {
+                assignments,
+                selection: None,
+            }),
         }));
     }
 }
@@ -47,7 +50,10 @@ fn rewrite_limit_clause(query: &mut sqlparser::ast::Query) {
     if let Some(LimitClause::OffsetCommaLimit { offset, limit }) = query.limit_clause.take() {
         query.limit_clause = Some(LimitClause::LimitOffset {
             limit: Some(limit),
-            offset: Some(Offset { value: offset, rows: OffsetRows::None }),
+            offset: Some(Offset {
+                value: offset,
+                rows: OffsetRows::None,
+            }),
             limit_by: vec![],
         });
     }
@@ -186,7 +192,10 @@ mod tests {
     fn boolean_translated() {
         let results = translate("SELECT TRUE, FALSE", Dialect::MySQL).unwrap();
         let sql = extract_sql(&results[0]);
-        assert!(sql.contains('1') && sql.contains('0'), "expected 1 and 0, got: {sql}");
+        assert!(
+            sql.contains('1') && sql.contains('0'),
+            "expected 1 and 0, got: {sql}"
+        );
     }
 
     // ── ON DUPLICATE KEY UPDATE ─────────────────────────────────────────────
@@ -200,9 +209,18 @@ mod tests {
         .unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
-        assert!(upper.contains("ON CONFLICT"), "expected ON CONFLICT, got: {sql}");
-        assert!(upper.contains("DO UPDATE"), "expected DO UPDATE, got: {sql}");
-        assert!(!upper.contains("DUPLICATE KEY"), "DUPLICATE KEY should be removed: {sql}");
+        assert!(
+            upper.contains("ON CONFLICT"),
+            "expected ON CONFLICT, got: {sql}"
+        );
+        assert!(
+            upper.contains("DO UPDATE"),
+            "expected DO UPDATE, got: {sql}"
+        );
+        assert!(
+            !upper.contains("DUPLICATE KEY"),
+            "DUPLICATE KEY should be removed: {sql}"
+        );
     }
 
     #[test]
@@ -251,14 +269,20 @@ mod tests {
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("TINYINT"), "TINYINT not rewritten: {sql}");
         assert!(!upper.contains("SMALLINT"), "SMALLINT not rewritten: {sql}");
-        assert!(!upper.contains("MEDIUMINT"), "MEDIUMINT not rewritten: {sql}");
+        assert!(
+            !upper.contains("MEDIUMINT"),
+            "MEDIUMINT not rewritten: {sql}"
+        );
         assert!(!upper.contains("BIGINT"), "BIGINT not rewritten: {sql}");
     }
 
     #[test]
     fn varchar_to_text() {
-        let results =
-            translate("CREATE TABLE t (name VARCHAR(255), bio TEXT)", Dialect::MySQL).unwrap();
+        let results = translate(
+            "CREATE TABLE t (name VARCHAR(255), bio TEXT)",
+            Dialect::MySQL,
+        )
+        .unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("VARCHAR"), "VARCHAR not rewritten: {sql}");
@@ -266,9 +290,11 @@ mod tests {
 
     #[test]
     fn float_types_to_real() {
-        let results =
-            translate("CREATE TABLE t (a FLOAT, b DOUBLE, c DECIMAL(10,2))", Dialect::MySQL)
-                .unwrap();
+        let results = translate(
+            "CREATE TABLE t (a FLOAT, b DOUBLE, c DECIMAL(10,2))",
+            Dialect::MySQL,
+        )
+        .unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(upper.contains("REAL"), "no REAL found: {sql}");
@@ -284,13 +310,18 @@ mod tests {
 
     #[test]
     fn datetime_to_text() {
-        let results =
-            translate("CREATE TABLE t (created DATETIME, updated TIMESTAMP)", Dialect::MySQL)
-                .unwrap();
+        let results = translate(
+            "CREATE TABLE t (created DATETIME, updated TIMESTAMP)",
+            Dialect::MySQL,
+        )
+        .unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("DATETIME"), "DATETIME not rewritten: {sql}");
-        assert!(!upper.contains("TIMESTAMP"), "TIMESTAMP not rewritten: {sql}");
+        assert!(
+            !upper.contains("TIMESTAMP"),
+            "TIMESTAMP not rewritten: {sql}"
+        );
     }
 
     #[test]
@@ -302,7 +333,10 @@ mod tests {
         .unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
-        assert!(!upper.contains("AUTO_INCREMENT"), "AUTO_INCREMENT not removed: {sql}");
+        assert!(
+            !upper.contains("AUTO_INCREMENT"),
+            "AUTO_INCREMENT not removed: {sql}"
+        );
     }
 
     #[test]
@@ -334,9 +368,11 @@ mod tests {
 
     #[test]
     fn insert_passthrough() {
-        let results =
-            translate("INSERT INTO users (name, age) VALUES ('Alice', 30)", Dialect::MySQL)
-                .unwrap();
+        let results = translate(
+            "INSERT INTO users (name, age) VALUES ('Alice', 30)",
+            Dialect::MySQL,
+        )
+        .unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.contains("Alice"), "got: {sql}");
     }

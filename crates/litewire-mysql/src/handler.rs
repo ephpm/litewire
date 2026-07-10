@@ -23,9 +23,17 @@ const MAX_PREPARED_STMTS_PER_CONN: usize = 1024;
 
 /// Build an `OkResponse` with the correct transaction status flag.
 fn ok_response(affected_rows: u64, last_insert_id: u64, in_transaction: bool) -> OkResponse {
-    let status_flags =
-        if in_transaction { StatusFlags::SERVER_STATUS_IN_TRANS } else { StatusFlags::empty() };
-    OkResponse { affected_rows, last_insert_id, status_flags, ..OkResponse::default() }
+    let status_flags = if in_transaction {
+        StatusFlags::SERVER_STATUS_IN_TRANS
+    } else {
+        StatusFlags::empty()
+    };
+    OkResponse {
+        affected_rows,
+        last_insert_id,
+        status_flags,
+        ..OkResponse::default()
+    }
 }
 
 use crate::types::sqlite_to_mysql_column_type;
@@ -51,7 +59,12 @@ pub struct LiteWireHandler {
 
 impl LiteWireHandler {
     pub fn new(backend: SharedBackend) -> Self {
-        Self { backend, stmts: HashMap::new(), next_stmt_id: 1, in_transaction: false }
+        Self {
+            backend,
+            stmts: HashMap::new(),
+            next_stmt_id: 1,
+            in_transaction: false,
+        }
     }
 
     /// Execute a query and write result set.
@@ -107,8 +120,10 @@ impl LiteWireHandler {
                 // last_insert_rowid comes back as i64 -- clamp negatives (should
                 // never happen; SQLite rowids are always >= 1 for a real insert)
                 // to 0 rather than reinterpret via `as u64`.
-                let last_id_u64: u64 =
-                    r.last_insert_rowid.and_then(|v| u64::try_from(v.max(0)).ok()).unwrap_or(0);
+                let last_id_u64: u64 = r
+                    .last_insert_rowid
+                    .and_then(|v| u64::try_from(v.max(0)).ok())
+                    .unwrap_or(0);
                 let resp = ok_response(r.affected_rows, last_id_u64, self.in_transaction);
                 results.completed(resp).await
             }
@@ -262,7 +277,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         let stmt_id = self.next_stmt_id;
         self.next_stmt_id += 1;
 
-        self.stmts.insert(stmt_id, PreparedStmt { sqlite_sql, kind });
+        self.stmts
+            .insert(stmt_id, PreparedStmt { sqlite_sql, kind });
 
         info.reply(stmt_id, &params, &columns).await
     }
@@ -292,7 +308,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
 
         // Noop statements (empty SQL from SET NAMES etc.)
         if sql.is_empty() {
-            return results.completed(ok_response(0, 0, self.in_transaction)).await;
+            return results
+                .completed(ok_response(0, 0, self.in_transaction))
+                .await;
         }
 
         match kind {
@@ -318,7 +336,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
             Ok(r) => r,
             Err(e) => {
                 warn!("SQL translation error: {e}");
-                return results.error(ErrorKind::ER_PARSE_ERROR, e.to_string().as_bytes()).await;
+                return results
+                    .error(ErrorKind::ER_PARSE_ERROR, e.to_string().as_bytes())
+                    .await;
             }
         };
 

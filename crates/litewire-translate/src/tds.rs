@@ -103,9 +103,11 @@ mod tests {
 
     #[test]
     fn int_types_to_integer() {
-        let results =
-            translate("CREATE TABLE t (a TINYINT, b SMALLINT, c INT, d BIGINT)", Dialect::TDS)
-                .unwrap();
+        let results = translate(
+            "CREATE TABLE t (a TINYINT, b SMALLINT, c INT, d BIGINT)",
+            Dialect::TDS,
+        )
+        .unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("TINYINT"), "TINYINT not rewritten: {sql}");
@@ -127,7 +129,10 @@ mod tests {
         let results = translate("CREATE TABLE t (data VARBINARY(MAX))", Dialect::TDS).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
-        assert!(!upper.contains("VARBINARY"), "VARBINARY not rewritten: {sql}");
+        assert!(
+            !upper.contains("VARBINARY"),
+            "VARBINARY not rewritten: {sql}"
+        );
         assert!(upper.contains("BLOB"), "no BLOB found: {sql}");
     }
 
@@ -202,7 +207,10 @@ mod tests {
         let results = translate("CREATE TABLE t (id UNIQUEIDENTIFIER)", Dialect::TDS).unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
-        assert!(!upper.contains("UNIQUEIDENTIFIER"), "UNIQUEIDENTIFIER not rewritten: {sql}");
+        assert!(
+            !upper.contains("UNIQUEIDENTIFIER"),
+            "UNIQUEIDENTIFIER not rewritten: {sql}"
+        );
         assert!(upper.contains("TEXT"), "no TEXT found: {sql}");
     }
 
@@ -217,8 +225,11 @@ mod tests {
 
     #[test]
     fn identity_column_option_removed() {
-        let results =
-            translate("CREATE TABLE t (id INT IDENTITY(1,1) PRIMARY KEY)", Dialect::TDS).unwrap();
+        let results = translate(
+            "CREATE TABLE t (id INT IDENTITY(1,1) PRIMARY KEY)",
+            Dialect::TDS,
+        )
+        .unwrap();
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains("IDENTITY"), "IDENTITY not removed: {sql}");

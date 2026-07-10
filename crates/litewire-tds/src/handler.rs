@@ -25,7 +25,11 @@ struct TdsSession {
 
 impl TdsSession {
     fn new() -> Self {
-        Self { in_transaction: false, next_tran_id: 1, current_tran_id: 0 }
+        Self {
+            in_transaction: false,
+            next_tran_id: 1,
+            current_tran_id: 0,
+        }
     }
 
     fn begin(&mut self) -> u64 {
@@ -163,7 +167,11 @@ async fn handle_login7<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     token::write_loginack(&mut resp, "litewire");
     token::write_envchange_database(&mut resp, &db_name);
     token::write_envchange_packet_size(&mut resp, DEFAULT_PACKET_SIZE as u32);
-    token::write_info(&mut resp, 5701, &format!("Changed database context to '{db_name}'."));
+    token::write_info(
+        &mut resp,
+        5701,
+        &format!("Changed database context to '{db_name}'."),
+    );
     token::write_done(&mut resp, token::DONE_FINAL, 0);
 
     packet::write_message(stream, PacketType::Response, &resp, DEFAULT_PACKET_SIZE).await?;
@@ -203,7 +211,10 @@ fn decode_utf16le(data: &[u8]) -> Option<String> {
     if data.len() % 2 != 0 {
         return None;
     }
-    let chars: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let chars: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     String::from_utf16(&chars).ok()
 }
 
@@ -239,7 +250,11 @@ fn skip_all_headers(payload: &[u8]) -> usize {
         return 0;
     }
     let total_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    if total_len >= 4 && total_len <= payload.len() { total_len } else { 0 }
+    if total_len >= 4 && total_len <= payload.len() {
+        total_len
+    } else {
+        0
+    }
 }
 
 /// Handle an RPC request.
