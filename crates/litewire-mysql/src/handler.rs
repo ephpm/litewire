@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use litewire_backend::{SharedBackend, Value};
+use litewire_backend::{BackendConn, BackendError, SharedBackend, Value};
 use litewire_translate::{self, Dialect, StatementKind, TranslateCache, TranslateResult, classify};
 use opensrv_mysql::*;
 use tokio::io::AsyncWrite;
@@ -48,8 +48,16 @@ struct PreparedStmt {
 }
 
 /// Handler for a single MySQL client connection.
+///
+/// Owns a per-session [`BackendConn`] obtained from the shared factory
+/// at accept time. All statements from this MySQL client hit the same
+/// backend session, so `BEGIN`/`COMMIT`/`ROLLBACK` are properly isolated
+/// from other MySQL clients.
 pub struct LiteWireHandler {
-    backend: SharedBackend,
+    /// Per-session backend handle. `Box<dyn BackendConn>` because
+    /// implementations vary (rusqlite vs. hrana) and we only need the
+    /// object-safe surface.
+    conn: Box<dyn BackendConn>,
     /// Shared translation cache across all connections on this frontend.
     translate_cache: Arc<TranslateCache>,
     /// Prepared statements keyed by the statement ID assigned during `on_prepare`.
@@ -61,14 +69,26 @@ pub struct LiteWireHandler {
 }
 
 impl LiteWireHandler {
-    pub fn new(backend: SharedBackend, translate_cache: Arc<TranslateCache>) -> Self {
-        Self {
-            backend,
+    /// Open a fresh backend session for this MySQL client.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's error verbatim if the underlying session
+    /// (e.g. a rusqlite `Connection` open or an sqld health probe) fails.
+    /// Callers should treat this as "reject the client" -- there is no
+    /// meaningful retry at this layer.
+    pub async fn new(
+        backend: SharedBackend,
+        translate_cache: Arc<TranslateCache>,
+    ) -> Result<Self, BackendError> {
+        let conn = backend.connect().await?;
+        Ok(Self {
+            conn,
             translate_cache,
             stmts: HashMap::new(),
             next_stmt_id: 1,
             in_transaction: false,
-        }
+        })
     }
 
     /// Execute a query and write result set.
@@ -78,7 +98,7 @@ impl LiteWireHandler {
         params: &[Value],
         results: QueryResultWriter<'_, W>,
     ) -> Result<(), std::io::Error> {
-        match self.backend.query(sql, params).await {
+        match self.conn.query(sql, params).await {
             Ok(rs) => {
                 let columns: Vec<Column> = rs
                     .columns
@@ -127,7 +147,7 @@ impl LiteWireHandler {
         params: &[Value],
         results: QueryResultWriter<'_, W>,
     ) -> Result<(), std::io::Error> {
-        match self.backend.execute(sql, params).await {
+        match self.conn.execute(sql, params).await {
             Ok(r) => {
                 // last_insert_rowid comes back as i64 -- clamp negatives (should
                 // never happen; SQLite rowids are always >= 1 for a real insert)
@@ -149,7 +169,7 @@ impl LiteWireHandler {
         sql: &str,
         results: QueryResultWriter<'_, W>,
     ) -> Result<(), std::io::Error> {
-        match self.backend.execute(sql, &[]).await {
+        match self.conn.execute(sql, &[]).await {
             Ok(_) => {
                 let upper = sql.trim().to_ascii_uppercase();
                 if upper.starts_with("BEGIN") || upper.starts_with("START") {
@@ -252,7 +272,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         // reads column metadata off the prepared statement without
         // executing it (was: `SELECT ... LIMIT 0` round trip).
         let columns = if kind == StatementKind::Query && !sqlite_sql.is_empty() {
-            match self.backend.describe_columns(&sqlite_sql).await {
+            match self.conn.describe_columns(&sqlite_sql).await {
                 Ok(cols) => cols
                     .iter()
                     .map(|c| Column {

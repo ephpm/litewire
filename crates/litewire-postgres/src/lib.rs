@@ -57,12 +57,7 @@ impl PostgresFrontend {
         // Shared parse+rewrite cache across every accepted connection --
         // same rationale as the MySQL frontend.
         let translate_cache = Arc::new(TranslateCache::default());
-        let factory = Arc::new(LiteWireHandlerFactory {
-            handler: Arc::new(PostgresHandler::new(
-                Arc::clone(&self.backend),
-                translate_cache,
-            )),
-        });
+        let backend = Arc::clone(&self.backend);
 
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -76,8 +71,23 @@ impl PostgresFrontend {
             let _ = stream.set_nodelay(true);
             debug!(%peer, "PostgreSQL client connected");
 
-            let factory = Arc::clone(&factory);
+            // Per-connection factory: each accepted client gets its own
+            // PostgresHandler with its own BackendConn, so transactions
+            // are isolated across pgwire sessions. Same rationale as
+            // litewire-mysql -- see BackendConn docs.
+            let be = Arc::clone(&backend);
+            let cache = Arc::clone(&translate_cache);
             tokio::spawn(async move {
+                let handler = match PostgresHandler::new(be, cache).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(%peer, "PostgreSQL: failed to open backend session: {e}");
+                        return;
+                    }
+                };
+                let factory = Arc::new(LiteWireHandlerFactory {
+                    handler: Arc::new(handler),
+                });
                 if let Err(e) = process_socket(stream, None, factory).await {
                     debug!(%peer, "PostgreSQL session ended: {e}");
                 }

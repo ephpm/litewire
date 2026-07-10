@@ -74,7 +74,13 @@ impl MysqlFrontend {
             let be = Arc::clone(&backend);
             let cache = Arc::clone(&translate_cache);
             tokio::spawn(async move {
-                let handler = LiteWireHandler::new(be, cache);
+                let handler = match LiteWireHandler::new(be, cache).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(%peer, "MySQL: failed to open backend session: {e}");
+                        return;
+                    }
+                };
                 let (reader, writer) = stream.into_split();
                 if let Err(e) =
                     opensrv_mysql::AsyncMysqlIntermediary::run_on(handler, reader, writer).await
