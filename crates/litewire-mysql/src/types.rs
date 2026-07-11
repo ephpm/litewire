@@ -1,6 +1,29 @@
 //! MySQL type mapping from SQLite column declarations.
 
+use litewire_backend::Value;
 use opensrv_mysql::ColumnType;
+
+/// Map a runtime [`Value`] to the MySQL column type its binary encoding
+/// requires.
+///
+/// SQLite is dynamically typed: expression columns (`SELECT 1`, `SELECT
+/// a + b`) have no declared type, so `decltype` is `None` and the
+/// declaration-based mapping would fall back to `VAR_STRING`. But the row
+/// writer emits each value in its native form (an integer as `LONGLONG`),
+/// and opensrv's binary protocol rejects a declared/actual type mismatch
+/// ("tried to use 1 as MYSQL_TYPE_VAR_STRING") and drops the connection —
+/// surfacing to the client as `2006 server has gone away`. For untyped
+/// columns we therefore derive the wire type from the actual data.
+#[must_use]
+pub fn mysql_type_for_value(value: &Value) -> ColumnType {
+    match value {
+        Value::Null => ColumnType::MYSQL_TYPE_VAR_STRING,
+        Value::Integer(_) => ColumnType::MYSQL_TYPE_LONGLONG,
+        Value::Float(_) => ColumnType::MYSQL_TYPE_DOUBLE,
+        Value::Text(_) => ColumnType::MYSQL_TYPE_VAR_STRING,
+        Value::Blob(_) => ColumnType::MYSQL_TYPE_BLOB,
+    }
+}
 
 /// Map a SQLite column declared type to a MySQL column type.
 ///
