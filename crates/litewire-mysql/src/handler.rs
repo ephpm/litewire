@@ -37,7 +37,7 @@ fn ok_response(affected_rows: u64, last_insert_id: u64, in_transaction: bool) ->
     }
 }
 
-use crate::types::sqlite_to_mysql_column_type;
+use crate::types::{mysql_type_for_value, sqlite_to_mysql_column_type};
 
 /// A cached prepared statement.
 struct PreparedStmt {
@@ -103,11 +103,29 @@ impl LiteWireHandler {
                 let columns: Vec<Column> = rs
                     .columns
                     .iter()
-                    .map(|c| Column {
-                        table: String::new(),
-                        column: c.name.clone(),
-                        coltype: sqlite_to_mysql_column_type(c.decltype.as_deref()),
-                        colflags: ColumnFlags::empty(),
+                    .enumerate()
+                    .map(|(i, c)| {
+                        // Declared type wins; for untyped expression columns
+                        // (`SELECT 1`, decltype None) infer the wire type from
+                        // the first non-NULL value so the declared column type
+                        // matches how the row writer encodes it. Scan past
+                        // leading NULLs; empty/all-NULL columns stay VAR_STRING
+                        // (NULL is valid against any column type).
+                        let coltype = if c.decltype.is_some() {
+                            sqlite_to_mysql_column_type(c.decltype.as_deref())
+                        } else {
+                            rs.rows
+                                .iter()
+                                .filter_map(|r| r.get(i))
+                                .find(|v| !matches!(v, Value::Null))
+                                .map_or(ColumnType::MYSQL_TYPE_VAR_STRING, mysql_type_for_value)
+                        };
+                        Column {
+                            table: String::new(),
+                            column: c.name.clone(),
+                            coltype,
+                            colflags: ColumnFlags::empty(),
+                        }
                     })
                     .collect();
 

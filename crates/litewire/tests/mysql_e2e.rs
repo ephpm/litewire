@@ -281,6 +281,31 @@ async fn prepared_select_with_param() {
 }
 
 #[tokio::test]
+async fn prepared_select_expression_no_table() {
+    // A prepared SELECT of a bare expression (no FROM clause) — e.g. the
+    // `SELECT 1` liveness check some ORMs issue with prepare-emulation off.
+    // Regressed with "2006 server has gone away": the frontend dropped the
+    // connection because on_prepare and on_execute disagreed on column count
+    // for a table-less expression column.
+    init_tracing();
+    let port = free_port().await;
+    let _server = start_litewire(port).await;
+    let mut conn = connect(port).await;
+
+    let rows: Vec<i64> = conn.exec("SELECT 1", ()).await.unwrap();
+    assert_eq!(rows, vec![1]);
+
+    // Also exercise a multi-column expression select and an aliased one.
+    let rows: Vec<(i64, i64)> = conn.exec("SELECT 1 + 1, 40 + 2", ()).await.unwrap();
+    assert_eq!(rows, vec![(2, 42)]);
+
+    let rows: Vec<i64> = conn.exec("SELECT 7 AS answer", ()).await.unwrap();
+    assert_eq!(rows, vec![7]);
+
+    drop(conn);
+}
+
+#[tokio::test]
 async fn prepared_insert() {
     init_tracing();
     let port = free_port().await;
