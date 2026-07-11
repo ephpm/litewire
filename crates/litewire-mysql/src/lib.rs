@@ -82,6 +82,26 @@ impl MysqlFrontend {
                     }
                 };
                 let (reader, writer) = stream.into_split();
+                // Coalesce the whole response into a single write.
+                //
+                // A result set is emitted by opensrv-mysql as several distinct
+                // packets (column-count, one column-def per column, EOF, one
+                // packet per row, EOF), each written to the socket separately;
+                // opensrv only calls `flush()` once, after the full response.
+                // On a raw socket every packet becomes its own TCP segment, so
+                // a client whose Nagle is enabled (PHP mysqlnd does NOT set
+                // TCP_NODELAY) withholds its ACK of the first segment while it
+                // waits for more data, and Linux delayed-ACK holds that ACK for
+                // ~40ms, stalling every result-set round trip (measured 44ms
+                // p50 per point-SELECT via PDO, vs 1.3ms for an INSERT, whose
+                // response is a single OK packet). Server-side `set_nodelay`
+                // alone does not cure it because the deadlock is driven by the
+                // client's Nagle, not the server's. Buffering makes opensrv's
+                // single trailing `flush()` emit the entire result set as one
+                // segment, so there is no intermediate packet for the client to
+                // sit on. The buffer is sized for the common small result set;
+                // larger responses flush in chunks, which is still correct.
+                let writer = tokio::io::BufWriter::with_capacity(64 * 1024, writer);
                 if let Err(e) =
                     opensrv_mysql::AsyncMysqlIntermediary::run_on(handler, reader, writer).await
                 {
