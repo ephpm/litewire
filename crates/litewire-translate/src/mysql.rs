@@ -23,16 +23,159 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
         Statement::Query(query) => {
             rewrite_limit_clause(query);
         }
+        Statement::Update { assignments, .. } => {
+            rewrite_update_assignment_targets(assignments);
+        }
         _ => {}
     }
     Ok(())
 }
 
+/// Strip table qualifiers from UPDATE SET targets: MySQL accepts
+/// `UPDATE users SET users.updated_at = ...`, SQLite requires a bare
+/// column name. (Laravel's Eloquent qualifies the `updated_at` column.)
+fn rewrite_update_assignment_targets(assignments: &mut [sqlparser::ast::Assignment]) {
+    use sqlparser::ast::{AssignmentTarget, ObjectName};
+    for a in assignments {
+        if let AssignmentTarget::ColumnName(name) = &mut a.target {
+            if name.0.len() > 1 {
+                if let Some(last) = name.0.pop() {
+                    *name = ObjectName(vec![last]);
+                }
+            }
+        }
+    }
+}
+
+// ── ALTER TABLE ADD KEY/UNIQUE -> CREATE INDEX ───────────────────────────────
+
+/// Expand MySQL `ALTER TABLE ... ADD {KEY|INDEX|UNIQUE} name (cols)` into
+/// standalone `CREATE [UNIQUE] INDEX` statements (SQLite has no
+/// `ALTER TABLE ... ADD CONSTRAINT`). Laravel's schema builder emits one
+/// such ALTER per `->unique()` / `->index()` after every `create table`.
+///
+/// Non-index operations are preserved in a residual `ALTER TABLE`.
+#[must_use]
+pub fn expand_alter_table(stmt: Statement) -> Vec<Statement> {
+    use sqlparser::ast::{
+        AlterTableOperation, CreateIndex, IndexColumn, OrderByExpr, OrderByOptions,
+        TableConstraint,
+    };
+
+    let Statement::AlterTable {
+        name,
+        if_exists,
+        only,
+        operations,
+        location,
+        on_cluster,
+        iceberg,
+    } = stmt
+    else {
+        return vec![stmt];
+    };
+
+    let to_index_columns = |cols: &[sqlparser::ast::Ident]| -> Vec<IndexColumn> {
+        cols.iter()
+            .map(|c| IndexColumn {
+                column: OrderByExpr {
+                    expr: sqlparser::ast::Expr::Identifier(c.clone()),
+                    options: OrderByOptions {
+                        asc: None,
+                        nulls_first: None,
+                    },
+                    with_fill: None,
+                },
+                operator_class: None,
+            })
+            .collect()
+    };
+
+    let mut indexes: Vec<Statement> = Vec::new();
+    let mut residual_ops: Vec<AlterTableOperation> = Vec::new();
+
+    for op in operations {
+        match &op {
+            AlterTableOperation::AddConstraint(TableConstraint::Unique {
+                name: cname,
+                index_name,
+                columns,
+                ..
+            }) => {
+                let idx_name = index_name.clone().or_else(|| cname.clone());
+                indexes.push(Statement::CreateIndex(CreateIndex {
+                    name: idx_name.map(|i| sqlparser::ast::ObjectName::from(vec![i])),
+                    table_name: name.clone(),
+                    using: None,
+                    columns: to_index_columns(columns),
+                    unique: true,
+                    concurrently: false,
+                    if_not_exists: false,
+                    include: vec![],
+                    nulls_distinct: None,
+                    with: vec![],
+                    predicate: None,
+                }));
+            }
+            AlterTableOperation::AddConstraint(TableConstraint::Index {
+                name: iname,
+                columns,
+                ..
+            }) => {
+                indexes.push(Statement::CreateIndex(CreateIndex {
+                    name: iname
+                        .clone()
+                        .map(|i| sqlparser::ast::ObjectName::from(vec![i])),
+                    table_name: name.clone(),
+                    using: None,
+                    columns: to_index_columns(columns),
+                    unique: false,
+                    concurrently: false,
+                    if_not_exists: false,
+                    include: vec![],
+                    nulls_distinct: None,
+                    with: vec![],
+                    predicate: None,
+                }));
+            }
+            // FULLTEXT/SPATIAL: no SQLite analogue — drop (perf-only).
+            AlterTableOperation::AddConstraint(TableConstraint::FulltextOrSpatial {
+                ..
+            }) => {}
+            _ => residual_ops.push(op),
+        }
+    }
+
+    let mut out = Vec::new();
+    if !residual_ops.is_empty() {
+        out.push(Statement::AlterTable {
+            name,
+            if_exists,
+            only,
+            operations: residual_ops,
+            location,
+            on_cluster,
+            iceberg,
+        });
+    }
+    out.extend(indexes);
+    out
+}
+
 // ── ON DUPLICATE KEY UPDATE -> ON CONFLICT DO UPDATE ─────────────────────────
 
 /// Rewrite MySQL's `ON DUPLICATE KEY UPDATE` to SQLite's `ON CONFLICT DO UPDATE`.
+///
+/// MySQL's `VALUES(col)` in the update list (the would-be-inserted value)
+/// becomes SQLite's `excluded.col`. Without this, the emitted SQL keeps the
+/// MySQL-only `VALUES(col)` call and SQLite rejects the whole upsert —
+/// WordPress `add_option()`/`update_option()` depend on this shape.
+/// (SQLite >= 3.35 accepts `DO UPDATE` without a conflict target.)
 fn rewrite_insert_on_duplicate(insert: &mut sqlparser::ast::Insert) {
-    if let Some(OnInsert::DuplicateKeyUpdate(assignments)) = insert.on.take() {
+    if let Some(OnInsert::DuplicateKeyUpdate(mut assignments)) = insert.on.take() {
+        for assignment in &mut assignments {
+            rewrite_values_call_to_excluded(&mut assignment.value);
+        }
         insert.on = Some(OnInsert::OnConflict(OnConflict {
             conflict_target: None,
             action: OnConflictAction::DoUpdate(DoUpdate {
@@ -40,6 +183,40 @@ fn rewrite_insert_on_duplicate(insert: &mut sqlparser::ast::Insert) {
                 selection: None,
             }),
         }));
+    }
+}
+
+/// Replace `VALUES(col)` with `excluded.col` in an upsert assignment value.
+fn rewrite_values_call_to_excluded(expr: &mut sqlparser::ast::Expr) {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident};
+
+    if let Expr::Function(func) = expr {
+        if func.name.to_string().eq_ignore_ascii_case("VALUES") {
+            if let FunctionArguments::List(args) = &func.args {
+                if args.args.len() == 1 {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(col))) =
+                        &args.args[0]
+                    {
+                        *expr = Expr::CompoundIdentifier(vec![
+                            Ident::new("excluded"),
+                            col.clone(),
+                        ]);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    // Recurse through common wrappers so `VALUES(a) + 1` style values work.
+    match expr {
+        sqlparser::ast::Expr::BinaryOp { left, right, .. } => {
+            rewrite_values_call_to_excluded(left);
+            rewrite_values_call_to_excluded(right);
+        }
+        sqlparser::ast::Expr::Nested(inner) | sqlparser::ast::Expr::UnaryOp { expr: inner, .. } => {
+            rewrite_values_call_to_excluded(inner);
+        }
+        _ => {}
     }
 }
 
@@ -63,6 +240,45 @@ fn rewrite_limit_clause(query: &mut sqlparser::ast::Query) {
 
 /// Rewrite `CREATE TABLE` for SQLite compatibility.
 fn rewrite_create_table(create: &mut sqlparser::ast::CreateTable) {
+    // Drop MySQL table options (`ENGINE=InnoDB`, `DEFAULT CHARACTER SET =
+    // utf8mb4 COLLATE = 'utf8mb4_unicode_ci'`, ...): SQLite rejects them all.
+    // Laravel's schema builder emits the CHARACTER SET / COLLATE pair on
+    // every `create table`.
+    create.table_options = sqlparser::ast::CreateTableOptions::None;
+
+    // Constraint fixups. The emitter is sqlparser `Display`, so MySQL-only
+    // constraint syntax must be removed or normalized here:
+    // - inline `KEY name (cols)` / FULLTEXT / SPATIAL: not valid SQLite —
+    //   dropped (secondary indexes are a performance concern, not a
+    //   correctness one; WordPress dbDelta emits one per table).
+    // - `UNIQUE KEY name (cols)`: normalize to bare `UNIQUE (cols)` —
+    //   functionally required (MySQL upserts target these).
+    // - `PRIMARY KEY (col)`: displays fine for SQLite; kept as-is.
+    create.constraints.retain(|c| {
+        !matches!(
+            c,
+            sqlparser::ast::TableConstraint::Index { .. }
+                | sqlparser::ast::TableConstraint::FulltextOrSpatial { .. }
+        )
+    });
+    for c in &mut create.constraints {
+        if let sqlparser::ast::TableConstraint::Unique {
+            name,
+            index_name,
+            index_type_display,
+            index_type,
+            index_options,
+            ..
+        } = c
+        {
+            *name = None;
+            *index_name = None;
+            *index_type = None;
+            *index_type_display = sqlparser::ast::KeyOrIndexDisplay::None;
+            index_options.clear();
+        }
+    }
+
     // Rewrite column types.
     for col in &mut create.columns {
         col.data_type = rewrite_data_type(&col.data_type);
@@ -355,6 +571,211 @@ mod tests {
         let upper = sql.to_ascii_uppercase();
         assert!(!upper.contains(" JSON"), "JSON not rewritten: {sql}");
         assert!(upper.contains("TEXT"), "no TEXT found: {sql}");
+    }
+
+    // ── Real-app DDL (WordPress / Laravel shapes) ───────────────────────────
+
+    #[test]
+    fn wordpress_index_prefix_length_parses() {
+        // wp_usermeta: index prefix lengths broke parsing before the DDL
+        // pre-pass (sqlparser cannot represent them).
+        let results = translate(
+            "CREATE TABLE wp_usermeta (\n\
+             umeta_id bigint(20) unsigned NOT NULL auto_increment,\n\
+             user_id bigint(20) unsigned NOT NULL default '0',\n\
+             meta_key varchar(255) default NULL,\n\
+             meta_value longtext,\n\
+             PRIMARY KEY  (umeta_id),\n\
+             KEY user_id (user_id),\n\
+             KEY meta_key (meta_key(191))\n\
+             ) DEFAULT CHARACTER SET utf8",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(!sql.contains("191"), "prefix length survived: {sql}");
+        assert!(
+            !sql.to_ascii_uppercase().contains("CHARACTER SET"),
+            "table options survived: {sql}"
+        );
+        // Inline `KEY name (col)` constraints are MySQL-only syntax; they
+        // must not reach SQLite. PRIMARY KEY stays.
+        let upper = sql.to_ascii_uppercase();
+        assert!(
+            !upper.replace("PRIMARY KEY (", "").contains(" KEY ("),
+            "inline KEY constraint survived: {sql}"
+        );
+        assert!(upper.contains("PRIMARY KEY"), "primary key lost: {sql}");
+    }
+
+    #[test]
+    fn wordpress_unique_key_normalized() {
+        // wp_options: `UNIQUE KEY option_name (option_name)` must become a
+        // bare `UNIQUE (option_name)` — upserts depend on the constraint.
+        let results = translate(
+            "CREATE TABLE wp_options (\n\
+             option_id bigint(20) unsigned NOT NULL auto_increment,\n\
+             option_name varchar(191) NOT NULL default '',\n\
+             option_value longtext NOT NULL,\n\
+             autoload varchar(20) NOT NULL default 'yes',\n\
+             PRIMARY KEY  (option_id),\n\
+             UNIQUE KEY option_name (option_name),\n\
+             KEY autoload (autoload)\n\
+             ) DEFAULT CHARACTER SET utf8",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        let upper = sql.to_ascii_uppercase();
+        assert!(upper.contains("UNIQUE ("), "unique constraint lost: {sql}");
+        assert!(!upper.contains("UNIQUE KEY"), "MySQL UNIQUE KEY survived: {sql}");
+        assert!(
+            !upper.contains("KEY AUTOLOAD"),
+            "plain KEY constraint survived: {sql}"
+        );
+    }
+
+    #[test]
+    fn laravel_charset_collate_table_options_dropped() {
+        let results = translate(
+            "create table `migrations` (`id` int unsigned not null auto_increment primary key, \
+             `migration` varchar(255) not null, `batch` int not null) \
+             default character set utf8mb4 collate 'utf8mb4_unicode_ci'",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        let upper = sql.to_ascii_uppercase();
+        assert!(!upper.contains("CHARACTER SET"), "charset survived: {sql}");
+        assert!(!upper.contains("COLLATE"), "collate survived: {sql}");
+    }
+
+    #[test]
+    fn upsert_values_call_becomes_excluded() {
+        // WordPress add_option()/update_option() shape.
+        let results = translate(
+            "INSERT INTO wp_options (option_name, option_value, autoload) \
+             VALUES ('siteurl', 'http://x', 'yes') \
+             ON DUPLICATE KEY UPDATE option_value = VALUES(option_value), autoload = VALUES(autoload)",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        let upper = sql.to_ascii_uppercase();
+        assert!(
+            upper.contains("EXCLUDED.OPTION_VALUE") && upper.contains("EXCLUDED.AUTOLOAD"),
+            "VALUES() not rewritten to excluded.*: {sql}"
+        );
+        assert!(
+            !upper.contains("= VALUES("),
+            "MySQL VALUES() call survived: {sql}"
+        );
+    }
+
+    #[test]
+    fn alter_add_unique_becomes_create_unique_index() {
+        // Laravel: alter table `users` add unique `users_email_unique`(`email`)
+        let results = translate(
+            "alter table `users` add unique `users_email_unique`(`email`)",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1, "expected exactly one statement");
+        let sql = extract_sql(&results[0]);
+        let upper = sql.to_ascii_uppercase();
+        assert!(
+            upper.starts_with("CREATE UNIQUE INDEX"),
+            "expected CREATE UNIQUE INDEX, got: {sql}"
+        );
+        assert!(sql.contains("users") && sql.contains("email"), "table/column lost: {sql}");
+    }
+
+    #[test]
+    fn alter_add_index_becomes_create_index() {
+        let results = translate(
+            "alter table `sessions` add index `sessions_user_id_index`(`user_id`)",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        let upper = sql.to_ascii_uppercase();
+        assert!(
+            upper.starts_with("CREATE INDEX"),
+            "expected CREATE INDEX, got: {sql}"
+        );
+        assert!(sql.contains("user_id"), "column lost: {sql}");
+    }
+
+    #[test]
+    fn decimal_precision_kept_in_ddl_prepass() {
+        let results = translate(
+            "CREATE TABLE t (price decimal(10,2) NOT NULL)",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(
+            sql.to_ascii_uppercase().contains("REAL"),
+            "decimal not mapped: {sql}"
+        );
+    }
+
+    #[test]
+    fn update_qualified_set_target_dequalified() {
+        // Laravel Eloquent: update `users` set `name` = ?, `users`.`updated_at` = ?
+        let results = translate(
+            "update `users` set `name` = 'x', `users`.`updated_at` = '2026-01-01' where `id` = 2",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(
+            !sql.contains("`users`.`updated_at`") && !sql.contains("users.updated_at"),
+            "qualified SET target survived: {sql}"
+        );
+        assert!(sql.contains("updated_at"), "column lost: {sql}");
+    }
+
+    #[test]
+    fn sql_calc_found_rows_hint_stripped() {
+        // WordPress main post/comment query shape.
+        let results = translate(
+            "SELECT SQL_CALC_FOUND_ROWS wp_comments.comment_ID FROM wp_comments \
+             WHERE ( comment_approved = '1' ) AND comment_post_ID = 4 \
+             ORDER BY wp_comments.comment_date_gmt ASC",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(
+            !sql.to_ascii_uppercase().contains("SQL_CALC_FOUND_ROWS"),
+            "hint survived: {sql}"
+        );
+        assert!(sql.contains("comment_ID"), "column lost: {sql}");
+    }
+
+    #[test]
+    fn hint_inside_string_literal_untouched() {
+        let results = translate(
+            "INSERT INTO posts (content) VALUES ('how to use SQL_CALC_FOUND_ROWS by hand') ON DUPLICATE KEY UPDATE content = VALUES(content)",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(
+            sql.contains("SQL_CALC_FOUND_ROWS"),
+            "literal content mangled: {sql}"
+        );
+    }
+
+    #[test]
+    fn found_rows_returns_zero_shim() {
+        let results = translate("SELECT FOUND_ROWS()", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(
+            sql.to_ascii_lowercase().contains("abs(0)"),
+            "FOUND_ROWS not shimmed: {sql}"
+        );
     }
 
     // ── Passthrough ─────────────────────────────────────────────────────────

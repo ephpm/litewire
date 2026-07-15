@@ -20,6 +20,10 @@ pub enum MetadataQuery {
     ShowIndex { table: String },
     /// `SELECT @@variable` queries — MySQL system variables.
     SystemVariables { variables: Vec<String> },
+    /// `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE
+    /// table_name = '<t>')` — table-existence probe (Laravel's
+    /// `Schema::hasTable`). Must return exactly one scalar column.
+    TableExists { table: String },
     /// `SELECT ... FROM information_schema.tables` — table listing.
     InformationSchemaTables { schema_filter: Option<String> },
     /// `SELECT ... FROM information_schema.columns` — column listing.
@@ -48,7 +52,36 @@ impl MetadataQuery {
                 "SELECT 'main' AS Database".into()
             }
             Self::ShowColumns { table } => {
-                format!("PRAGMA table_info('{table}')")
+                // MySQL-shaped `SHOW FULL COLUMNS` / `DESCRIBE` output.
+                //
+                // WordPress's wpdb::get_table_charset() reads `Collation` and
+                // `Type` from `SHOW FULL COLUMNS`; if they're missing it
+                // returns a WP_Error and sanitize_option() then blanks the
+                // value being saved (observed: every option routed through
+                // strip_invalid_text_for_column stored as ''). Text affinity
+                // maps to longtext/longblob so WP applies no 64 KB length cap.
+                format!(
+                    "SELECT name AS \"Field\", \
+                     CASE \
+                       WHEN upper(type) LIKE '%INT%' THEN 'bigint' \
+                       WHEN upper(type) IN ('REAL', 'DOUBLE', 'FLOAT', 'NUMERIC', 'DECIMAL') THEN 'double' \
+                       WHEN upper(type) LIKE '%BLOB%' THEN 'longblob' \
+                       WHEN upper(type) LIKE '%CHAR%' OR upper(type) LIKE '%CLOB%' OR upper(type) LIKE '%TEXT%' THEN 'longtext' \
+                       WHEN type = '' THEN 'longtext' \
+                       ELSE lower(type) \
+                     END AS \"Type\", \
+                     CASE WHEN \"notnull\" = 1 THEN 'NO' ELSE 'YES' END AS \"Null\", \
+                     CASE WHEN pk > 0 THEN 'PRI' ELSE '' END AS \"Key\", \
+                     dflt_value AS \"Default\", \
+                     '' AS \"Extra\", \
+                     CASE \
+                       WHEN upper(type) LIKE '%CHAR%' OR upper(type) LIKE '%CLOB%' OR upper(type) LIKE '%TEXT%' OR type = '' THEN 'utf8mb4_unicode_ci' \
+                       ELSE NULL \
+                     END AS \"Collation\", \
+                     'select,insert,update,references' AS \"Privileges\", \
+                     '' AS \"Comment\" \
+                     FROM pragma_table_info('{table}') ORDER BY cid"
+                )
             }
             Self::ShowCreateTable { table } => {
                 format!(
@@ -57,6 +90,11 @@ impl MetadataQuery {
             }
             Self::ShowIndex { table } => {
                 format!("PRAGMA index_list('{table}')")
+            }
+            Self::TableExists { table } => {
+                format!(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='{table}') AS `exists`"
+                )
             }
             Self::InformationSchemaTables { schema_filter } => {
                 // Map INFORMATION_SCHEMA.TABLES to sqlite_master.
@@ -175,10 +213,15 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
         return Some(MetadataQuery::ShowDatabases);
     }
 
-    // SHOW COLUMNS FROM <table> / SHOW FIELDS FROM <table>
+    // SHOW [FULL] COLUMNS FROM <table> / SHOW [FULL] FIELDS FROM <table>
+    // (`FULL` adds Collation/Privileges/Comment columns — WordPress's
+    // wpdb::get_table_charset issues `SHOW FULL COLUMNS` on every table it
+    // writes user text into.)
     if let Some(rest) = upper
         .strip_prefix("SHOW COLUMNS FROM ")
         .or_else(|| upper.strip_prefix("SHOW FIELDS FROM "))
+        .or_else(|| upper.strip_prefix("SHOW FULL COLUMNS FROM "))
+        .or_else(|| upper.strip_prefix("SHOW FULL FIELDS FROM "))
     {
         let table = extract_table_name(rest, trimmed);
         return Some(MetadataQuery::ShowColumns { table });
@@ -214,6 +257,14 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
         if upper.contains("INFORMATION_SCHEMA.TABLES")
             || upper.contains("INFORMATION_SCHEMA.`TABLES`")
         {
+            // Existence probe (`SELECT EXISTS (...)` with a TABLE_NAME
+            // filter) must produce a single scalar column — Laravel's
+            // Schema::hasTable calls Connection::scalar() on it.
+            if upper.starts_with("SELECT EXISTS") {
+                if let Some(table) = extract_where_value_original(trimmed, "TABLE_NAME") {
+                    return Some(MetadataQuery::TableExists { table });
+                }
+            }
             let schema_filter = extract_where_value_original(trimmed, "TABLE_SCHEMA");
             return Some(MetadataQuery::InformationSchemaTables { schema_filter });
         }
@@ -496,8 +547,46 @@ mod tests {
             table: "users".into(),
         }
         .to_sqlite_sql();
-        assert!(sql.contains("PRAGMA table_info"));
+        assert!(sql.contains("pragma_table_info"));
         assert!(sql.contains("users"));
+        // MySQL SHOW FULL COLUMNS shape: wpdb::get_table_charset needs
+        // Field/Type/Collation; text affinity must not map to a capped type.
+        for col in ["\"Field\"", "\"Type\"", "\"Null\"", "\"Key\"", "\"Collation\""] {
+            assert!(sql.contains(col), "missing column {col}: {sql}");
+        }
+        assert!(sql.contains("longtext"), "text affinity must map to longtext: {sql}");
+        assert!(sql.contains("utf8mb4_unicode_ci"), "collation missing: {sql}");
+    }
+
+    #[test]
+    fn laravel_has_table_exists_probe() {
+        // Laravel 11+/12 Schema::hasTable — must map to a single scalar.
+        let q = detect_metadata_query(
+            "select exists (select 1 from information_schema.tables where table_schema = schema() and table_name = 'migrations') as `exists`",
+            Dialect::MySQL,
+        );
+        let Some(MetadataQuery::TableExists { table }) = q else {
+            panic!("expected TableExists, got {q:?}");
+        };
+        assert_eq!(table, "migrations");
+        let sql = MetadataQuery::TableExists { table }.to_sqlite_sql();
+        assert!(sql.contains("sqlite_master"), "got: {sql}");
+        assert!(sql.to_uppercase().starts_with("SELECT EXISTS"), "got: {sql}");
+    }
+
+    #[test]
+    fn show_full_columns_detected() {
+        for q in [
+            "SHOW FULL COLUMNS FROM wp_options",
+            "SHOW FULL COLUMNS FROM `wp_options`",
+            "show full fields from wp_options",
+        ] {
+            let det = detect_metadata_query(q, Dialect::MySQL);
+            assert!(
+                matches!(det, Some(MetadataQuery::ShowColumns { ref table }) if table == "wp_options"),
+                "not detected: {q} -> {det:?}"
+            );
+        }
     }
 
     #[test]
