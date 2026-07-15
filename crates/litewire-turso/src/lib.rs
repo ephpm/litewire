@@ -29,7 +29,9 @@
 //! writers are coordinated by the engine (MVCC / `BEGIN CONCURRENT` is a
 //! Turso feature; plain busy-handling applies to classic transactions) with
 //! a configurable busy timeout (default 5000 ms, mirroring the rusqlite
-//! backend).
+//! backend). Each session also sets `PRAGMA synchronous = NORMAL` by
+//! default — the engine's own default is `FULL`; `NORMAL` matches the
+//! rusqlite backend's documented per-session behavior.
 //!
 //! # In-memory databases
 //!
@@ -67,12 +69,41 @@ use litewire_backend::{
 };
 use tokio::sync::Mutex;
 
+/// `synchronous` setting applied to every per-session connection.
+///
+/// Mirrors the rusqlite backend's `Synchronous` enum. The engine's own
+/// default is `FULL`; this backend defaults to [`Synchronous::Normal`] to
+/// match the rusqlite backend's documented per-session behavior (the
+/// WAL-appropriate default: durable across power loss for committed
+/// transactions, higher write throughput than `FULL`).
+#[derive(Clone, Copy, Debug)]
+pub enum Synchronous {
+    /// Fastest, unsafe against power loss.
+    Off,
+    /// WAL-appropriate default, matches the rusqlite backend.
+    Normal,
+    /// Fully synchronous (the Turso engine's own default). Slowest.
+    Full,
+}
+
+impl Synchronous {
+    fn as_pragma_str(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Normal => "NORMAL",
+            Self::Full => "FULL",
+        }
+    }
+}
+
 /// Builder for [`Turso`]. Use [`Turso::open`] / [`Turso::memory`] for the
-/// default configuration; use [`TursoBuilder`] to tune the busy timeout.
+/// default configuration; use [`TursoBuilder`] to tune the per-session
+/// busy timeout and `synchronous` mode.
 #[derive(Clone, Debug)]
 pub struct TursoBuilder {
     path: String,
     busy_timeout_ms: u32,
+    synchronous: Synchronous,
 }
 
 impl TursoBuilder {
@@ -82,6 +113,15 @@ impl TursoBuilder {
     #[must_use]
     pub fn busy_timeout_ms(mut self, ms: u32) -> Self {
         self.busy_timeout_ms = ms;
+        self
+    }
+
+    /// Set the `synchronous` PRAGMA applied to every per-session
+    /// connection (default [`Synchronous::Normal`], mirroring the rusqlite
+    /// backend).
+    #[must_use]
+    pub fn synchronous(mut self, s: Synchronous) -> Self {
+        self.synchronous = s;
         self
     }
 
@@ -101,6 +141,7 @@ impl TursoBuilder {
         Ok(Turso {
             db,
             busy_timeout_ms: self.busy_timeout_ms,
+            synchronous: self.synchronous,
         })
     }
 }
@@ -113,6 +154,7 @@ impl TursoBuilder {
 pub struct Turso {
     db: turso::Database,
     busy_timeout_ms: u32,
+    synchronous: Synchronous,
 }
 
 impl Turso {
@@ -143,6 +185,7 @@ impl Turso {
         TursoBuilder {
             path: path.as_ref().to_string(),
             busy_timeout_ms: 5000,
+            synchronous: Synchronous::Normal,
         }
     }
 }
@@ -161,6 +204,11 @@ impl Backend for Turso {
     async fn connect(&self) -> Result<Box<dyn BackendConn>, BackendError> {
         let conn = self.db.connect().map_err(map_turso_err)?;
         conn.busy_timeout(Duration::from_millis(u64::from(self.busy_timeout_ms)))
+            .map_err(map_turso_err)?;
+        // The engine's own default is synchronous=FULL; bring the session
+        // to parity with the rusqlite backend (NORMAL by default).
+        conn.pragma_update("synchronous", self.synchronous.as_pragma_str())
+            .await
             .map_err(map_turso_err)?;
         Ok(Box::new(TursoConn {
             conn: Mutex::new(conn),
