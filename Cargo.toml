@@ -8,6 +8,7 @@ members = [
     "crates/litewire-postgres",
     "crates/litewire-tds",
     "crates/litewire-hrana",
+    "crates/litewire-turso",
 ]
 
 [workspace.package]
@@ -24,6 +25,7 @@ litewire-mysql = { path = "crates/litewire-mysql" }
 litewire-postgres = { path = "crates/litewire-postgres" }
 litewire-tds = { path = "crates/litewire-tds" }
 litewire-hrana = { path = "crates/litewire-hrana" }
+litewire-turso = { path = "crates/litewire-turso" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -39,6 +41,11 @@ sqlparser = { version = "0.57", features = ["serde"] }
 # to fill in `Column.decltype` on empty result sets (an unexecuted prepared
 # SELECT). Without it, wire-frontend type inference has to LIMIT-0 probe.
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
+# Turso Database — the ground-up Rust rewrite of SQLite
+# (github.com/tursodatabase/turso). Pinned exactly: the engine is Beta and
+# API/behavior move between releases. 0.7.0 is the first non-pre release on
+# the 0.7 line (July 2026). Bump deliberately, never via `cargo update`.
+turso = { version = "=0.7.0", default-features = false }
 
 # HTTP (Hrana)
 axum = "0.8"

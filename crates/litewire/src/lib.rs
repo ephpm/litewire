@@ -32,6 +32,15 @@ pub use litewire_postgres;
 #[cfg(feature = "tds")]
 pub use litewire_tds;
 
+/// EXPERIMENTAL: Turso Database engine backend (feature `turso`, off by
+/// default). The engine is Beta upstream — see the `litewire-turso` crate
+/// docs for status and known-unsupported operations.
+#[cfg(feature = "turso")]
+pub use litewire_turso;
+
+#[cfg(feature = "turso")]
+pub use litewire_turso::Turso;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

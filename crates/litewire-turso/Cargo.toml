@@ -1,0 +1,17 @@
+[package]
+name = "litewire-turso"
+description = "Experimental Turso Database (Rust SQLite rewrite) backend for litewire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+litewire-backend = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+turso = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

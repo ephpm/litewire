@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
 |---------|-------------|----------|
 | `Rusqlite` | `backend-rusqlite` | Direct in-process SQLite |
 | `HranaClient` | `backend-hrana-client` | Remote SQLite via the Hrana HTTP protocol (sqld / Turso) |
+| `Turso` | `turso` | **Experimental** — [Turso Database](https://github.com/tursodatabase/turso) engine (Rust rewrite of SQLite, Beta upstream; pinned `=0.7.0`). See `crates/litewire-turso` docs for limitations (no `VACUUM`, no multi-process access) |
 | Custom | implement `Backend` trait | Bring your own |
 
 The `HranaClient` backend connects to [sqld](https://github.com/tursodatabase/libsql) via HTTP, enabling embedded replicas and distributed SQLite clusters.
