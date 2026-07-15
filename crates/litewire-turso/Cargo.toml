@@ -1,0 +1,22 @@
+[package]
+name = "litewire-turso"
+description = "Experimental Turso Database (Rust SQLite rewrite) backend for litewire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Path dep (not workspace) so default features can be disabled: the trait
+# is all this crate needs at runtime; rusqlite stays out of the build.
+litewire-backend = { path = "../litewire-backend", version = "0.1.0", default-features = false }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+turso = { workspace = true }
+
+[dev-dependencies]
+# rusqlite backend enabled for tests/examples only: the Phase 1 gate
+# harness (examples/phase1_gates.rs) compares both engines side by side.
+litewire-backend = { workspace = true, features = ["rusqlite"] }
+tokio = { workspace = true, features = ["full"] }
