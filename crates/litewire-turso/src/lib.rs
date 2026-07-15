@@ -62,6 +62,14 @@
 //! text mapped into [`BackendError::Sqlite`], which the wire frontends'
 //! error classifiers already understand (SQLite-style message shapes).
 
+pub mod cdc;
+
+/// Re-export of the underlying [`turso::Connection`] type. External
+/// callers (e.g. ePHPm's Phase 2 CDC replication layer) need this to
+/// type their apply-side function signatures without taking a direct
+/// `turso` dependency.
+pub use turso::Connection as TursoConnection;
+
 use std::time::Duration;
 
 use litewire_backend::{
@@ -104,6 +112,7 @@ pub struct TursoBuilder {
     path: String,
     busy_timeout_ms: u32,
     synchronous: Synchronous,
+    enable_cdc_on_connect: bool,
 }
 
 impl TursoBuilder {
@@ -125,6 +134,22 @@ impl TursoBuilder {
         self
     }
 
+    /// **Experimental** — when true, every session opened via
+    /// [`Backend::connect`] auto-enables full CDC capture via
+    /// [`cdc::enable_cdc`]. Used by ePHPm's Phase 2 CDC-native
+    /// replication on the primary so writes coming in via the wire
+    /// frontends are captured for replay by replicas.
+    ///
+    /// Default: `false`. Enabling CDC has a modest write-amp cost
+    /// (`full` mode doubles the write path: pre-image + post-image
+    /// records) and only makes sense when a tailer downstream is
+    /// consuming the log.
+    #[must_use]
+    pub fn enable_cdc_on_connect(mut self, on: bool) -> Self {
+        self.enable_cdc_on_connect = on;
+        self
+    }
+
     /// Finalize the builder: open (or create) the database with the Turso
     /// engine. The engine is WAL-native; no journal-mode bootstrap is
     /// required.
@@ -142,6 +167,7 @@ impl TursoBuilder {
             db,
             busy_timeout_ms: self.busy_timeout_ms,
             synchronous: self.synchronous,
+            enable_cdc_on_connect: self.enable_cdc_on_connect,
         })
     }
 }
@@ -152,9 +178,12 @@ impl TursoBuilder {
 /// every wire-protocol session via [`Backend::connect`]. See the module
 /// docs for status and limitations.
 pub struct Turso {
-    db: turso::Database,
+    pub(crate) db: turso::Database,
     busy_timeout_ms: u32,
     synchronous: Synchronous,
+    /// If set, [`Backend::connect`] enables full CDC capture on every
+    /// session. See [`TursoBuilder::enable_cdc_on_connect`].
+    pub(crate) enable_cdc_on_connect: bool,
 }
 
 impl Turso {
@@ -179,6 +208,22 @@ impl Turso {
         Self::builder(":memory:").build().await
     }
 
+    /// Open a fresh raw [`turso::Connection`] against this factory's
+    /// database, bypassing the litewire [`BackendConn`] wrapper.
+    ///
+    /// **Experimental** — this is the seam ePHPm's Phase 2 CDC
+    /// replication uses to enable `capture_data_changes_conn` on write
+    /// sessions on the primary and to tail `turso_cdc` on the follower
+    /// side. Prefer [`Backend::connect`] for anything else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::Sqlite`] if the engine cannot open a new
+    /// connection.
+    pub fn raw_connection(&self) -> Result<turso::Connection, BackendError> {
+        self.db.connect().map_err(map_turso_err)
+    }
+
     /// Start a [`TursoBuilder`] to override defaults.
     #[must_use]
     pub fn builder(path: impl AsRef<str>) -> TursoBuilder {
@@ -186,6 +231,7 @@ impl Turso {
             path: path.as_ref().to_string(),
             busy_timeout_ms: 5000,
             synchronous: Synchronous::Normal,
+            enable_cdc_on_connect: false,
         }
     }
 }
@@ -210,6 +256,15 @@ impl Backend for Turso {
         conn.pragma_update("synchronous", self.synchronous.as_pragma_str())
             .await
             .map_err(map_turso_err)?;
+        if self.enable_cdc_on_connect {
+            // Experimental: opt every wire session into CDC capture. Only
+            // set when litewire-turso is being used as the primary in
+            // ePHPm's Phase 2 replication mode. The pragma is
+            // per-connection, so a session that skips this (e.g. a
+            // direct `raw_connection()` caller like the tail loop) is
+            // unaffected.
+            cdc::enable_cdc(&conn).await?;
+        }
         Ok(Box::new(TursoConn {
             conn: Mutex::new(conn),
         }))
@@ -222,7 +277,7 @@ impl Backend for Turso {
 /// ("database is locked (SQLITE_BUSY)") so the wire frontends' substring
 /// classifiers (`litewire-mysql`/`-postgres` `error_map`) map them to the
 /// retryable lock-wait error codes clients expect.
-fn map_turso_err(e: turso::Error) -> BackendError {
+pub(crate) fn map_turso_err(e: turso::Error) -> BackendError {
     match e {
         turso::Error::Busy(m) | turso::Error::BusySnapshot(m) => {
             BackendError::Sqlite(format!("database is locked (SQLITE_BUSY): {m}"))
