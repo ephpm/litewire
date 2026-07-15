@@ -64,6 +64,12 @@
 
 pub mod cdc;
 
+/// Re-export of the underlying [`turso::Connection`] type. External
+/// callers (e.g. ePHPm's Phase 2 CDC replication layer) need this to
+/// type their apply-side function signatures without taking a direct
+/// `turso` dependency.
+pub use turso::Connection as TursoConnection;
+
 use std::time::Duration;
 
 use litewire_backend::{
