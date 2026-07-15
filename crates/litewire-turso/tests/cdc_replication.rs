@@ -333,6 +333,42 @@ async fn tailer_resume_from_watermark_only_ships_new_batches() {
     assert_eq!(count_rows(&replica, "t").await, 3);
 }
 
+/// The factory-level `enable_cdc_on_connect` opt-in causes every
+/// wire-session `Backend::connect` to opt into CDC — so writes coming in
+/// via the litewire wire frontends are captured for replication (this is
+/// the seam ePHPm's Phase 2 primary depends on).
+#[tokio::test]
+async fn factory_flag_enables_cdc_on_backend_connect() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let path = file.path().to_str().unwrap();
+    let factory = Turso::builder(path)
+        .enable_cdc_on_connect(true)
+        .build()
+        .await
+        .unwrap();
+    let factory = Arc::new(factory);
+
+    // A wire session obtained via Backend::connect should have CDC live.
+    let session = factory.connect().await.unwrap();
+    session
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[])
+        .await
+        .unwrap();
+    session
+        .execute("INSERT INTO t VALUES (1, 'x')", &[])
+        .await
+        .unwrap();
+
+    // A tailer using the same factory should see the batch (CREATE +
+    // INSERT + COMMIT).
+    let mut tailer = CdcTailer::new(&factory, 0);
+    let batches = drain_batches(&mut tailer).await;
+    assert!(
+        !batches.is_empty(),
+        "enable_cdc_on_connect did not cause writes to be captured"
+    );
+}
+
 /// Partial-transaction hold-back: this is subtle. The primary opens an
 /// explicit BEGIN, inserts, and does *not* commit yet. The tailer must
 /// return `None` (no COMMIT delimiter → no complete batch).

@@ -106,6 +106,7 @@ pub struct TursoBuilder {
     path: String,
     busy_timeout_ms: u32,
     synchronous: Synchronous,
+    enable_cdc_on_connect: bool,
 }
 
 impl TursoBuilder {
@@ -127,6 +128,22 @@ impl TursoBuilder {
         self
     }
 
+    /// **Experimental** — when true, every session opened via
+    /// [`Backend::connect`] auto-enables full CDC capture via
+    /// [`cdc::enable_cdc`]. Used by ePHPm's Phase 2 CDC-native
+    /// replication on the primary so writes coming in via the wire
+    /// frontends are captured for replay by replicas.
+    ///
+    /// Default: `false`. Enabling CDC has a modest write-amp cost
+    /// (`full` mode doubles the write path: pre-image + post-image
+    /// records) and only makes sense when a tailer downstream is
+    /// consuming the log.
+    #[must_use]
+    pub fn enable_cdc_on_connect(mut self, on: bool) -> Self {
+        self.enable_cdc_on_connect = on;
+        self
+    }
+
     /// Finalize the builder: open (or create) the database with the Turso
     /// engine. The engine is WAL-native; no journal-mode bootstrap is
     /// required.
@@ -144,6 +161,7 @@ impl TursoBuilder {
             db,
             busy_timeout_ms: self.busy_timeout_ms,
             synchronous: self.synchronous,
+            enable_cdc_on_connect: self.enable_cdc_on_connect,
         })
     }
 }
@@ -157,6 +175,9 @@ pub struct Turso {
     pub(crate) db: turso::Database,
     busy_timeout_ms: u32,
     synchronous: Synchronous,
+    /// If set, [`Backend::connect`] enables full CDC capture on every
+    /// session. See [`TursoBuilder::enable_cdc_on_connect`].
+    pub(crate) enable_cdc_on_connect: bool,
 }
 
 impl Turso {
@@ -204,6 +225,7 @@ impl Turso {
             path: path.as_ref().to_string(),
             busy_timeout_ms: 5000,
             synchronous: Synchronous::Normal,
+            enable_cdc_on_connect: false,
         }
     }
 }
@@ -228,6 +250,15 @@ impl Backend for Turso {
         conn.pragma_update("synchronous", self.synchronous.as_pragma_str())
             .await
             .map_err(map_turso_err)?;
+        if self.enable_cdc_on_connect {
+            // Experimental: opt every wire session into CDC capture. Only
+            // set when litewire-turso is being used as the primary in
+            // ePHPm's Phase 2 replication mode. The pragma is
+            // per-connection, so a session that skips this (e.g. a
+            // direct `raw_connection()` caller like the tail loop) is
+            // unaffected.
+            cdc::enable_cdc(&conn).await?;
+        }
         Ok(Box::new(TursoConn {
             conn: Mutex::new(conn),
         }))
