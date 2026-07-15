@@ -2122,6 +2122,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "litewire-backend",
+ "tempfile",
  "tokio",
  "tracing",
  "turso",

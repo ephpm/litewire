@@ -20,3 +20,7 @@ turso = { workspace = true }
 # harness (examples/phase1_gates.rs) compares both engines side by side.
 litewire-backend = { workspace = true, features = ["rusqlite"] }
 tokio = { workspace = true, features = ["full"] }
+# Temp files for CDC replication tests that need two independent
+# file-backed databases (Turso 0.7.0's shared-memory `:memory:` isn't
+# suitable for primary/replica pairs).
+tempfile = "3"

@@ -62,6 +62,8 @@
 //! text mapped into [`BackendError::Sqlite`], which the wire frontends'
 //! error classifiers already understand (SQLite-style message shapes).
 
+pub mod cdc;
+
 use std::time::Duration;
 
 use litewire_backend::{
@@ -152,7 +154,7 @@ impl TursoBuilder {
 /// every wire-protocol session via [`Backend::connect`]. See the module
 /// docs for status and limitations.
 pub struct Turso {
-    db: turso::Database,
+    pub(crate) db: turso::Database,
     busy_timeout_ms: u32,
     synchronous: Synchronous,
 }
@@ -177,6 +179,22 @@ impl Turso {
     /// Returns an error if the engine cannot create the database.
     pub async fn memory() -> Result<Self, BackendError> {
         Self::builder(":memory:").build().await
+    }
+
+    /// Open a fresh raw [`turso::Connection`] against this factory's
+    /// database, bypassing the litewire [`BackendConn`] wrapper.
+    ///
+    /// **Experimental** — this is the seam ePHPm's Phase 2 CDC
+    /// replication uses to enable `capture_data_changes_conn` on write
+    /// sessions on the primary and to tail `turso_cdc` on the follower
+    /// side. Prefer [`Backend::connect`] for anything else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::Sqlite`] if the engine cannot open a new
+    /// connection.
+    pub fn raw_connection(&self) -> Result<turso::Connection, BackendError> {
+        self.db.connect().map_err(map_turso_err)
     }
 
     /// Start a [`TursoBuilder`] to override defaults.
@@ -222,7 +240,7 @@ impl Backend for Turso {
 /// ("database is locked (SQLITE_BUSY)") so the wire frontends' substring
 /// classifiers (`litewire-mysql`/`-postgres` `error_map`) map them to the
 /// retryable lock-wait error codes clients expect.
-fn map_turso_err(e: turso::Error) -> BackendError {
+pub(crate) fn map_turso_err(e: turso::Error) -> BackendError {
     match e {
         turso::Error::Busy(m) | turso::Error::BusySnapshot(m) => {
             BackendError::Sqlite(format!("database is locked (SQLITE_BUSY): {m}"))
