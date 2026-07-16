@@ -341,6 +341,12 @@ fn reject_unsupported(sql: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
+/// Does this SQL read from a pragma table-valued function
+/// (`pragma_table_info(...)`, `pragma_index_list(...)`, ...)?
+fn sql_uses_pragma_tvf(sql: &str) -> bool {
+    sql.to_ascii_lowercase().contains("pragma_")
+}
+
 #[async_trait::async_trait]
 impl BackendConn for TursoConn {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> {
@@ -361,6 +367,23 @@ impl BackendConn for TursoConn {
                 values.push(from_turso(row.get_value(i).map_err(map_turso_err)?));
             }
             result_rows.push(values);
+        }
+
+        // WORKAROUND (turso 0.7.0): a SELECT from a pragma table-valued
+        // function (e.g. `pragma_table_info(...)`) leaves the connection in
+        // a phantom-transaction state: every subsequent write is accepted
+        // and visible to this session but never committed — silently lost
+        // on close. `COMMIT` then reports "no transaction is active", yet
+        // an explicit `BEGIN; COMMIT;` pair restores normal autocommit —
+        // but only once the poisoning statement handle has been dropped.
+        // Verified empirically (see ePHPm docs/turso-gate5-results.md);
+        // upstream issue to be filed. Without this, WordPress is unusable
+        // (dbDelta's DESCRIBE poisons the session before any writes).
+        if sql_uses_pragma_tvf(sql) {
+            drop(rows);
+            drop(stmt);
+            conn.execute("BEGIN", ()).await.map_err(map_turso_err)?;
+            conn.execute("COMMIT", ()).await.map_err(map_turso_err)?;
         }
 
         Ok(ResultSet {
@@ -403,6 +426,42 @@ mod tests {
     // Mirrors the rusqlite backend's test suite so behavior differences
     // between the two engines show up as test failures here, not as
     // production surprises.
+
+    #[tokio::test]
+    async fn pragma_tvf_read_does_not_poison_session() {
+        // Regression (turso 0.7.0): a SELECT from pragma_table_info() left
+        // the session in a phantom-transaction state — subsequent writes
+        // were visible to the same session but silently lost to others.
+        let dir = std::env::temp_dir().join(format!("lw-tvf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("poison.db");
+        let backend = Turso::open(path.to_str().unwrap()).await.unwrap();
+        let a = backend.connect().await.unwrap();
+        a.execute("CREATE TABLE anchor (id INTEGER PRIMARY KEY)", &[])
+            .await
+            .unwrap();
+        // The poisoning read (WordPress: DESCRIBE / SHOW FULL COLUMNS).
+        a.query("SELECT name FROM pragma_table_info('anchor')", &[])
+            .await
+            .unwrap();
+        // Writes after the TVF read...
+        a.execute(
+            "CREATE TABLE after_tvf (id INTEGER PRIMARY KEY, v TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+        a.execute("INSERT INTO after_tvf (v) VALUES ('x')", &[])
+            .await
+            .unwrap();
+        // ...must be visible to a different session.
+        let b = backend.connect().await.unwrap();
+        let rs = b
+            .query("SELECT COUNT(*) FROM after_tvf", &[])
+            .await
+            .expect("table written after pragma TVF read must exist for other sessions");
+        assert_eq!(rs.rows[0][0], Value::Integer(1));
+    }
 
     #[tokio::test]
     async fn basic_crud() {

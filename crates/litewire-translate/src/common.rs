@@ -260,6 +260,16 @@ fn rewrite_function(func: &mut Function) {
                 "8.0.0-litewire".into(),
             ))]);
         }
+        // FOUND_ROWS(): the paired SQL_CALC_FOUND_ROWS hint is stripped
+        // before parsing (SQLite cannot emulate it without per-session
+        // state), so return 0. Known semantic gap: WP-style pagination
+        // totals read 0; result sets themselves are unaffected.
+        "FOUND_ROWS" => {
+            // abs(0): single-argument scalar that SQLite accepts (coalesce
+            // and max need >= 2 args).
+            func.name = func_name("abs");
+            func.args = func_args(vec![value_expr(Value::Number("0".into(), false))]);
+        }
         "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => {
             func.name = func_name("coalesce");
             func.args = func_args(vec![value_expr(Value::SingleQuotedString(

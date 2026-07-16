@@ -258,6 +258,16 @@ fn param_to_value(param: ParamValue<'_>) -> Value {
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
     type Error = std::io::Error;
 
+    /// Server version advertised in the wire handshake.
+    ///
+    /// The opensrv default is `5.1.10-alpha-msql-proxy`, which WordPress
+    /// >= 6.5 rejects outright ("requires MySQL 5.5.5 or higher") — clients
+    /// read this from `mysqli_get_server_info()`, not `SELECT VERSION()`.
+    /// Advertise a modern 8.0.x version, suffixed so it is identifiable.
+    fn version(&self) -> String {
+        "8.0.36-litewire".to_string()
+    }
+
     async fn on_prepare<'a>(
         &'a mut self,
         query: &'a str,
