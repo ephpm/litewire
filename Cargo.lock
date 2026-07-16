@@ -2084,6 +2084,7 @@ name = "litewire-postgres"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "futures",
  "litewire-backend",
  "litewire-translate",
