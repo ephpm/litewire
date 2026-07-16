@@ -79,17 +79,174 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
         Dialect::TDS => Box::new(MsSqlDialect {}),
     };
 
+    // MySQL DDL pre-pass: sqlparser (0.57) cannot parse index column prefix
+    // lengths (`KEY meta_key (meta_key(191))`), which every WordPress schema
+    // uses. Display widths / prefix lengths are meaningless to SQLite, so
+    // strip bare `(<digits>)` groups from DDL text before parsing. Applied
+    // to CREATE/ALTER TABLE and CREATE INDEX only -- DML literals are never
+    // touched. (`decimal(10,2)` is unaffected: it contains a comma.)
+    let owned_sql;
+    let sql = if dialect == Dialect::MySQL && is_mysql_ddl(sql) {
+        owned_sql = strip_numeric_paren_groups(sql);
+        owned_sql.as_str()
+    } else {
+        sql
+    };
+
+    // MySQL SELECT hints (`SQL_CALC_FOUND_ROWS`, `SQL_NO_CACHE`, ...) are not
+    // parseable by sqlparser and meaningless to SQLite. WordPress's main
+    // post/comment queries lead with SQL_CALC_FOUND_ROWS. Quote-aware strip.
+    let owned_hintless;
+    let sql = if dialect == Dialect::MySQL && has_mysql_select_hint(sql) {
+        owned_hintless = strip_mysql_select_hints(sql);
+        owned_hintless.as_str()
+    } else {
+        sql
+    };
+
     let statements = Parser::parse_sql(parser_dialect.as_ref(), sql)
         .map_err(|e| TranslateError::Parse(e.to_string()))?;
 
     let mut results = Vec::with_capacity(statements.len());
     for stmt in statements {
         let rewritten = rewrite_statement(stmt, dialect)?;
-        let sqlite_sql = emit::emit_statement(&rewritten);
-        results.push(TranslateResult::Sql(sqlite_sql));
+        if dialect == Dialect::MySQL {
+            // `ALTER TABLE ... ADD KEY/UNIQUE` expands to CREATE INDEX
+            // statements (SQLite has no ALTER ... ADD CONSTRAINT).
+            for expanded in mysql::expand_alter_table(rewritten) {
+                results.push(TranslateResult::Sql(emit::emit_statement(&expanded)));
+            }
+        } else {
+            let sqlite_sql = emit::emit_statement(&rewritten);
+            results.push(TranslateResult::Sql(sqlite_sql));
+        }
     }
 
     Ok(results)
+}
+
+/// Is this statement MySQL DDL that may carry display widths / index
+/// prefix lengths (`CREATE TABLE`, `ALTER TABLE`, `CREATE [UNIQUE] INDEX`)?
+fn is_mysql_ddl(sql: &str) -> bool {
+    let upper = sql.trim_start().to_ascii_uppercase();
+    upper.starts_with("CREATE TABLE")
+        || upper.starts_with("CREATE TEMPORARY TABLE")
+        || upper.starts_with("ALTER TABLE")
+        || upper.starts_with("CREATE INDEX")
+        || upper.starts_with("CREATE UNIQUE INDEX")
+        || upper.starts_with("CREATE FULLTEXT INDEX")
+}
+
+/// Remove bare `(<digits>)` groups outside string/identifier quotes:
+/// `bigint(20)` -> `bigint`, `KEY k (col(191))` -> `KEY k (col)`.
+/// Groups containing anything but digits (e.g. `decimal(10,2)`) are kept.
+fn strip_numeric_paren_groups(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            out.push(c as char);
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(c);
+                out.push(c as char);
+                i += 1;
+            }
+            b'(' => {
+                // Look ahead: digits then ')'.
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + 1 && j < bytes.len() && bytes[j] == b')' {
+                    i = j + 1; // skip the whole (NNN) group
+                } else {
+                    out.push('(');
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// MySQL-only SELECT hint keywords stripped before parsing.
+const MYSQL_SELECT_HINTS: [&str; 6] = [
+    "SQL_CALC_FOUND_ROWS",
+    "SQL_NO_CACHE",
+    "SQL_CACHE",
+    "SQL_SMALL_RESULT",
+    "SQL_BIG_RESULT",
+    "SQL_BUFFER_RESULT",
+];
+
+/// Cheap pre-check (may false-positive on hints inside string literals —
+/// the quote-aware strip below won't touch those).
+fn has_mysql_select_hint(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    MYSQL_SELECT_HINTS.iter().any(|h| upper.contains(h))
+}
+
+/// Remove MySQL SELECT hint keywords outside string/identifier quotes.
+fn strip_mysql_select_hints(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            out.push(c as char);
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(c);
+                out.push(c as char);
+                i += 1;
+            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
+                // Read a whole word, compare against the hint list.
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = &sql[start..i];
+                let upper_word = word.to_ascii_uppercase();
+                if MYSQL_SELECT_HINTS.contains(&upper_word.as_str()) {
+                    // Drop the hint and one following space (if any) so
+                    // `SELECT SQL_NO_CACHE x` becomes `SELECT x`.
+                    if i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                } else {
+                    out.push_str(word);
+                }
+            }
+            _ => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Translate a SQL string, using a bounded LRU cache in front of the
