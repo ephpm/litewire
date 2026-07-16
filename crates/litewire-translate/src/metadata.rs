@@ -346,16 +346,22 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
             .split_ascii_whitespace()
             .nth(1)
             .map(|s| {
-                s.trim_matches('\'')
-                    .trim_matches('"')
-                    .trim_end_matches(';')
-                    .to_string()
+                sanitize_identifier(s.trim_matches('\'').trim_matches('"').trim_end_matches(';'))
             })
             .unwrap_or_default();
         return Some(MetadataQuery::SysColumns { table });
     }
 
     None
+}
+
+/// Sanitize an identifier (table or schema name) by stripping any character
+/// that isn't alphanumeric, underscore, or period. This prevents SQL injection
+/// when identifiers are interpolated into generated SQL via `format!()`.
+fn sanitize_identifier(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+        .collect()
 }
 
 /// Extract a simple `column = 'value'` filter from a WHERE clause.
@@ -388,13 +394,12 @@ fn extract_where_value_original(original_sql: &str, column: &str) -> Option<Stri
     if let Some(pos) = upper.find(&pattern) {
         let after = &original_sql[pos + pattern.len()..];
         let after_trimmed = after.trim_start();
-        let _trim_offset = after.len() - after_trimmed.len();
         let after = after_trimmed;
         if after.starts_with('\'') || after.starts_with('"') {
             let quote = after.as_bytes()[0] as char;
             let rest = &after[1..];
             if let Some(end) = rest.find(quote) {
-                return Some(rest[..end].to_string());
+                return Some(sanitize_identifier(&rest[..end]));
             }
         }
     }
@@ -411,13 +416,14 @@ fn extract_table_name(upper_rest: &str, original: &str) -> String {
     let orig_word = orig_rest.split_ascii_whitespace().next().unwrap_or(word);
 
     // Strip backticks, double quotes, brackets.
-    orig_word
+    let raw = orig_word
         .trim_matches('`')
         .trim_matches('"')
         .trim_matches('[')
         .trim_end_matches(']')
-        .trim_end_matches(';')
-        .to_string()
+        .trim_end_matches(';');
+
+    sanitize_identifier(raw)
 }
 
 #[cfg(test)]
@@ -1006,5 +1012,198 @@ mod tests {
             matches!(q, Some(MetadataQuery::SysColumns { .. })),
             "got: {q:?}"
         );
+    }
+
+    // ── SQL injection sanitization ────────────────────────────────────────
+
+    #[test]
+    fn table_name_injection_sanitized() {
+        let q = detect_metadata_query("DESCRIBE users'; DROP TABLE x; --", Dialect::MySQL);
+        match q {
+            Some(MetadataQuery::ShowColumns { table }) => {
+                assert!(!table.contains('\''), "quote not stripped: {table}");
+                assert!(!table.contains(';'), "semicolon not stripped: {table}");
+                assert!(!table.contains('-'), "dash not stripped: {table}");
+            }
+            other => panic!("should detect as ShowColumns, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_filter_injection_sanitized() {
+        let q = detect_metadata_query(
+            "SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'main'; DROP TABLE x'",
+            Dialect::MySQL,
+        );
+        match q {
+            Some(MetadataQuery::InformationSchemaTables { schema_filter }) => {
+                if let Some(schema) = &schema_filter {
+                    assert!(!schema.contains(';'), "semicolon not stripped: {schema}");
+                    assert!(!schema.contains('\''), "quote not stripped: {schema}");
+                    assert!(!schema.contains('-'), "dash not stripped: {schema}");
+                }
+            }
+            other => panic!("expected InformationSchemaTables, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normal_identifiers_unchanged() {
+        // Simple underscore name
+        let q = detect_metadata_query("DESCRIBE my_table", Dialect::MySQL);
+        assert!(
+            matches!(q, Some(MetadataQuery::ShowColumns { ref table }) if table == "my_table"),
+            "got: {q:?}"
+        );
+
+        // Mixed case with digits
+        let q = detect_metadata_query("DESCRIBE MyTable123", Dialect::MySQL);
+        assert!(
+            matches!(q, Some(MetadataQuery::ShowColumns { ref table }) if table == "MyTable123"),
+            "got: {q:?}"
+        );
+
+        // Dot-separated (schema.table)
+        let q = detect_metadata_query("DESCRIBE schema.table", Dialect::MySQL);
+        assert!(
+            matches!(q, Some(MetadataQuery::ShowColumns { ref table }) if table == "schema.table"),
+            "got: {q:?}"
+        );
+    }
+
+    #[test]
+    fn generated_sql_safe_from_injection() {
+        let q = detect_metadata_query(
+            "DESCRIBE users'; DROP TABLE sqlite_master; --",
+            Dialect::MySQL,
+        );
+        let sql = q.unwrap().to_sqlite_sql();
+        assert!(
+            !sql.contains(';'),
+            "generated SQL contains semicolon: {sql}"
+        );
+        assert!(
+            !sql.contains("--"),
+            "generated SQL contains comment marker: {sql}"
+        );
+    }
+
+    // ── Injection coverage for the `format!`-interpolated identifier sites
+    //    introduced/kept by the framework-compat work (#11). Every variant
+    //    whose `to_sqlite_sql()` interpolates `{table}`/`{schema}` directly
+    //    into the generated SQL must not be breakable out of, regardless of
+    //    which detection path populated the identifier. ─────────────────────
+
+    /// Assert a generated statement can't be broken out of: no stray quote,
+    /// statement separator, or comment marker survived into the SQL.
+    fn assert_single_safe_statement(sql: &str) {
+        assert!(!sql.contains(';'), "semicolon in generated SQL: {sql}");
+        assert!(
+            !sql.contains("--"),
+            "comment marker in generated SQL: {sql}"
+        );
+        // The only single-quotes allowed are the ones the template itself
+        // emits around interpolated identifiers, e.g. name='table' or
+        // pragma_table_info('table'). An injected quote would create an odd
+        // count. Verify quotes are balanced (even).
+        assert_eq!(
+            sql.matches('\'').count() % 2,
+            0,
+            "unbalanced single-quotes (quote broke out): {sql}"
+        );
+    }
+
+    /// Laravel's `Schema::hasTable` existence probe — a #11 site that
+    /// interpolates the table name into `... name='{table}' ...`.
+    #[test]
+    fn table_exists_probe_injection_safe() {
+        let q = detect_metadata_query(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_name = 'users'' OR ''1''=''1'; DROP TABLE x; --')",
+            Dialect::MySQL,
+        );
+        match q {
+            Some(MetadataQuery::TableExists { .. }) => {
+                let sql = q.unwrap().to_sqlite_sql();
+                assert!(sql.contains("sqlite_master"), "got: {sql}");
+                assert_single_safe_statement(&sql);
+            }
+            other => panic!("expected TableExists, got: {other:?}"),
+        }
+    }
+
+    /// `SHOW FULL COLUMNS` / `DESCRIBE` — the WordPress charset path (#11)
+    /// interpolates the table into `pragma_table_info('{table}')`.
+    #[test]
+    fn show_columns_pragma_injection_safe() {
+        let sql = detect_metadata_query(
+            "SHOW FULL COLUMNS FROM `users'); DROP TABLE x; --`",
+            Dialect::MySQL,
+        )
+        .unwrap()
+        .to_sqlite_sql();
+        assert!(sql.contains("pragma_table_info"), "got: {sql}");
+        assert_single_safe_statement(&sql);
+    }
+
+    /// `SHOW CREATE TABLE` interpolates into `... name='{table}'`.
+    #[test]
+    fn show_create_table_injection_safe() {
+        let sql = detect_metadata_query(
+            "SHOW CREATE TABLE users'; DROP TABLE sqlite_master; --",
+            Dialect::MySQL,
+        )
+        .unwrap()
+        .to_sqlite_sql();
+        assert_single_safe_statement(&sql);
+    }
+
+    /// `SHOW INDEX FROM` interpolates into `PRAGMA index_list('{table}')`.
+    #[test]
+    fn show_index_injection_safe() {
+        let sql =
+            detect_metadata_query("SHOW INDEX FROM users'); DROP TABLE x; --", Dialect::MySQL)
+                .unwrap()
+                .to_sqlite_sql();
+        assert!(sql.contains("index_list"), "got: {sql}");
+        assert_single_safe_statement(&sql);
+    }
+
+    /// `INFORMATION_SCHEMA.COLUMNS` with a TABLE_NAME filter interpolates the
+    /// table into both a projected literal and `pragma_table_info('{table}')`.
+    #[test]
+    fn information_schema_columns_injection_safe() {
+        let q = detect_metadata_query(
+            "SELECT * FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_NAME = 'users''; DROP TABLE x; --'",
+            Dialect::MySQL,
+        );
+        match q {
+            Some(MetadataQuery::InformationSchemaColumns {
+                table_filter: Some(_),
+            }) => {
+                let sql = q.unwrap().to_sqlite_sql();
+                assert!(sql.contains("pragma_table_info"), "got: {sql}");
+                assert_single_safe_statement(&sql);
+            }
+            other => panic!("expected InformationSchemaColumns with filter, got: {other:?}"),
+        }
+    }
+
+    /// pg_catalog column path (`pg_attribute`) interpolates into
+    /// `'{table}' AS table_name ... pragma_table_info('{table}')`.
+    #[test]
+    fn pg_catalog_columns_injection_safe() {
+        let q = detect_metadata_query(
+            "SELECT * FROM PG_CATALOG.PG_ATTRIBUTE \
+             WHERE TABLE_NAME = 'users''; DROP TABLE x; --'",
+            Dialect::PostgreSQL,
+        );
+        if let Some(MetadataQuery::PgCatalogColumns { table }) = &q {
+            if !table.is_empty() {
+                let sql = q.as_ref().unwrap().to_sqlite_sql();
+                assert_single_safe_statement(&sql);
+            }
+        }
     }
 }
