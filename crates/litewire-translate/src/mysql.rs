@@ -58,8 +58,7 @@ fn rewrite_update_assignment_targets(assignments: &mut [sqlparser::ast::Assignme
 #[must_use]
 pub fn expand_alter_table(stmt: Statement) -> Vec<Statement> {
     use sqlparser::ast::{
-        AlterTableOperation, CreateIndex, IndexColumn, OrderByExpr, OrderByOptions,
-        TableConstraint,
+        AlterTableOperation, CreateIndex, IndexColumn, OrderByExpr, OrderByOptions, TableConstraint,
     };
 
     let Statement::AlterTable {
@@ -139,9 +138,7 @@ pub fn expand_alter_table(stmt: Statement) -> Vec<Statement> {
                 }));
             }
             // FULLTEXT/SPATIAL: no SQLite analogue — drop (perf-only).
-            AlterTableOperation::AddConstraint(TableConstraint::FulltextOrSpatial {
-                ..
-            }) => {}
+            AlterTableOperation::AddConstraint(TableConstraint::FulltextOrSpatial { .. }) => {}
             _ => residual_ops.push(op),
         }
     }
@@ -197,10 +194,7 @@ fn rewrite_values_call_to_excluded(expr: &mut sqlparser::ast::Expr) {
                     if let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(col))) =
                         &args.args[0]
                     {
-                        *expr = Expr::CompoundIdentifier(vec![
-                            Ident::new("excluded"),
-                            col.clone(),
-                        ]);
+                        *expr = Expr::CompoundIdentifier(vec![Ident::new("excluded"), col.clone()]);
                         return;
                     }
                 }
@@ -628,7 +622,10 @@ mod tests {
         let sql = extract_sql(&results[0]);
         let upper = sql.to_ascii_uppercase();
         assert!(upper.contains("UNIQUE ("), "unique constraint lost: {sql}");
-        assert!(!upper.contains("UNIQUE KEY"), "MySQL UNIQUE KEY survived: {sql}");
+        assert!(
+            !upper.contains("UNIQUE KEY"),
+            "MySQL UNIQUE KEY survived: {sql}"
+        );
         assert!(
             !upper.contains("KEY AUTOLOAD"),
             "plain KEY constraint survived: {sql}"
@@ -687,7 +684,10 @@ mod tests {
             upper.starts_with("CREATE UNIQUE INDEX"),
             "expected CREATE UNIQUE INDEX, got: {sql}"
         );
-        assert!(sql.contains("users") && sql.contains("email"), "table/column lost: {sql}");
+        assert!(
+            sql.contains("users") && sql.contains("email"),
+            "table/column lost: {sql}"
+        );
     }
 
     #[test]

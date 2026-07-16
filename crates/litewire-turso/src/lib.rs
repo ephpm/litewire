@@ -445,9 +445,12 @@ mod tests {
             .await
             .unwrap();
         // Writes after the TVF read...
-        a.execute("CREATE TABLE after_tvf (id INTEGER PRIMARY KEY, v TEXT)", &[])
-            .await
-            .unwrap();
+        a.execute(
+            "CREATE TABLE after_tvf (id INTEGER PRIMARY KEY, v TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
         a.execute("INSERT INTO after_tvf (v) VALUES ('x')", &[])
             .await
             .unwrap();

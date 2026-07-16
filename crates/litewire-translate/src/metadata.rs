@@ -551,11 +551,23 @@ mod tests {
         assert!(sql.contains("users"));
         // MySQL SHOW FULL COLUMNS shape: wpdb::get_table_charset needs
         // Field/Type/Collation; text affinity must not map to a capped type.
-        for col in ["\"Field\"", "\"Type\"", "\"Null\"", "\"Key\"", "\"Collation\""] {
+        for col in [
+            "\"Field\"",
+            "\"Type\"",
+            "\"Null\"",
+            "\"Key\"",
+            "\"Collation\"",
+        ] {
             assert!(sql.contains(col), "missing column {col}: {sql}");
         }
-        assert!(sql.contains("longtext"), "text affinity must map to longtext: {sql}");
-        assert!(sql.contains("utf8mb4_unicode_ci"), "collation missing: {sql}");
+        assert!(
+            sql.contains("longtext"),
+            "text affinity must map to longtext: {sql}"
+        );
+        assert!(
+            sql.contains("utf8mb4_unicode_ci"),
+            "collation missing: {sql}"
+        );
     }
 
     #[test]
@@ -571,7 +583,10 @@ mod tests {
         assert_eq!(table, "migrations");
         let sql = MetadataQuery::TableExists { table }.to_sqlite_sql();
         assert!(sql.contains("sqlite_master"), "got: {sql}");
-        assert!(sql.to_uppercase().starts_with("SELECT EXISTS"), "got: {sql}");
+        assert!(
+            sql.to_uppercase().starts_with("SELECT EXISTS"),
+            "got: {sql}"
+        );
     }
 
     #[test]

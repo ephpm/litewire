@@ -225,9 +225,7 @@ fn strip_mysql_select_hints(sql: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
                 // Read a whole word, compare against the hint list.
                 let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 let word = &sql[start..i];
