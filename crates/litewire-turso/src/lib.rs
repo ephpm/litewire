@@ -61,6 +61,16 @@
 //! Anything else the engine cannot do surfaces as the engine's own error
 //! text mapped into [`BackendError::Sqlite`], which the wire frontends'
 //! error classifiers already understand (SQLite-style message shapes).
+//!
+//! # Bind-count parity with the rusqlite backend
+//!
+//! The engine executes statements with unbound parameters as `NULL`
+//! instead of erroring. This backend rejects a parameter-count mismatch
+//! with the same "Wrong number of parameters passed to query" error the
+//! rusqlite backend produces. Without it, the `mysql` >= 8.1 CLI's
+//! `select $$` startup probe (which must fail) returns a result set the
+//! CLI never consumes, and every later statement dies client-side with
+//! CR 2014 "Commands out of sync".
 
 pub mod cdc;
 
@@ -347,6 +357,147 @@ fn sql_uses_pragma_tvf(sql: &str) -> bool {
     sql.to_ascii_lowercase().contains("pragma_")
 }
 
+/// Number of parameter slots a SQL statement declares, following SQLite's
+/// tokenizer rules: `?` takes the next free index, `?NNN` takes index `NNN`,
+/// and `:name` / `@name` / `$name` each take the next free index the first
+/// time the name appears. `$name` additionally swallows SQLite's TCL-heritage
+/// suffixes (`$name::seg` repetitions and one trailing `(...)`) as part of
+/// the variable name, matching tokenize.c. The result is the highest index
+/// assigned — the same value `sqlite3_bind_parameter_count()` reports.
+///
+/// Quoted strings (`'…'`), quoted identifiers (`"…"`, `` `…` ``, `[…]`),
+/// line comments (`--`) and block comments (`/* … */`) are skipped.
+///
+/// TODO(turso >0.7): delete this scanner and delegate to the statement's
+/// parameter count once the turso crate exposes it publicly.
+fn expected_param_count(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut max_index = 0usize;
+    // Distinct named parameters seen so far (each gets one index).
+    let mut named: Vec<&str> = Vec::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            // String literal or quoted identifier; doubled quote escapes.
+            q @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == q {
+                        if i + 1 < bytes.len() && bytes[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            // Bracket-quoted identifier (accepted by SQLite for MS compat).
+            b'[' => {
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // -- line comment
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // /* block comment */
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            // `?` or `?NNN`
+            b'?' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i > start {
+                    let n: usize = sql[start..i].parse().unwrap_or(0);
+                    max_index = max_index.max(n);
+                } else {
+                    max_index += 1;
+                }
+            }
+            // `:name`, `@name`, `$name`. SQLite also accepts a bare `$`
+            // variable — `SELECT $$` parses as a single parameter (the
+            // mysql 8.4 CLI exploits exactly that in its startup probe).
+            b':' | b'@' | b'$' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+                {
+                    i += 1;
+                }
+                if bytes[start] == b'$' {
+                    // TCL-heritage suffixes are part of the variable name
+                    // (sqlite tokenize.c): `$name::seg` repetitions, then
+                    // optionally one non-nested `(...)`.
+                    while i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
+                        i += 2;
+                        while i < bytes.len()
+                            && (bytes[i].is_ascii_alphanumeric()
+                                || bytes[i] == b'_'
+                                || bytes[i] == b'$')
+                        {
+                            i += 1;
+                        }
+                    }
+                    if i < bytes.len() && bytes[i] == b'(' {
+                        while i < bytes.len() && bytes[i] != b')' {
+                            i += 1;
+                        }
+                        i = (i + 1).min(bytes.len());
+                    }
+                }
+                if i > start + 1 || bytes[start] == b'$' {
+                    let name = &sql[start..i];
+                    // O(n) scan is fine: real statements carry < 10 distinct
+                    // named parameters.
+                    if !named.contains(&name) {
+                        named.push(name);
+                        max_index += 1;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    max_index
+}
+
+/// Reject a bind-count mismatch with the same error shape the rusqlite
+/// backend produces (`rusqlite::Error::InvalidParameterCount`).
+///
+/// The Turso engine (0.7.0) silently leaves unbound parameters NULL and
+/// executes anyway. SQLite's C API technically does the same, but every
+/// SQLite *binding* litewire sits on (rusqlite here, and what wire clients
+/// expect from a MySQL-shaped server) treats a count mismatch as an error.
+/// The failure mode of not checking is severe: Oracle's `mysql` >= 8.1 CLI
+/// probes dollar-quoting support at startup with `select $$` and expects an
+/// error reply. If the server instead returns a result set, the CLI never
+/// reads it, its client-side state machine wedges, and every subsequent
+/// statement fails with CR 2014 "Commands out of sync".
+fn check_param_count(sql: &str, got: usize) -> Result<(), BackendError> {
+    let needed = expected_param_count(sql);
+    if got != needed {
+        return Err(BackendError::Sqlite(format!(
+            "Wrong number of parameters passed to query. Got {got}, needed {needed}"
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl BackendConn for TursoConn {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> {
@@ -355,6 +506,10 @@ impl BackendConn for TursoConn {
         // `prepare_cached` interns the parsed statement in the engine's
         // per-connection cache, mirroring the rusqlite backend.
         let mut stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
+        // Engine parse errors surface first (prepare above); then enforce
+        // the bind count like rusqlite does — the engine itself would
+        // silently run with unbound parameters as NULL.
+        check_param_count(sql, params.len())?;
 
         let columns = to_columns(&stmt.columns());
         let col_count = columns.len();
@@ -396,6 +551,8 @@ impl BackendConn for TursoConn {
         reject_unsupported(sql)?;
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
+        // Same bind-count parity check as `query` (see `check_param_count`).
+        check_param_count(sql, params.len())?;
         let affected = stmt
             .execute(to_params(params))
             .await
@@ -711,6 +868,81 @@ mod tests {
         assert_eq!(cols[1].decltype.as_deref(), Some("TEXT"));
         assert_eq!(cols[2].name, "tags");
         assert_eq!(cols[2].decltype.as_deref(), Some("BLOB"));
+    }
+
+    // -- Bind-count parity (mysql CLI `select $$` probe regression) -------
+
+    #[test]
+    fn param_count_scanner() {
+        assert_eq!(expected_param_count("SELECT 1"), 0);
+        assert_eq!(expected_param_count("SELECT ?"), 1);
+        assert_eq!(expected_param_count("SELECT ?, ?"), 2);
+        assert_eq!(expected_param_count("SELECT ?2"), 2);
+        assert_eq!(expected_param_count("SELECT ?3, ?"), 4);
+        assert_eq!(expected_param_count("SELECT :a, :b, :a"), 2);
+        assert_eq!(expected_param_count("SELECT @x, $y"), 2);
+        // The mysql >= 8.1 CLI probe: one TCL-style `$` parameter.
+        assert_eq!(expected_param_count("SELECT $$"), 1);
+        // Placeholders inside literals/identifiers/comments don't count.
+        assert_eq!(expected_param_count("SELECT '?', \"?\", `?` -- ?"), 0);
+        assert_eq!(expected_param_count("SELECT 'it''s ?' /* :x */, [?]"), 0);
+        assert_eq!(expected_param_count("SELECT 'a@b.c', '$5'"), 0);
+        // TCL-heritage `$` suffixes are part of the variable name, matching
+        // sqlite3_bind_parameter_count() (review differential-test finding).
+        assert_eq!(expected_param_count("SELECT $foo::type"), 1);
+        assert_eq!(expected_param_count("SELECT $foo::type(1,2)"), 1);
+        assert_eq!(expected_param_count("SELECT $foo(1)"), 1);
+        assert_eq!(expected_param_count("SELECT $a::b::c, $a::b::c"), 1);
+    }
+
+    #[tokio::test]
+    async fn unbound_parameter_rejected_like_rusqlite() {
+        // Regression: Oracle's mysql 8.4 CLI sends `select $$` at startup
+        // (dollar-quoting detection) and requires an error reply. Turso
+        // executes unbound parameters as NULL, so this returned a result
+        // set — which the CLI never reads, wedging its state machine into
+        // CR 2014 "Commands out of sync" for every following statement.
+        let backend = Turso::memory().await.unwrap();
+
+        let err = backend.query("SELECT $$", &[]).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Wrong number of parameters passed to query. Got 0, needed 1"),
+            "expected rusqlite-parity bind-count error, got: {err}"
+        );
+
+        let err = backend.query("SELECT ?", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("Wrong number of parameters"));
+    }
+
+    #[tokio::test]
+    async fn execute_bind_count_mismatch_rejected() {
+        let backend = Turso::memory().await.unwrap();
+        backend
+            .execute("CREATE TABLE t (v TEXT)", &[])
+            .await
+            .unwrap();
+
+        // Too few.
+        let err = backend
+            .execute("INSERT INTO t VALUES (?1)", &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Got 0, needed 1"), "got: {err}");
+
+        // Too many.
+        let err = backend
+            .query("SELECT ?1", &[Value::Integer(1), Value::Integer(2)])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Got 2, needed 1"), "got: {err}");
+
+        // Exact count still works.
+        let rs = backend
+            .query("SELECT ?1", &[Value::Integer(7)])
+            .await
+            .unwrap();
+        assert_eq!(rs.rows[0][0], Value::Integer(7));
     }
 
     #[tokio::test]
