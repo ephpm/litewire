@@ -360,11 +360,16 @@ fn sql_uses_pragma_tvf(sql: &str) -> bool {
 /// Number of parameter slots a SQL statement declares, following SQLite's
 /// tokenizer rules: `?` takes the next free index, `?NNN` takes index `NNN`,
 /// and `:name` / `@name` / `$name` each take the next free index the first
-/// time the name appears. The result is the highest index assigned — the
-/// same value `sqlite3_bind_parameter_count()` reports.
+/// time the name appears. `$name` additionally swallows SQLite's TCL-heritage
+/// suffixes (`$name::seg` repetitions and one trailing `(...)`) as part of
+/// the variable name, matching tokenize.c. The result is the highest index
+/// assigned — the same value `sqlite3_bind_parameter_count()` reports.
 ///
 /// Quoted strings (`'…'`), quoted identifiers (`"…"`, `` `…` ``, `[…]`),
 /// line comments (`--`) and block comments (`/* … */`) are skipped.
+///
+/// TODO(turso >0.7): delete this scanner and delegate to the statement's
+/// parameter count once the turso crate exposes it publicly.
 fn expected_param_count(sql: &str) -> usize {
     let bytes = sql.as_bytes();
     let mut i = 0;
@@ -434,8 +439,31 @@ fn expected_param_count(sql: &str) -> usize {
                 {
                     i += 1;
                 }
+                if bytes[start] == b'$' {
+                    // TCL-heritage suffixes are part of the variable name
+                    // (sqlite tokenize.c): `$name::seg` repetitions, then
+                    // optionally one non-nested `(...)`.
+                    while i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b':' {
+                        i += 2;
+                        while i < bytes.len()
+                            && (bytes[i].is_ascii_alphanumeric()
+                                || bytes[i] == b'_'
+                                || bytes[i] == b'$')
+                        {
+                            i += 1;
+                        }
+                    }
+                    if i < bytes.len() && bytes[i] == b'(' {
+                        while i < bytes.len() && bytes[i] != b')' {
+                            i += 1;
+                        }
+                        i = (i + 1).min(bytes.len());
+                    }
+                }
                 if i > start + 1 || bytes[start] == b'$' {
                     let name = &sql[start..i];
+                    // O(n) scan is fine: real statements carry < 10 distinct
+                    // named parameters.
                     if !named.contains(&name) {
                         named.push(name);
                         max_index += 1;
@@ -859,6 +887,12 @@ mod tests {
         assert_eq!(expected_param_count("SELECT '?', \"?\", `?` -- ?"), 0);
         assert_eq!(expected_param_count("SELECT 'it''s ?' /* :x */, [?]"), 0);
         assert_eq!(expected_param_count("SELECT 'a@b.c', '$5'"), 0);
+        // TCL-heritage `$` suffixes are part of the variable name, matching
+        // sqlite3_bind_parameter_count() (review differential-test finding).
+        assert_eq!(expected_param_count("SELECT $foo::type"), 1);
+        assert_eq!(expected_param_count("SELECT $foo::type(1,2)"), 1);
+        assert_eq!(expected_param_count("SELECT $foo(1)"), 1);
+        assert_eq!(expected_param_count("SELECT $a::b::c, $a::b::c"), 1);
     }
 
     #[tokio::test]
