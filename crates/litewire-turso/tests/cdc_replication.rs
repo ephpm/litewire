@@ -408,3 +408,75 @@ async fn uncommitted_transaction_is_not_yielded() {
         .expect("committed batch should surface");
     assert!(batch.commit_change_id() > 0);
 }
+
+/// A tailer over a database that has never been written to must report
+/// "nothing yet", not an error.
+///
+/// Turso creates `turso_cdc` lazily, on the first *captured write* — not
+/// when CDC is enabled and not when a session connects. A freshly
+/// provisioned primary therefore has no log table at all, and
+/// `poll_batch` used to surface that as `Err(no such table: turso_cdc)`.
+///
+/// That is indistinguishable, to a caller, from a real fault: ePHPm's
+/// CDC primary treated it as fatal, dropped the replica's subscription
+/// on every poll, and the replica redialled every 2s — 21 connection
+/// churns in 40 idle seconds on a two-node cluster serving no traffic,
+/// ending only when someone happened to write. Since "absent" and
+/// "empty" both mean zero changes to ship, the contract `Ok(None)`
+/// already documents ("no complete batch is pending") is the correct
+/// answer, and fixing it here means no consumer has to know this.
+#[tokio::test]
+async fn cold_database_with_no_cdc_log_polls_as_empty_not_error() {
+    let (primary, _file) = temp_factory().await;
+
+    // Precondition: the log genuinely does not exist. If a future turso
+    // creates it eagerly, this assert fires and tells us the tolerance
+    // below is no longer load-bearing.
+    let probe = primary
+        .raw_connection()
+        .unwrap()
+        .prepare("SELECT 1 FROM turso_cdc LIMIT 1")
+        .await;
+    assert!(
+        probe.is_err(),
+        "turso_cdc should not exist before any captured write"
+    );
+
+    let mut tailer = CdcTailer::new(&primary, 0);
+    assert!(
+        tailer
+            .poll_batch()
+            .await
+            .expect("cold poll must not error")
+            .is_none(),
+        "cold poll should yield no batch"
+    );
+    // Repeatable: still not an error on subsequent polls, and the cursor
+    // has not moved.
+    assert!(
+        tailer
+            .poll_batch()
+            .await
+            .expect("second cold poll")
+            .is_none()
+    );
+    assert_eq!(tailer.cursor(), 0, "cold polls must not advance the cursor");
+
+    // And once a captured write lands, the same tailer starts producing.
+    let writer = primary.raw_connection().unwrap();
+    enable_cdc(&writer).await.unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())
+        .await
+        .unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (1, 'hello')", ())
+        .await
+        .unwrap();
+
+    let batches = drain_batches(&mut tailer).await;
+    assert!(
+        !batches.is_empty(),
+        "tailer that started cold must still deliver once writes begin"
+    );
+}
