@@ -21,7 +21,10 @@ async fn free_port() -> u16 {
 async fn start_litewire(port: u16) -> tokio::task::JoinHandle<()> {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let backend = litewire::backend::Rusqlite::memory().unwrap();
-    let config = litewire::litewire_tds::TdsFrontendConfig { listen: addr };
+    let config = litewire::litewire_tds::TdsFrontendConfig {
+        listen: addr,
+        max_connections: 0,
+    };
     let frontend = litewire::litewire_tds::TdsFrontend::new(config, std::sync::Arc::new(backend));
 
     tokio::spawn(async move {
