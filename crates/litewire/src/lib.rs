@@ -49,6 +49,7 @@ use litewire_backend::SharedBackend;
 /// Builder for a litewire server instance.
 pub struct LiteWire {
     backend: SharedBackend,
+    max_connections: usize,
     #[cfg(feature = "mysql")]
     mysql_listen: Option<SocketAddr>,
     #[cfg(feature = "hrana")]
@@ -64,6 +65,7 @@ impl LiteWire {
     pub fn new(backend: impl litewire_backend::Backend) -> Self {
         Self {
             backend: Arc::new(backend),
+            max_connections: 0,
             #[cfg(feature = "mysql")]
             mysql_listen: None,
             #[cfg(feature = "hrana")]
@@ -73,6 +75,42 @@ impl LiteWire {
             #[cfg(feature = "tds")]
             tds_listen: None,
         }
+    }
+
+    /// Cap the number of simultaneous client connections **per wire
+    /// frontend**. `0` (the default) means unlimited, which preserves the
+    /// historical behaviour exactly.
+    ///
+    /// # Why you probably want this
+    ///
+    /// A connection here is not free. Each accepted client holds a backend
+    /// session for its entire lifetime, and the rusqlite backend gives
+    /// every session **its own OS thread** plus its own open SQLite handle
+    /// and statement cache. Connections are therefore the knob that bounds
+    /// threads and file descriptors: with no cap, a client that opens
+    /// connections faster than it closes them can grow this process's
+    /// thread count without limit.
+    ///
+    /// Set it to something a little above the peak concurrency the
+    /// application actually needs. Beyond the cap, clients are refused
+    /// **immediately** rather than queued -- a refused client can back off
+    /// or fail over, whereas one parked in an invisible accept queue only
+    /// learns anything when it times out. The MySQL frontend answers with a
+    /// proper `ER_CON_COUNT_ERROR (1040)` "Too many connections"; the
+    /// PostgreSQL and TDS frontends close the connection (both protocols
+    /// have the client speak first, so there is nothing safe to reply to
+    /// yet).
+    ///
+    /// The cap applies per frontend, not in aggregate: enabling both MySQL
+    /// and PostgreSQL with `max_connections(64)` allows 64 of each.
+    ///
+    /// The Hrana frontend is unaffected -- it is stateless HTTP that opens
+    /// a throwaway session per statement rather than holding one per
+    /// connection, so its connection count does not bound worker threads.
+    #[must_use]
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
+        self
     }
 
     /// Enable the MySQL wire protocol frontend on the given address.
@@ -117,7 +155,10 @@ impl LiteWire {
 
         #[cfg(feature = "mysql")]
         if let Some(addr) = self.mysql_listen {
-            let config = litewire_mysql::MysqlFrontendConfig { listen: addr };
+            let config = litewire_mysql::MysqlFrontendConfig {
+                listen: addr,
+                max_connections: self.max_connections,
+            };
             let frontend = litewire_mysql::MysqlFrontend::new(config, Arc::clone(&self.backend));
             handles.push(tokio::spawn(async move {
                 frontend.serve().await.map_err(Into::into)
@@ -135,7 +176,10 @@ impl LiteWire {
 
         #[cfg(feature = "postgres")]
         if let Some(addr) = self.postgres_listen {
-            let config = litewire_postgres::PostgresFrontendConfig { listen: addr };
+            let config = litewire_postgres::PostgresFrontendConfig {
+                listen: addr,
+                max_connections: self.max_connections,
+            };
             let frontend =
                 litewire_postgres::PostgresFrontend::new(config, Arc::clone(&self.backend));
             handles.push(tokio::spawn(async move {
@@ -145,7 +189,10 @@ impl LiteWire {
 
         #[cfg(feature = "tds")]
         if let Some(addr) = self.tds_listen {
-            let config = litewire_tds::TdsFrontendConfig { listen: addr };
+            let config = litewire_tds::TdsFrontendConfig {
+                listen: addr,
+                max_connections: self.max_connections,
+            };
             let frontend = litewire_tds::TdsFrontend::new(config, Arc::clone(&self.backend));
             handles.push(tokio::spawn(async move {
                 frontend.serve().await.map_err(Into::into)

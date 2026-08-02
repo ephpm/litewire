@@ -11,7 +11,7 @@ mod types;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use litewire_backend::SharedBackend;
+use litewire_backend::{ConnectionLimiter, SharedBackend};
 use litewire_translate::TranslateCache;
 use pgwire::api::NoopErrorHandler;
 use pgwire::api::PgWireServerHandlers;
@@ -28,6 +28,25 @@ use handler::PostgresHandler;
 pub struct PostgresFrontendConfig {
     /// Address to listen on (e.g., `127.0.0.1:5432`).
     pub listen: SocketAddr,
+    /// Maximum simultaneous client connections. `0` means unlimited,
+    /// which is the historical behaviour and what the `LiteWire` builder
+    /// uses unless `max_connections` is called on it.
+    ///
+    /// Worth setting. Each accepted connection holds a backend session for
+    /// its whole lifetime, and the rusqlite backend gives every session its
+    /// own OS thread and its own open SQLite handle -- so bounding
+    /// connections is how you bound threads and file descriptors. Beyond
+    /// the cap the connection is closed immediately; accepts are never
+    /// queued.
+    ///
+    /// Unlike the MySQL frontend, which answers with
+    /// `ER_CON_COUNT_ERROR (1040)`, this one just closes. A PostgreSQL
+    /// client speaks first -- `SSLRequest` or `StartupMessage` -- and
+    /// writing an `ErrorResponse` before reading that would mean guessing
+    /// which of the two is arriving. libpq reports a closed connection
+    /// clearly enough that the guess is not worth the risk of desyncing
+    /// the stream.
+    pub max_connections: usize,
 }
 
 /// PostgreSQL wire protocol frontend.
@@ -52,7 +71,12 @@ impl PostgresFrontend {
     /// Returns an error if binding the listen address fails.
     pub async fn serve(self) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(self.config.listen).await?;
-        info!(listen = %self.config.listen, "PostgreSQL frontend listening");
+        let limiter = ConnectionLimiter::new(self.config.max_connections);
+        info!(
+            listen = %self.config.listen,
+            max_connections = ?limiter.limit(),
+            "PostgreSQL frontend listening"
+        );
 
         // Shared parse+rewrite cache across every accepted connection --
         // same rationale as the MySQL frontend.
@@ -69,7 +93,20 @@ impl PostgresFrontend {
             };
             // See litewire-mysql: Nagle + delayed ACK costs ~40ms per round trip.
             let _ = stream.set_nodelay(true);
-            debug!(%peer, "PostgreSQL client connected");
+
+            // Take a seat before doing any work, so an over-limit client
+            // never causes a backend session -- or its OS thread -- to be
+            // created.
+            let Some(slot) = limiter.try_acquire() else {
+                warn!(
+                    %peer,
+                    limit = limiter.limit().unwrap_or_default(),
+                    "PostgreSQL connection refused: max_connections reached"
+                );
+                drop(stream);
+                continue;
+            };
+            debug!(%peer, live = limiter.live(), "PostgreSQL client connected");
 
             // Per-connection factory: each accepted client gets its own
             // PostgresHandler with its own BackendConn, so transactions
@@ -78,6 +115,9 @@ impl PostgresFrontend {
             let be = Arc::clone(&backend);
             let cache = Arc::clone(&translate_cache);
             tokio::spawn(async move {
+                // Released when this task ends, on the same path that drops
+                // the handler and reclaims its session's worker thread.
+                let _slot = slot;
                 let handler = match PostgresHandler::new(be, cache).await {
                     Ok(h) => h,
                     Err(e) => {

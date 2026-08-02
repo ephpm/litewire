@@ -22,6 +22,8 @@
 //! per call. Callers that need transactions (i.e. all wire frontends) must
 //! use [`Backend::connect`].
 
+pub mod conn_limit;
+
 #[cfg(feature = "rusqlite")]
 pub mod rusqlite_backend;
 
@@ -188,6 +190,8 @@ pub trait Backend: Send + Sync + 'static {
 
 /// Type alias for a shared backend reference.
 pub type SharedBackend = Arc<dyn Backend>;
+
+pub use conn_limit::{ConnectionLimiter, ConnectionSlot};
 
 #[cfg(feature = "rusqlite")]
 pub use rusqlite_backend::Rusqlite;

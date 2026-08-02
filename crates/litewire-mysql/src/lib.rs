@@ -12,18 +12,72 @@ mod types;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use litewire_backend::SharedBackend;
+use litewire_backend::{ConnectionLimiter, SharedBackend};
 use litewire_translate::TranslateCache;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
 use handler::LiteWireHandler;
+
+/// MySQL server error code `ER_CON_COUNT_ERROR` -- "Too many connections".
+const ER_CON_COUNT_ERROR: u16 = 1040;
 
 /// Configuration for the MySQL wire protocol frontend.
 #[derive(Clone, Debug)]
 pub struct MysqlFrontendConfig {
     /// Address to listen on (e.g., `127.0.0.1:3306`).
     pub listen: SocketAddr,
+    /// Maximum simultaneous client connections. `0` means unlimited,
+    /// which is the historical behaviour and what the `LiteWire` builder
+    /// uses unless `max_connections` is called on it.
+    ///
+    /// Worth setting. Each accepted connection holds a backend session for
+    /// its whole lifetime, and the rusqlite backend gives every session its
+    /// own OS thread and its own open SQLite handle -- so bounding
+    /// connections is how you bound threads and file descriptors. Beyond
+    /// the cap a client is refused immediately with
+    /// `ER_CON_COUNT_ERROR (1040)`; accepts are never queued.
+    pub max_connections: usize,
+}
+
+/// Refuse a connection with a pre-handshake `ER_CON_COUNT_ERROR` packet.
+///
+/// This is the one place litewire writes MySQL wire bytes by hand, because
+/// it happens *before* `opensrv-mysql` is involved -- the point of the cap
+/// is to not build a session at all.
+///
+/// The packet is the pre-4.1 error form: a 4-byte header (3-byte length,
+/// sequence 0) then `0xFF`, the error code little-endian, and the message.
+/// It deliberately omits the `#SQLSTATE` marker, because that field only
+/// exists once `CLIENT_PROTOCOL_41` has been negotiated and the client has
+/// not sent its capability flags yet -- this is the client's *first* packet
+/// from us, in place of the initial handshake. Real MySQL refuses
+/// over-limit connections the same way.
+async fn refuse_too_many(stream: &mut tokio::net::TcpStream, limit: usize) {
+    let message = format!("Too many connections (litewire max_connections={limit})");
+    let payload_len = 1 + 2 + message.len();
+    // A 3-byte length field caps a packet at 16 MiB; the message above is
+    // far smaller, but keep the invariant explicit rather than implied.
+    debug_assert!(payload_len < 0x00ff_ffff);
+
+    let mut packet = Vec::with_capacity(4 + payload_len);
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        packet.push((payload_len & 0xff) as u8);
+        packet.push(((payload_len >> 8) & 0xff) as u8);
+        packet.push(((payload_len >> 16) & 0xff) as u8);
+    }
+    packet.push(0); // sequence id 0 -- we are replacing the handshake
+    packet.push(0xff); // ERR packet marker
+    packet.extend_from_slice(&ER_CON_COUNT_ERROR.to_le_bytes());
+    packet.extend_from_slice(message.as_bytes());
+
+    // Best effort: the client may already be gone, and there is nothing
+    // useful to do about it either way.
+    let _ = stream.write_all(&packet).await;
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
 }
 
 /// MySQL wire protocol frontend.
@@ -48,7 +102,12 @@ impl MysqlFrontend {
     /// Returns an error if binding the listen address fails.
     pub async fn serve(self) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(self.config.listen).await?;
-        info!(listen = %self.config.listen, "MySQL frontend listening");
+        let limiter = ConnectionLimiter::new(self.config.max_connections);
+        info!(
+            listen = %self.config.listen,
+            max_connections = ?limiter.limit(),
+            "MySQL frontend listening"
+        );
 
         let backend = Arc::clone(&self.backend);
         // Shared parse+rewrite cache across every accepted connection.
@@ -58,7 +117,7 @@ impl MysqlFrontend {
         let translate_cache = Arc::new(TranslateCache::default());
 
         loop {
-            let (stream, peer) = match listener.accept().await {
+            let (mut stream, peer) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
                     warn!("MySQL accept error: {e}");
@@ -69,11 +128,27 @@ impl MysqlFrontend {
             // Nagle + delayed ACK stalls every round trip ~40ms on Linux
             // loopback (measured 44ms/query via PDO, 2026-07-09).
             let _ = stream.set_nodelay(true);
-            debug!(%peer, "MySQL client connected");
+
+            // Take a seat before doing any work. Over the cap the client is
+            // told so and disconnected here, without a backend session --
+            // and therefore without an OS thread -- ever being created.
+            let Some(slot) = limiter.try_acquire() else {
+                let limit = limiter.limit().unwrap_or_default();
+                warn!(%peer, limit, "MySQL connection refused: max_connections reached");
+                tokio::spawn(async move { refuse_too_many(&mut stream, limit).await });
+                continue;
+            };
+            debug!(%peer, live = limiter.live(), "MySQL client connected");
 
             let be = Arc::clone(&backend);
             let cache = Arc::clone(&translate_cache);
             tokio::spawn(async move {
+                // Moved in, never touched again: dropping the task -- for
+                // any reason, including a client that vanished
+                // mid-statement -- releases the seat on exactly the same
+                // path that drops the handler and reclaims its session's
+                // worker thread.
+                let _slot = slot;
                 let handler = match LiteWireHandler::new(be, cache).await {
                     Ok(h) => h,
                     Err(e) => {
