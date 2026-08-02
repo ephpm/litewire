@@ -27,7 +27,10 @@ async fn free_port() -> u16 {
 async fn start_litewire_turso(port: u16) -> tokio::task::JoinHandle<()> {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let backend = litewire::litewire_turso::Turso::memory().await.unwrap();
-    let config = litewire::litewire_mysql::MysqlFrontendConfig { listen: addr };
+    let config = litewire::litewire_mysql::MysqlFrontendConfig {
+        listen: addr,
+        max_connections: 0,
+    };
     let frontend = litewire::litewire_mysql::MysqlFrontend::new(config, Arc::new(backend));
 
     tokio::spawn(async move {
