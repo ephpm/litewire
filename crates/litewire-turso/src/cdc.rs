@@ -53,6 +53,27 @@
 use crate::{Turso, map_turso_err};
 use litewire_backend::{BackendError, Value};
 
+/// Name of Turso's CDC log table.
+const CDC_LOG_TABLE: &str = "turso_cdc";
+
+/// True when `e` is Turso reporting that the CDC log table does not
+/// exist yet.
+///
+/// `turso::Error` has no typed "relation missing" variant — a failed
+/// name resolution arrives as `Error::Error(String)` carrying the
+/// parser's message — so this has to match on text. Confining that match
+/// to a single place is the point of having it here: before this, every
+/// consumer of [`CdcTailer`] had to recognise the cold-start case for
+/// itself, and a consumer that treated it as fatal tore down its
+/// replication stream on every poll until the first write landed.
+///
+/// Both halves are required, so an unrelated missing relation or a
+/// corruption error is not mistaken for a cold start.
+fn is_missing_cdc_log(e: &turso::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("no such table") && msg.contains(CDC_LOG_TABLE)
+}
+
 /// v2 CDC schema `change_type` values, as emitted by
 /// `turso_core::translate::emitter::mod::emit_cdc_insns_v2`.
 mod change_type {
@@ -182,9 +203,20 @@ impl<'a> CdcTailer<'a> {
     /// transactions (row rows without a trailing COMMIT) are deliberately
     /// held back so replicas never observe an uncommitted state.
     ///
+    /// `Ok(None)` also covers the case where the `turso_cdc` log **does
+    /// not exist yet**. Turso creates it lazily, on the first captured
+    /// write — not when CDC is enabled and not when a session connects —
+    /// so a database that has served no writes has no log, and "absent"
+    /// carries exactly the same information as "empty": nothing to ship.
+    /// Reporting that as an error made every caller responsible for
+    /// distinguishing a cold start from a real fault, and a caller that
+    /// treated it as fatal would tear down its replication stream on a
+    /// freshly provisioned cluster and retry forever.
+    ///
     /// # Errors
     ///
-    /// Returns [`BackendError::Sqlite`] if the underlying poll fails.
+    /// Returns [`BackendError::Sqlite`] if the underlying poll fails for
+    /// any reason other than the log not existing yet.
     /// Malformed rows (missing required columns, wrong types) produce
     /// [`BackendError::Other`] — Phase 2 pins turso exactly, so this
     /// should only fire on a schema change we haven't caught up to.
@@ -194,7 +226,7 @@ impl<'a> CdcTailer<'a> {
         const WINDOW: i64 = 1024;
 
         let conn = self.factory.db.connect().map_err(map_turso_err)?;
-        let mut stmt = conn
+        let prepared = conn
             .prepare(
                 "SELECT change_id, change_txn_id, change_type, table_name, id, \
                         before, after, updates \
@@ -203,8 +235,15 @@ impl<'a> CdcTailer<'a> {
                  ORDER BY change_id \
                  LIMIT ?",
             )
-            .await
-            .map_err(map_turso_err)?;
+            .await;
+        let mut stmt = match prepared {
+            Ok(stmt) => stmt,
+            // No log table yet => no changes captured yet. Mirrors
+            // `read_watermark`, which already reports 0 rather than
+            // failing when its table is absent.
+            Err(e) if is_missing_cdc_log(&e) => return Ok(None),
+            Err(e) => return Err(map_turso_err(e)),
+        };
         let mut rows = stmt
             .query((self.last_seen_change_id, WINDOW))
             .await
@@ -824,6 +863,33 @@ fn decode_serial(blob: &[u8], pos: usize, serial: u64) -> Result<(Value, usize),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_cdc_log_recognises_the_cold_start_error() {
+        // Verbatim from a real cold-start poll against turso 0.7.0.
+        let e = turso::Error::Error("Parse error: no such table: turso_cdc".to_string());
+        assert!(is_missing_cdc_log(&e));
+    }
+
+    #[test]
+    fn missing_cdc_log_ignores_unrelated_failures() {
+        // A different missing relation must not be mistaken for a cold
+        // start — swallowing it would hide a genuinely broken tailer.
+        assert!(!is_missing_cdc_log(&turso::Error::Error(
+            "Parse error: no such table: posts".to_string()
+        )));
+        // Nor corruption, nor lock contention.
+        assert!(!is_missing_cdc_log(&turso::Error::Corrupt(
+            "database disk image is malformed".to_string()
+        )));
+        assert!(!is_missing_cdc_log(&turso::Error::Busy(
+            "locked".to_string()
+        )));
+        // Naming the table is not enough on its own.
+        assert!(!is_missing_cdc_log(&turso::Error::Error(
+            "turso_cdc is locked".to_string()
+        )));
+    }
 
     #[test]
     fn varint_single_byte() {
