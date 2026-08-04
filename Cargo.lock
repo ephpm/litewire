@@ -2040,6 +2040,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "litewire-hrana",
+ "litewire-translate",
  "parking_lot",
  "reqwest",
  "rusqlite",
