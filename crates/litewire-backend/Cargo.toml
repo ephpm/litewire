@@ -9,6 +9,10 @@ license.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
+# Statement classification for write admission control (hrana-client only).
+# `litewire-translate` depends on no other workspace crate, so this does not
+# create a cycle.
+litewire-translate = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
@@ -26,4 +30,10 @@ tracing-subscriber = { workspace = true }
 [features]
 default = ["rusqlite"]
 rusqlite = ["dep:rusqlite"]
-hrana-client = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:base64"]
+hrana-client = [
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:base64",
+    "dep:litewire-translate",
+]

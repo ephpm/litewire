@@ -30,6 +30,9 @@ pub mod rusqlite_backend;
 #[cfg(feature = "hrana-client")]
 pub mod hrana_client;
 
+#[cfg(feature = "hrana-client")]
+pub mod write_admission;
+
 use std::fmt;
 use std::sync::Arc;
 
@@ -198,6 +201,9 @@ pub use rusqlite_backend::Rusqlite;
 
 #[cfg(feature = "hrana-client")]
 pub use hrana_client::HranaClient;
+
+#[cfg(feature = "hrana-client")]
+pub use write_admission::{DEFAULT_ACQUIRE_TIMEOUT, SessionAdmission, WriteAdmission, WriteIntent};
 
 #[cfg(test)]
 mod tests {

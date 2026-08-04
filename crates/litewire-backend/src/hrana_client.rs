@@ -21,10 +21,12 @@
 //! dependency between `litewire-backend` and `litewire-hrana`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::write_admission::{DEFAULT_ACQUIRE_TIMEOUT, SessionAdmission, WriteAdmission};
 use crate::{Backend, BackendConn, BackendError, Column, ExecuteResult, ResultSet, Value};
 
 // -- Hrana 3 wire types (inline) -------------------------------------------
@@ -139,13 +141,26 @@ struct Endpoint {
 ///
 /// The reqwest `Client` uses HTTP/2 connection reuse across all sessions,
 /// so opening a new [`HranaConn`] does not open a new TCP connection.
+/// Clones share one write-admission pool, so wrapping this backend (as
+/// ePHPm's stats tracker does) does not multiply the write concurrency it
+/// was configured for.
 #[derive(Clone)]
 pub struct HranaClient {
     endpoint: Endpoint,
+    /// Configured write concurrency. `0` disables admission control.
+    write_permits: usize,
+    /// How long a queued write waits before failing.
+    write_acquire_timeout: Duration,
+    /// Built from the two fields above; `None` when disabled. Shared by
+    /// every session this client opens.
+    admission: Option<WriteAdmission>,
 }
 
 impl HranaClient {
     /// Create a new Hrana client pointing at the given base URL.
+    ///
+    /// Write admission control is **off** by default, so a client built
+    /// this way behaves exactly as it did before the feature existed.
     ///
     /// # Example
     ///
@@ -162,7 +177,56 @@ impl HranaClient {
                 pipeline_url: format!("{base}/v2/pipeline"),
                 health_url: format!("{base}/health"),
             },
+            write_permits: 0,
+            write_acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
+            admission: None,
         }
+    }
+
+    /// Cap the number of **writes** running concurrently through this
+    /// backend at `permits`. `0` (the default) means unlimited -- no
+    /// semaphore, no classification, nothing in the path.
+    ///
+    /// Reads are never capped. Writes over the cap queue in FIFO order and
+    /// are never refused, except by
+    /// [`Self::write_acquire_timeout`].
+    ///
+    /// # Why you might want this
+    ///
+    /// SQLite has one writer. Handing sqld more concurrent writes than it
+    /// can absorb makes it queue them badly -- `SQLITE_BUSY` escapes to
+    /// clients and throughput collapses instead of plateauing. Capping
+    /// admission keeps the excess in an orderly local queue. See
+    /// [`crate::write_admission`] for the full rationale, including why an
+    /// explicit transaction holds its permit until `COMMIT`.
+    ///
+    /// # Panics-free ordering note
+    ///
+    /// Builder methods rebuild the shared pool, so call them during
+    /// construction and before [`Backend::connect`]. Calling one after
+    /// sessions exist would leave those sessions on the previous pool.
+    #[must_use]
+    pub fn write_permits(mut self, permits: usize) -> Self {
+        self.write_permits = permits;
+        self.rebuild_admission();
+        self
+    }
+
+    /// How long a queued write waits for a permit before failing with a
+    /// `SQLITE_BUSY`-shaped error. Defaults to
+    /// [`DEFAULT_ACQUIRE_TIMEOUT`].
+    ///
+    /// This is a backstop against a wedged server, not a load-shedding
+    /// control -- keep it generous.
+    #[must_use]
+    pub fn write_acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.write_acquire_timeout = timeout;
+        self.rebuild_admission();
+        self
+    }
+
+    fn rebuild_admission(&mut self) {
+        self.admission = WriteAdmission::new(self.write_permits, self.write_acquire_timeout);
     }
 
     /// Check if the remote server is healthy.
@@ -197,6 +261,9 @@ impl Backend for HranaClient {
         Ok(Box::new(HranaConn {
             endpoint: self.endpoint.clone(),
             baton: Arc::new(Mutex::new(None)),
+            // Every session shares the client's pool; only the
+            // transaction bookkeeping is per-session.
+            admission: SessionAdmission::new(self.admission.clone()),
         }))
     }
 }
@@ -212,6 +279,10 @@ pub struct HranaConn {
     /// request; sqld's `_default` stream will pick us up and issue a
     /// baton in the response.
     baton: Arc<Mutex<Option<String>>>,
+    /// This session's seat in the shared write-permit pool, plus the
+    /// transaction bookkeeping that decides when the seat is taken and
+    /// given back. Dropping the session returns any parked permit.
+    admission: SessionAdmission,
 }
 
 impl HranaConn {
@@ -311,11 +382,18 @@ impl Drop for HranaConn {
 #[async_trait::async_trait]
 impl BackendConn for HranaConn {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> {
+        // Binding to a named local (not `_`) is load-bearing: `let _ = ...`
+        // would drop the permit immediately and admit the next writer
+        // before this statement had run at all.
+        let _permit = self.admission.admit(sql).await?;
         let exec = self.execute_pipeline(sql, params).await?;
         Ok(execute_response_to_result_set(exec))
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, BackendError> {
+        // See the note in `query`: the permit must outlive the round trip,
+        // so it is held until this function returns.
+        let _permit = self.admission.admit(sql).await?;
         let exec = self.execute_pipeline(sql, params).await?;
         Ok(ExecuteResult {
             affected_rows: exec.affected_row_count,
@@ -444,7 +522,7 @@ mod tests {
                     value: "123".into(),
                 },
             ),
-            (Value::Float(3.14), ResponseValue::Float { value: 3.14 }),
+            (Value::Float(2.75), ResponseValue::Float { value: 2.75 }),
             (
                 Value::Text("test".into()),
                 ResponseValue::Text {
@@ -528,9 +606,9 @@ mod tests {
 
     #[test]
     fn value_to_hrana_float() {
-        match value_to_hrana(&Value::Float(3.14)) {
+        match value_to_hrana(&Value::Float(2.75)) {
             HranaValue::Float { value } => {
-                assert!((value - 3.14).abs() < f64::EPSILON);
+                assert!((value - 2.75).abs() < f64::EPSILON);
             }
             other => panic!("expected Float, got: {other:?}"),
         }
@@ -775,22 +853,31 @@ mod tests {
     #[test]
     fn hrana_client_url_trailing_slash_trimmed() {
         let client = HranaClient::new("http://localhost:8081/");
-        assert_eq!(client.pipeline_url, "http://localhost:8081/v2/pipeline");
-        assert_eq!(client.health_url, "http://localhost:8081/health");
+        assert_eq!(
+            client.endpoint.pipeline_url,
+            "http://localhost:8081/v2/pipeline"
+        );
+        assert_eq!(client.endpoint.health_url, "http://localhost:8081/health");
     }
 
     #[test]
     fn hrana_client_url_no_trailing_slash() {
         let client = HranaClient::new("http://localhost:8081");
-        assert_eq!(client.pipeline_url, "http://localhost:8081/v2/pipeline");
-        assert_eq!(client.health_url, "http://localhost:8081/health");
+        assert_eq!(
+            client.endpoint.pipeline_url,
+            "http://localhost:8081/v2/pipeline"
+        );
+        assert_eq!(client.endpoint.health_url, "http://localhost:8081/health");
     }
 
     #[test]
     fn hrana_client_url_multiple_trailing_slashes_trimmed() {
         let client = HranaClient::new("http://localhost:8081///");
-        assert_eq!(client.pipeline_url, "http://localhost:8081/v2/pipeline");
-        assert_eq!(client.health_url, "http://localhost:8081/health");
+        assert_eq!(
+            client.endpoint.pipeline_url,
+            "http://localhost:8081/v2/pipeline"
+        );
+        assert_eq!(client.endpoint.health_url, "http://localhost:8081/health");
     }
 
     // ── hrana_error_to_backend: additional cases ────────────────────────────
