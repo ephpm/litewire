@@ -572,7 +572,7 @@ async fn float_values() {
         .unwrap();
 
     client
-        .execute("INSERT INTO floats VALUES (1, 3.14)", &[])
+        .execute("INSERT INTO floats VALUES (1, 2.75)", &[])
         .await
         .unwrap();
 
@@ -581,5 +581,5 @@ async fn float_values() {
         .await
         .unwrap();
     let val: f64 = rows[0].get(0);
-    assert!((val - 3.14).abs() < 0.001);
+    assert!((val - 2.75).abs() < 0.001);
 }

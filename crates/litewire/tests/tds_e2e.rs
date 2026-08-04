@@ -587,7 +587,7 @@ async fn float_column_types() {
         .unwrap();
 
     client
-        .simple_query("INSERT INTO typed_floats VALUES (1, 3.14)")
+        .simple_query("INSERT INTO typed_floats VALUES (1, 2.75)")
         .await
         .unwrap()
         .into_results()
@@ -600,5 +600,5 @@ async fn float_column_types() {
         .unwrap();
     let row = stream.into_row().await.unwrap().unwrap();
     let val: f64 = row.get(0).unwrap();
-    assert!((val - 3.14).abs() < 0.001);
+    assert!((val - 2.75).abs() < 0.001);
 }
