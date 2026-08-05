@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use litewire_backend::{Backend, Value};
 use litewire_turso::Turso;
-use litewire_turso::cdc::{CdcTailer, TxnBatch, apply_batch, enable_cdc, read_watermark};
+use litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, enable_cdc, read_watermark};
 
 async fn temp_factory() -> (Arc<Turso>, tempfile::NamedTempFile) {
     let file = tempfile::NamedTempFile::new().expect("temp file");
@@ -79,7 +79,11 @@ async fn watermark_starts_at_zero_and_advances_monotonically() {
     let mut tailer = CdcTailer::new(&primary, 0);
     let batches = drain_batches(&mut tailer).await;
     assert!(!batches.is_empty(), "expected at least one batch");
-    let expected_wm = batches.last().unwrap().commit_change_id();
+    let expected_wm = batches
+        .last()
+        .unwrap()
+        .commit_change_id()
+        .expect("a polled batch always ends in a COMMIT row");
 
     let r_conn = replica.raw_connection().unwrap();
     assert_eq!(read_watermark(&r_conn).await.unwrap(), 0);
@@ -323,8 +327,8 @@ async fn tailer_resume_from_watermark_only_ships_new_batches() {
     assert!(!new_batches.is_empty(), "expected new batches after resume");
     for b in &new_batches {
         assert!(
-            b.commit_change_id() > wm,
-            "resumed tailer emitted a batch <= old watermark: {}",
+            b.commit_change_id() > Some(wm),
+            "resumed tailer emitted a batch <= old watermark: {:?}",
             b.commit_change_id()
         );
     }
@@ -406,7 +410,7 @@ async fn uncommitted_transaction_is_not_yielded() {
         .await
         .unwrap()
         .expect("committed batch should surface");
-    assert!(batch.commit_change_id() > 0);
+    assert!(batch.commit_change_id().is_some_and(|id| id > 0));
 }
 
 /// A tailer over a database that has never been written to must report
@@ -479,4 +483,141 @@ async fn cold_database_with_no_cdc_log_polls_as_empty_not_error() {
         !batches.is_empty(),
         "tailer that started cold must still deliver once writes begin"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hostile / malformed batches reaching apply_batch.
+//
+// These construct batches by hand rather than tailing a primary: the point
+// is exactly what a *peer* can put on the wire, which is not limited to
+// what a well-behaved primary would emit.
+// ---------------------------------------------------------------------------
+
+/// Encode values as a SQLite record blob, mirroring what CDC stores in the
+/// `after` column. Only the cases these tests need: TEXT short enough for a
+/// single-byte serial type, and integers that fit in one byte.
+fn encode_record(values: &[Value]) -> Vec<u8> {
+    let mut serials: Vec<u8> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    for v in values {
+        match v {
+            Value::Text(s) => {
+                let serial = 13 + 2 * s.len();
+                assert!(serial < 128, "test helper encodes short text only");
+                serials.push(u8::try_from(serial).unwrap());
+                body.extend_from_slice(s.as_bytes());
+            }
+            Value::Integer(i) => {
+                let byte = i8::try_from(*i).expect("test helper encodes 1-byte ints only");
+                serials.push(1);
+                body.extend_from_slice(&byte.to_be_bytes());
+            }
+            other => panic!("test helper cannot encode {other:?}"),
+        }
+    }
+    let header_len = 1 + serials.len();
+    assert!(header_len < 128, "test helper encodes short headers only");
+    let mut out = Vec::with_capacity(header_len + body.len());
+    out.push(u8::try_from(header_len).unwrap());
+    out.extend_from_slice(&serials);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// A batch carrying one `sqlite_schema` INSERT whose stored `sql` is
+/// `sql`, followed by the COMMIT delimiter — the exact shape a peer sends
+/// to replay DDL.
+fn schema_replay_batch(change_id: i64, sql: &str) -> TxnBatch {
+    // sqlite_schema columns: (type, name, tbl_name, rootpage, sql).
+    let record = encode_record(&[
+        Value::Text("table".into()),
+        Value::Text("t".into()),
+        Value::Text("t".into()),
+        Value::Integer(2),
+        Value::Text(sql.into()),
+    ]);
+    TxnBatch {
+        rows: vec![
+            CdcRow {
+                change_id,
+                change_txn_id: Some(1),
+                change_type: 1, // INSERT
+                table_name: Some("sqlite_schema".into()),
+                id: Some(1),
+                before: None,
+                after: Some(record),
+                updates: None,
+            },
+            CdcRow {
+                change_id: change_id + 1,
+                change_txn_id: Some(1),
+                change_type: 2, // COMMIT
+                table_name: None,
+                id: None,
+                before: None,
+                after: None,
+                updates: None,
+            },
+        ],
+    }
+}
+
+/// Positive control for the two rejection tests below: the hand-built
+/// batch shape is genuinely applicable, so a rejection there is the
+/// allowlist talking and not a malformed blob.
+#[tokio::test]
+async fn hand_built_schema_batch_applies_when_the_ddl_is_legitimate() {
+    let (replica, _r) = temp_factory().await;
+    let r_conn = replica.raw_connection().unwrap();
+
+    apply_batch(&r_conn, &schema_replay_batch(10, "CREATE TABLE t (a)"))
+        .await
+        .expect("a plain CREATE TABLE must replay");
+
+    r_conn
+        .execute("INSERT INTO t (a) VALUES (1)", ())
+        .await
+        .expect("the replayed table must exist on the replica");
+    assert_eq!(count_rows(&replica, "t").await, 1);
+    assert_eq!(read_watermark(&r_conn).await.unwrap(), 11);
+}
+
+/// The headline of this change: peer-supplied schema SQL is no longer
+/// handed to the engine unexamined.
+#[tokio::test]
+async fn schema_replay_refuses_attach_and_pragma() {
+    for hostile in [
+        "PRAGMA writable_schema=ON",
+        "ATTACH DATABASE '/tmp/evil' AS evil",
+        "CREATE TABLE t (a); ATTACH DATABASE '/tmp/evil' AS e",
+        "/* CREATE TABLE t (a) */ PRAGMA journal_mode=OFF",
+    ] {
+        let (replica, _r) = temp_factory().await;
+        let r_conn = replica.raw_connection().unwrap();
+
+        let err = apply_batch(&r_conn, &schema_replay_batch(10, hostile))
+            .await
+            .expect_err("hostile schema replay must be refused");
+        assert!(
+            err.to_string().contains("rejected") || err.to_string().contains("more than one"),
+            "unexpected error for {hostile:?}: {err}"
+        );
+        // The watermark must not advance past a refused batch, so the
+        // stream resumes at the same place instead of skipping it.
+        assert_eq!(read_watermark(&r_conn).await.unwrap(), 0);
+    }
+}
+
+/// An empty batch must be reported, not panic the applying task. ePHPm
+/// decodes batches from a network frame, so `{"rows":[]}` is reachable
+/// from the wire.
+#[tokio::test]
+async fn apply_batch_reports_an_empty_batch_instead_of_panicking() {
+    let (replica, _r) = temp_factory().await;
+    let r_conn = replica.raw_connection().unwrap();
+
+    let err = apply_batch(&r_conn, &TxnBatch { rows: Vec::new() })
+        .await
+        .expect_err("an empty batch is malformed, not a silent no-op");
+    assert!(err.to_string().contains("empty batch"), "got: {err}");
 }
