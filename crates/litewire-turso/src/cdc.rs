@@ -29,6 +29,11 @@
 //! and re-executes the SQL text carried in the `sql` column of the
 //! sqlite_schema record. Verified by `tests/cdc_ddl_capture.rs`.
 //!
+//! That SQL text arrives from a peer, so it is **not** executed as it
+//! stands: [`classify_replayed_ddl`] parses it first and admits only the
+//! `CREATE` forms `sqlite_schema` can legitimately hold. See that
+//! function for the allowlist and its rationale.
+//!
 //! # DML decoding
 //!
 //! Row mutations carry `before`/`after` as SQLite record blobs (the same
@@ -144,12 +149,18 @@ pub struct TxnBatch {
 impl TxnBatch {
     /// Highest `change_id` in the batch (the COMMIT record). Advancing
     /// the replica's watermark past this value marks the batch applied.
+    ///
+    /// `None` for an empty batch. [`CdcTailer::poll_batch`] never yields
+    /// one — it cuts each batch at a COMMIT record, so there is always a
+    /// last row — but a `TxnBatch` is a plain public struct and callers
+    /// that build one from *elsewhere* can. ePHPm's replication link
+    /// decodes batches from a network frame, and a peer sending
+    /// `{"rows":[]}` used to reach an `expect` here and abort the
+    /// applying task. Reporting the absence lets every caller decide;
+    /// [`apply_batch`] turns it into a [`BackendError::Other`].
     #[must_use]
-    pub fn commit_change_id(&self) -> i64 {
-        self.rows
-            .last()
-            .map(|r| r.change_id)
-            .expect("TxnBatch is never empty")
+    pub fn commit_change_id(&self) -> Option<i64> {
+        self.rows.last().map(|r| r.change_id)
     }
 
     /// Transaction id shared by every non-COMMIT row in the batch.
@@ -273,8 +284,11 @@ impl<'a> CdcTailer<'a> {
         };
 
         buffered.truncate(commit_idx + 1);
+        // Read the cursor off the COMMIT row before the vec moves into the
+        // batch, so this path needs no unwrap on the now-`Option` accessor.
+        let commit_change_id = buffered[commit_idx].change_id;
         let batch = TxnBatch { rows: buffered };
-        self.last_seen_change_id = batch.commit_change_id();
+        self.last_seen_change_id = commit_change_id;
         Ok(Some(batch))
     }
 }
@@ -406,18 +420,29 @@ pub async fn read_watermark(conn: &turso::Connection) -> Result<i64, BackendErro
 /// the replica transaction is rolled back and the watermark is not
 /// advanced — the caller should retry with the same batch.
 ///
+/// An **empty** batch is a [`BackendError::Other`], not a silent no-op:
+/// a `TxnBatch` is by definition a run of row changes terminated by a
+/// COMMIT record, so a batch with no rows is a malformed one and the
+/// caller that produced it should hear about it.
+///
 /// # Panics
 ///
-/// This function does not panic; malformed CDC rows surface as
-/// [`BackendError::Other`].
+/// This function does not panic; malformed CDC rows and empty batches
+/// surface as [`BackendError::Other`].
 pub async fn apply_batch(
     replica_conn: &turso::Connection,
     batch: &TxnBatch,
 ) -> Result<(), BackendError> {
+    let Some(commit_change_id) = batch.commit_change_id() else {
+        return Err(BackendError::Other(
+            "cdc apply: empty batch (a TxnBatch always ends in a COMMIT row)".into(),
+        ));
+    };
+
     ensure_watermark_table(replica_conn).await?;
 
     let current = read_watermark(replica_conn).await?;
-    if batch.commit_change_id() <= current {
+    if commit_change_id <= current {
         // Already applied; idempotent no-op.
         return Ok(());
     }
@@ -429,7 +454,7 @@ pub async fn apply_batch(
         .await
         .map_err(map_turso_err)?;
 
-    let result = apply_batch_inner(replica_conn, batch, current).await;
+    let result = apply_batch_inner(replica_conn, batch, current, commit_change_id).await;
     match result {
         Ok(()) => {
             replica_conn
@@ -450,6 +475,7 @@ async fn apply_batch_inner(
     conn: &turso::Connection,
     batch: &TxnBatch,
     current_watermark: i64,
+    commit_change_id: i64,
 ) -> Result<(), BackendError> {
     for row in &batch.rows {
         // Skip rows the replica already applied inside a prior partial
@@ -489,7 +515,7 @@ async fn apply_batch_inner(
         .prepare("UPDATE __litewire_cdc_watermark SET applied_change_id = ? WHERE id = 0")
         .await
         .map_err(map_turso_err)?;
-    stmt.execute((batch.commit_change_id(),))
+    stmt.execute((commit_change_id,))
         .await
         .map_err(map_turso_err)?;
     Ok(())
@@ -501,6 +527,12 @@ async fn apply_batch_inner(
 /// Only INSERT/UPDATE carry an after-image with the SQL text; DELETE
 /// events are DROP TABLE / DROP INDEX and we synthesize the statement
 /// from the before-image `type` + `name`.
+///
+/// The INSERT/UPDATE text is peer-supplied and goes through
+/// [`classify_replayed_ddl`] before it reaches the engine. The DELETE
+/// branch is not peer-supplied in the same sense — the statement is
+/// built here from a fixed template with the identifier escaped — so it
+/// needs no allowlist.
 async fn apply_ddl(conn: &turso::Connection, row: &CdcRow) -> Result<(), BackendError> {
     match row.change_type {
         change_type::INSERT | change_type::UPDATE => {
@@ -527,6 +559,15 @@ async fn apply_ddl(conn: &turso::Connection, row: &CdcRow) -> Result<(), Backend
                     )));
                 }
             };
+            if classify_replayed_ddl(&sql)? == SchemaObject::Trigger {
+                tracing::warn!(
+                    change_id = row.change_id,
+                    "cdc apply: not replaying a CREATE TRIGGER — CDC already carries the \
+                     rows the trigger produced on the primary, so recreating it here would \
+                     double-apply them"
+                );
+                return Ok(());
+            }
             conn.execute(&sql, ()).await.map_err(map_turso_err)?;
         }
         change_type::DELETE => {
@@ -566,6 +607,295 @@ async fn apply_ddl(conn: &turso::Connection, row: &CdcRow) -> Result<(), Backend
 
 fn escape_ident(s: &str) -> String {
     s.replace('"', "\"\"")
+}
+
+// ---------------------------------------------------------------------------
+// Replayed-DDL allowlist.
+// ---------------------------------------------------------------------------
+
+/// A schema object that a CDC `sqlite_schema` row may legitimately
+/// create — the complete set [`classify_replayed_ddl`] admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaObject {
+    /// `CREATE TABLE`.
+    Table,
+    /// `CREATE INDEX` or `CREATE UNIQUE INDEX`.
+    Index,
+    /// `CREATE VIEW`.
+    View,
+    /// `CREATE TRIGGER`. Recognised as legitimate so it can be told apart
+    /// from an attack, but deliberately **not replayed** — see
+    /// [`apply_batch`] and the note on [`classify_replayed_ddl`].
+    Trigger,
+}
+
+impl SchemaObject {
+    /// The keyword form, for error and log messages.
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            SchemaObject::Table => "TABLE",
+            SchemaObject::Index => "INDEX",
+            SchemaObject::View => "VIEW",
+            SchemaObject::Trigger => "TRIGGER",
+        }
+    }
+}
+
+/// Classify the `sqlite_schema.sql` text of a replayed DDL event, and
+/// reject anything outside the allowlist.
+///
+/// # Why this exists
+///
+/// The text is peer-supplied. A CDC batch reaches [`apply_batch`] only
+/// from a node that already holds the cluster credential, so it is
+/// entitled to dictate the replica's *data* — but before this check it
+/// could also dictate arbitrary *SQL*, including `ATTACH` (open or
+/// create a file of its choosing) and `PRAGMA` (retarget the journal,
+/// disable integrity behaviour, and in some builds load an extension).
+/// That is a strictly larger capability than "corrupt some rows", and it
+/// is the gap this closes. The DML path never had it: values bind as
+/// parameters and identifiers go through [`escape_ident`].
+///
+/// # What is allowed, and why that is the whole set
+///
+/// `sqlite_schema.sql` can only ever hold a `CREATE`. That is not a
+/// policy choice, it is what SQLite stores:
+///
+/// - `CREATE TABLE` / `CREATE [UNIQUE] INDEX` / `CREATE VIEW` /
+///   `CREATE TRIGGER` — the four object kinds with a stored `sql` text.
+/// - `ALTER TABLE ... ADD COLUMN` (and `RENAME`) does **not** appear as
+///   `ALTER` text. SQLite rewrites the object's stored `CREATE TABLE`
+///   and the change surfaces as an UPDATE of that row, so the replay
+///   text is still a `CREATE`.
+/// - `DROP` does not appear here either: it arrives as a DELETE on the
+///   schema row, and that branch of [`apply_ddl`] synthesizes its own
+///   `DROP ... IF EXISTS` from a fixed template.
+/// - Auto-indexes carry a NULL `sql` and are skipped before this point.
+///
+/// So everything else — `ATTACH`, `PRAGMA`, `BEGIN`/`COMMIT`/`SAVEPOINT`,
+/// `INSERT`/`UPDATE`/`DELETE`, `SELECT`, a literal `DROP` or `ALTER`,
+/// `CREATE TEMP ...` (temp objects live in `sqlite_temp_schema`, never
+/// here) — cannot be a genuine CDC schema replay and is refused.
+///
+/// `CREATE VIRTUAL TABLE` is refused too, and that one is a judgement
+/// call rather than a structural impossibility: it names a module and
+/// hands it arbitrary arguments at replay time, which is a different
+/// capability from building a b-tree and one whose blast radius depends
+/// on which modules the replica's build happens to register. Turso
+/// 0.7.0's CDC behaviour over virtual tables is unverified either way,
+/// so refusing costs nothing that works today.
+///
+/// # One statement, not many
+///
+/// SQLite stores exactly one statement per schema row, without a
+/// trailing `;`. A payload carrying a second statement is therefore
+/// smuggling, and the scan that detects it is quote- and comment-aware:
+/// `'…'` (with `''` escapes), `"…"`, `` `…` ``, `[…]`, `-- …` and
+/// `/* … */` are all runs in which a `;` is not a separator. An
+/// unterminated quote or block comment is refused rather than guessed
+/// at.
+///
+/// `CREATE TRIGGER` is exempt from the separator check, because a
+/// trigger body legitimately contains `;` between `BEGIN` and `END` —
+/// and it is exempt safely, because a trigger is never executed on the
+/// replay path. Recreating it would double-apply the row effects CDC
+/// already carries from the primary, so [`apply_ddl`] logs and skips it,
+/// matching what ePHPm's snapshot bootstrap does with triggers.
+///
+/// # Errors
+///
+/// Returns [`BackendError::Other`] naming the offending statement
+/// (truncated) when the text is not a single allowlisted `CREATE`.
+pub fn classify_replayed_ddl(sql: &str) -> Result<SchemaObject, BackendError> {
+    let object = classify_leading_keywords(sql)?;
+    if object != SchemaObject::Trigger {
+        ensure_single_statement(sql, object)?;
+    }
+    Ok(object)
+}
+
+/// Read the `CREATE <kind>` preamble and map it to a [`SchemaObject`].
+fn classify_leading_keywords(sql: &str) -> Result<SchemaObject, BackendError> {
+    let words = leading_keywords(sql, 3);
+    let reject = |reason: &str| {
+        Err(BackendError::Other(format!(
+            "cdc apply: replayed DDL rejected ({reason}); only CREATE \
+             TABLE/[UNIQUE] INDEX/VIEW/TRIGGER may be replayed: {}",
+            truncate_for_log(sql)
+        )))
+    };
+
+    match words.first().map(String::as_str) {
+        Some("CREATE") => {}
+        Some(other) => return reject(&format!("leading keyword {other}")),
+        None => return reject("no leading keyword"),
+    }
+    match words.get(1).map(String::as_str) {
+        Some("TABLE") => Ok(SchemaObject::Table),
+        Some("INDEX") => Ok(SchemaObject::Index),
+        Some("VIEW") => Ok(SchemaObject::View),
+        Some("TRIGGER") => Ok(SchemaObject::Trigger),
+        // The only modifier SQLite stores between CREATE and the object
+        // kind. TEMP/TEMPORARY and VIRTUAL fall through to the reject.
+        Some("UNIQUE") => match words.get(2).map(String::as_str) {
+            Some("INDEX") => Ok(SchemaObject::Index),
+            Some(other) => reject(&format!("CREATE UNIQUE {other}")),
+            None => reject("CREATE UNIQUE with no object kind"),
+        },
+        Some(other) => reject(&format!("CREATE {other}")),
+        None => reject("CREATE with no object kind"),
+    }
+}
+
+/// Refuse a payload that carries a second statement.
+///
+/// Quote- and comment-aware, so a `;` inside a string literal, a quoted
+/// identifier, or a comment is not mistaken for a separator. An
+/// unterminated quote or block comment is an error: the payload cannot be
+/// reasoned about, so it does not get the benefit of the doubt.
+fn ensure_single_statement(sql: &str, object: SchemaObject) -> Result<(), BackendError> {
+    let bytes = sql.as_bytes();
+    let mut first_semicolon: Option<usize> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            // Doubling (`''`, `""`, ` `` `) escapes the quote character.
+            quote @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                loop {
+                    if i >= bytes.len() {
+                        return Err(BackendError::Other(format!(
+                            "cdc apply: unterminated quoted literal in replayed DDL: {}",
+                            truncate_for_log(sql)
+                        )));
+                    }
+                    if bytes[i] == quote {
+                        if bytes.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // SQLite also accepts MSSQL-style `[identifier]`. There is no
+            // escape form — the first `]` closes it.
+            b'[' => {
+                i += 1;
+                loop {
+                    if i >= bytes.len() {
+                        return Err(BackendError::Other(format!(
+                            "cdc apply: unterminated bracketed identifier in replayed DDL: {}",
+                            truncate_for_log(sql)
+                        )));
+                    }
+                    let closed = bytes[i] == b']';
+                    i += 1;
+                    if closed {
+                        break;
+                    }
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                loop {
+                    if i + 1 >= bytes.len() {
+                        return Err(BackendError::Other(format!(
+                            "cdc apply: unterminated block comment in replayed DDL: {}",
+                            truncate_for_log(sql)
+                        )));
+                    }
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b';' => {
+                if first_semicolon.is_none() {
+                    first_semicolon = Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    // A single trailing `;` is tolerated (SQLite does not store one, but
+    // refusing it would be pedantry); anything of substance after it is
+    // a second statement.
+    if let Some(pos) = first_semicolon {
+        if !skip_blank_and_comments(&sql[pos + 1..]).is_empty() {
+            return Err(BackendError::Other(format!(
+                "cdc apply: replayed CREATE {} carries more than one statement: {}",
+                object.as_str(),
+                truncate_for_log(sql)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The first `n` bare keywords at the head of `sql`, upper-cased, with
+/// whitespace and comments between them skipped. Stops at the first
+/// token that is not a bare word — a quote, a paren, a digit — since
+/// none of those can be part of a `CREATE <kind>` preamble.
+fn leading_keywords(sql: &str, n: usize) -> Vec<String> {
+    let mut s = sql;
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        s = skip_blank_and_comments(s);
+        let len = s.bytes().take_while(u8::is_ascii_alphabetic).count();
+        if len == 0 {
+            break;
+        }
+        out.push(s[..len].to_ascii_uppercase());
+        s = &s[len..];
+    }
+    out
+}
+
+/// Drop leading whitespace and SQL comments. Returns `""` when the input
+/// is nothing but whitespace and comments, including an unterminated
+/// comment — which by definition swallows everything after it.
+fn skip_blank_and_comments(s: &str) -> &str {
+    let mut s = s;
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            let Some(nl) = rest.find('\n') else { return "" };
+            s = &rest[nl + 1..];
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else {
+                return "";
+            };
+            s = &rest[end + 2..];
+        } else {
+            return s;
+        }
+    }
+}
+
+/// First 120 characters of `s`, so an error message cannot dump a
+/// multi-megabyte payload into the log.
+fn truncate_for_log(s: &str) -> String {
+    const LIMIT: usize = 120;
+    if s.chars().count() <= LIMIT {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(LIMIT).collect();
+    format!("{head}…")
 }
 
 /// Replay one row-level DML captured on a user table.
@@ -949,5 +1279,251 @@ mod tests {
         let blob = [0x02, 0x02, 0x01];
         let err = decode_sqlite_record(&blob).unwrap_err();
         assert!(err.to_string().contains("truncated"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Replayed-DDL allowlist.
+    // -----------------------------------------------------------------
+
+    /// Assert `sql` classifies as `want`.
+    #[track_caller]
+    fn accepts(sql: &str, want: SchemaObject) {
+        match classify_replayed_ddl(sql) {
+            Ok(got) => assert_eq!(got, want, "wrong object kind for: {sql}"),
+            Err(e) => panic!("legitimate schema DDL rejected: {sql}\n  error: {e}"),
+        }
+    }
+
+    /// Assert `sql` is refused.
+    #[track_caller]
+    fn rejects(sql: &str) {
+        assert!(
+            classify_replayed_ddl(sql).is_err(),
+            "allowlist admitted a statement it must refuse: {sql}"
+        );
+    }
+
+    #[test]
+    fn allowlist_accepts_the_stored_create_forms() {
+        accepts(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+            SchemaObject::Table,
+        );
+        accepts("CREATE INDEX idx_t_v ON t (v)", SchemaObject::Index);
+        accepts("CREATE UNIQUE INDEX idx_t_v ON t (v)", SchemaObject::Index);
+        accepts("CREATE VIEW v AS SELECT id FROM t", SchemaObject::View);
+        // Case and internal whitespace are not significant.
+        accepts("create   table  t (a)", SchemaObject::Table);
+        accepts("CREATE\n\tUNIQUE\n\tINDEX i ON t (a)", SchemaObject::Index);
+        // sqlite_schema stores the text as written, `IF NOT EXISTS` included.
+        accepts("CREATE TABLE IF NOT EXISTS t (a)", SchemaObject::Table);
+    }
+
+    #[test]
+    fn allowlist_accepts_a_trigger_but_only_to_skip_it() {
+        // A trigger body legitimately contains `;` between BEGIN and END,
+        // which is why triggers are exempt from the separator scan. The
+        // exemption is safe because `apply_ddl` never executes a trigger.
+        accepts(
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
+             INSERT INTO audit (who) VALUES (NEW.id); \
+             UPDATE counters SET n = n + 1; END",
+            SchemaObject::Trigger,
+        );
+    }
+
+    #[test]
+    fn trigger_exemption_does_not_execute_anything() {
+        // Consequence of the exemption, stated explicitly: a payload that
+        // opens with CREATE TRIGGER is not separator-scanned, so trailing
+        // SQL classifies as a trigger rather than erroring. That is not a
+        // hole — `apply_ddl` logs and returns without running any of it.
+        // If trigger replay is ever turned on, this test must flip to a
+        // rejection and the separator scan must cover triggers.
+        assert_eq!(
+            classify_replayed_ddl(
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END; \
+                 ATTACH DATABASE '/tmp/evil' AS evil"
+            )
+            .unwrap(),
+            SchemaObject::Trigger
+        );
+    }
+
+    #[test]
+    fn allowlist_rejects_attach_and_pragma() {
+        // The two that make this a security fix rather than tidiness:
+        // one opens a file of the peer's choosing, the other retargets
+        // the engine's behaviour.
+        rejects("ATTACH DATABASE '/tmp/evil.db' AS evil");
+        rejects("attach database '/etc/passwd' as p");
+        rejects("PRAGMA journal_mode = OFF");
+        rejects("pragma writable_schema = ON");
+    }
+
+    #[test]
+    fn allowlist_rejects_transaction_control_and_dml() {
+        rejects("BEGIN");
+        rejects("COMMIT");
+        rejects("ROLLBACK");
+        rejects("SAVEPOINT s");
+        rejects("RELEASE s");
+        rejects("INSERT INTO t VALUES (1)");
+        rejects("UPDATE t SET v = 'x'");
+        rejects("DELETE FROM t");
+        rejects("SELECT 1");
+        rejects("VACUUM");
+    }
+
+    #[test]
+    fn allowlist_rejects_drop_and_alter_text() {
+        // Neither can appear in sqlite_schema.sql: DROP arrives as a
+        // DELETE on the schema row (synthesized elsewhere), and ALTER
+        // surfaces as an UPDATE whose text is the rewritten CREATE.
+        rejects("DROP TABLE t");
+        rejects("ALTER TABLE t ADD COLUMN c INTEGER");
+    }
+
+    #[test]
+    fn allowlist_rejects_create_forms_outside_the_set() {
+        rejects("CREATE VIRTUAL TABLE t USING fts5(body)");
+        rejects("CREATE TEMP TABLE t (a)");
+        rejects("CREATE TEMPORARY VIEW v AS SELECT 1");
+        rejects("CREATE UNIQUE TABLE t (a)");
+        rejects("CREATE");
+        rejects("CREATE UNIQUE");
+    }
+
+    #[test]
+    fn allowlist_rejects_empty_and_keywordless_payloads() {
+        rejects("");
+        rejects("   \n\t ");
+        rejects("-- just a comment\n");
+        rejects("/* just a comment */");
+        rejects("'quoted'");
+        rejects("42");
+    }
+
+    #[test]
+    fn semicolon_smuggling_is_rejected() {
+        rejects("CREATE TABLE t (a); ATTACH DATABASE '/tmp/evil' AS evil");
+        rejects("CREATE TABLE t (a);PRAGMA writable_schema=ON");
+        rejects("CREATE INDEX i ON t (a); DROP TABLE users");
+        rejects("CREATE VIEW v AS SELECT 1; DELETE FROM users");
+        // Three statements, and the payload opens legitimately.
+        rejects("CREATE TABLE t (a); CREATE TABLE u (b); PRAGMA foo");
+    }
+
+    #[test]
+    fn comment_smuggling_is_rejected() {
+        // A comment must not be able to disguise the real first keyword…
+        rejects("/* CREATE TABLE t (a) */ ATTACH DATABASE '/tmp/e' AS e");
+        rejects("-- CREATE TABLE t (a)\nPRAGMA writable_schema=ON");
+        // …nor to hide a separator from the scan.
+        rejects("CREATE TABLE t (a); /* harmless */ DROP TABLE users");
+        rejects("CREATE TABLE t (a); -- note\nDROP TABLE users");
+    }
+
+    #[test]
+    fn comments_in_legitimate_positions_are_skipped_not_rejected() {
+        // sqlite_schema.sql stores the exact CREATE text an operator
+        // wrote, comments included; refusing them would make an ordinary
+        // database un-replicatable.
+        accepts(
+            "-- the widgets table\nCREATE TABLE t (a)",
+            SchemaObject::Table,
+        );
+        accepts(
+            "/* the widgets table */ CREATE TABLE t (a)",
+            SchemaObject::Table,
+        );
+        accepts("CREATE /* kind */ TABLE t (a)", SchemaObject::Table);
+        accepts(
+            "CREATE TABLE t (\n  a INTEGER -- the id\n)",
+            SchemaObject::Table,
+        );
+        accepts("CREATE TABLE t (a) -- trailing note", SchemaObject::Table);
+        // A `;` inside a comment is not a separator.
+        accepts(
+            "CREATE TABLE t (a) -- ; DROP TABLE users\n",
+            SchemaObject::Table,
+        );
+        accepts(
+            "CREATE TABLE t (a) /* ; DROP TABLE users */",
+            SchemaObject::Table,
+        );
+    }
+
+    #[test]
+    fn semicolons_inside_quoted_runs_are_not_separators() {
+        // Single-quoted literal, with the `''` escape form.
+        accepts(
+            "CREATE TABLE t (a TEXT DEFAULT 'x; DROP TABLE users')",
+            SchemaObject::Table,
+        );
+        accepts(
+            "CREATE TABLE t (a TEXT DEFAULT 'it''s; fine')",
+            SchemaObject::Table,
+        );
+        // All three identifier-quoting forms SQLite accepts.
+        accepts("CREATE TABLE \"odd;name\" (a)", SchemaObject::Table);
+        accepts("CREATE TABLE `odd;name` (a)", SchemaObject::Table);
+        accepts("CREATE TABLE [odd;name] (a)", SchemaObject::Table);
+        accepts("CREATE TABLE \"say \"\"hi\"\";\" (a)", SchemaObject::Table);
+    }
+
+    #[test]
+    fn unterminated_quotes_and_comments_are_rejected() {
+        // Unreasonable-about payloads do not get the benefit of the doubt.
+        rejects("CREATE TABLE t (a TEXT DEFAULT 'unterminated)");
+        rejects("CREATE TABLE \"unterminated (a)");
+        rejects("CREATE TABLE `unterminated (a)");
+        rejects("CREATE TABLE [unterminated (a)");
+        rejects("CREATE TABLE t (a) /* never closed");
+    }
+
+    #[test]
+    fn trailing_semicolon_is_tolerated() {
+        // SQLite does not store one, but refusing it would be pedantry.
+        accepts("CREATE TABLE t (a);", SchemaObject::Table);
+        accepts("CREATE TABLE t (a); \n ", SchemaObject::Table);
+        accepts("CREATE TABLE t (a); -- done", SchemaObject::Table);
+    }
+
+    // -----------------------------------------------------------------
+    // Empty-batch API.
+    // -----------------------------------------------------------------
+
+    fn row(change_id: i64, change_type: i64) -> CdcRow {
+        CdcRow {
+            change_id,
+            change_txn_id: Some(1),
+            change_type,
+            table_name: None,
+            id: None,
+            before: None,
+            after: None,
+            updates: None,
+        }
+    }
+
+    #[test]
+    fn commit_change_id_is_none_for_an_empty_batch() {
+        // Was an `expect`. A peer-decoded batch can be empty, and the
+        // task that applied it had no way to survive the panic.
+        assert_eq!(TxnBatch { rows: Vec::new() }.commit_change_id(), None);
+    }
+
+    #[test]
+    fn commit_change_id_reads_the_commit_row() {
+        let batch = TxnBatch {
+            rows: vec![
+                row(7, change_type::INSERT),
+                row(8, change_type::INSERT),
+                row(9, change_type::COMMIT),
+            ],
+        };
+        assert_eq!(batch.commit_change_id(), Some(9));
+        assert_eq!(batch.txn_id(), Some(1));
     }
 }
