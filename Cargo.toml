@@ -4,6 +4,7 @@ members = [
     "crates/litewire",
     "crates/litewire-backend",
     "crates/litewire-translate",
+    "crates/litewire-session",
     "crates/litewire-mysql",
     "crates/litewire-postgres",
     "crates/litewire-tds",
@@ -21,6 +22,7 @@ license = "MIT"
 # Internal crates
 litewire-backend = { path = "crates/litewire-backend" }
 litewire-translate = { path = "crates/litewire-translate" }
+litewire-session = { path = "crates/litewire-session" }
 litewire-mysql = { path = "crates/litewire-mysql" }
 litewire-postgres = { path = "crates/litewire-postgres" }
 litewire-tds = { path = "crates/litewire-tds" }

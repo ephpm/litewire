@@ -18,6 +18,11 @@
 //! ```
 
 pub use litewire_backend as backend;
+pub use litewire_session as session;
+/// The dialect-aware session layer -- translation, transaction-state
+/// tracking, and error mapping over one [`backend::BackendConn`] -- for
+/// embedders that execute SQL in-process instead of over a wire protocol.
+pub use litewire_session::{Session, SessionError, SessionOk, SessionResult};
 pub use litewire_translate as translate;
 
 #[cfg(feature = "mysql")]

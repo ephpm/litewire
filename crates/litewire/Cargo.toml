@@ -14,6 +14,7 @@ required-features = ["cli"]
 [dependencies]
 litewire-backend = { workspace = true }
 litewire-translate = { workspace = true }
+litewire-session = { workspace = true }
 litewire-mysql = { workspace = true, optional = true }
 litewire-postgres = { workspace = true, optional = true }
 litewire-tds = { workspace = true, optional = true }
