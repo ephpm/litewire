@@ -2021,6 +2021,7 @@ dependencies = [
  "litewire-hrana",
  "litewire-mysql",
  "litewire-postgres",
+ "litewire-session",
  "litewire-tds",
  "litewire-translate",
  "litewire-turso",
@@ -2073,6 +2074,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "litewire-backend",
+ "litewire-session",
  "litewire-translate",
  "opensrv-mysql",
  "thiserror 2.0.18",
@@ -2093,6 +2095,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "litewire-session"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "litewire-backend",
+ "litewire-translate",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

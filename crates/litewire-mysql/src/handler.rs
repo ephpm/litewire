@@ -2,12 +2,19 @@
 //!
 //! Implements `AsyncMysqlShim` to handle MySQL protocol commands including
 //! prepared statement prepare/execute/close.
+//!
+//! The handler is a thin wire codec: dialect translation, transaction-state
+//! tracking, error mapping, and backend execution all live in
+//! [`litewire_session::Session`]. Only MySQL packet framing and the
+//! prepared-statement cache remain here.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use litewire_backend::{BackendConn, BackendError, SharedBackend, Value};
-use litewire_translate::{self, Dialect, StatementKind, TranslateCache, TranslateResult, classify};
+use litewire_backend::{BackendError, ResultSet, SharedBackend, Value};
+use litewire_session::{Session, SessionError, SessionResult};
+use litewire_translate::{Dialect, StatementKind, TranslateCache};
 use opensrv_mysql::*;
 use tokio::io::AsyncWrite;
 use tracing::{debug, warn};
@@ -49,23 +56,40 @@ struct PreparedStmt {
 
 /// Handler for a single MySQL client connection.
 ///
-/// Owns a per-session [`BackendConn`] obtained from the shared factory
-/// at accept time. All statements from this MySQL client hit the same
-/// backend session, so `BEGIN`/`COMMIT`/`ROLLBACK` are properly isolated
-/// from other MySQL clients.
+/// A thin wire codec over [`Session`], which owns the per-session
+/// [`litewire_backend::BackendConn`] (obtained from the shared factory at
+/// accept time), dialect translation, transaction-state tracking, and error
+/// mapping. All statements from this MySQL client hit the same backend
+/// session, so `BEGIN`/`COMMIT`/`ROLLBACK` are properly isolated from other
+/// MySQL clients. Only MySQL-protocol state lives here: the
+/// prepared-statement cache and packet framing.
 pub struct LiteWireHandler {
-    /// Per-session backend handle. `Box<dyn BackendConn>` because
-    /// implementations vary (rusqlite vs. hrana) and we only need the
-    /// object-safe surface.
-    conn: Box<dyn BackendConn>,
-    /// Shared translation cache across all connections on this frontend.
-    translate_cache: Arc<TranslateCache>,
+    /// The dialect-aware session this connection delegates to.
+    session: Session,
     /// Prepared statements keyed by the statement ID assigned during `on_prepare`.
     stmts: HashMap<u32, PreparedStmt>,
     /// Next statement ID to assign.
     next_stmt_id: u32,
-    /// Whether the connection is inside an explicit transaction.
-    in_transaction: bool,
+}
+
+/// The handler *is* a session plus wire framing -- delegate the rest.
+///
+/// Gives internal callers (including this crate's tests) direct access to
+/// [`Session::conn`], [`Session::in_transaction`], and
+/// [`Session::translate_sql`] exactly as when that state lived on the
+/// handler itself.
+impl Deref for LiteWireHandler {
+    type Target = Session;
+
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+
+impl DerefMut for LiteWireHandler {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
 }
 
 impl LiteWireHandler {
@@ -83,145 +107,92 @@ impl LiteWireHandler {
     ) -> Result<Self, BackendError> {
         let conn = backend.connect().await?;
         Ok(Self {
-            conn,
-            translate_cache,
+            session: Session::with_cache(conn, Dialect::MySQL, translate_cache),
             stmts: HashMap::new(),
             next_stmt_id: 1,
-            in_transaction: false,
         })
     }
+}
 
-    /// Execute a query and write result set.
-    async fn do_query<W: AsyncWrite + Send + Unpin>(
-        &self,
-        sql: &str,
-        params: &[Value],
-        results: QueryResultWriter<'_, W>,
-    ) -> Result<(), std::io::Error> {
-        match self.conn.query(sql, params).await {
-            Ok(rs) => {
-                let columns: Vec<Column> = rs
-                    .columns
+/// Write a [`ResultSet`] in MySQL wire format.
+async fn write_result_set<W: AsyncWrite + Send + Unpin>(
+    rs: &ResultSet,
+    results: QueryResultWriter<'_, W>,
+) -> Result<(), std::io::Error> {
+    let columns: Vec<Column> = rs
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            // Declared type wins; for untyped expression columns
+            // (`SELECT 1`, decltype None) infer the wire type from
+            // the first non-NULL value so the declared column type
+            // matches how the row writer encodes it. Scan past
+            // leading NULLs; empty/all-NULL columns stay VAR_STRING
+            // (NULL is valid against any column type).
+            let coltype = if c.decltype.is_some() {
+                sqlite_to_mysql_column_type(c.decltype.as_deref())
+            } else {
+                rs.rows
                     .iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        // Declared type wins; for untyped expression columns
-                        // (`SELECT 1`, decltype None) infer the wire type from
-                        // the first non-NULL value so the declared column type
-                        // matches how the row writer encodes it. Scan past
-                        // leading NULLs; empty/all-NULL columns stay VAR_STRING
-                        // (NULL is valid against any column type).
-                        let coltype = if c.decltype.is_some() {
-                            sqlite_to_mysql_column_type(c.decltype.as_deref())
-                        } else {
-                            rs.rows
-                                .iter()
-                                .filter_map(|r| r.get(i))
-                                .find(|v| !matches!(v, Value::Null))
-                                .map_or(ColumnType::MYSQL_TYPE_VAR_STRING, mysql_type_for_value)
-                        };
-                        Column {
-                            table: String::new(),
-                            column: c.name.clone(),
-                            coltype,
-                            colflags: ColumnFlags::empty(),
-                        }
-                    })
-                    .collect();
-
-                let mut rw: RowWriter<'_, W> = results.start(&columns).await?;
-
-                for row in &rs.rows {
-                    for val in row {
-                        // Write each value in its native form so the binary
-                        // (prepared-statement) protocol accepts it against
-                        // the declared column type. Previously integers were
-                        // stringified, which worked only because every
-                        // column was declared as VAR_STRING. Now that
-                        // decltype flows through from `column_decltype`,
-                        // integer columns arrive at the wire as LONGLONG
-                        // and opensrv rejects a `String` payload.
-                        match val {
-                            Value::Null => rw.write_col(None::<&str>)?,
-                            Value::Integer(i) => rw.write_col(*i)?,
-                            Value::Float(f) => rw.write_col(*f)?,
-                            Value::Text(s) => rw.write_col(s.as_str())?,
-                            Value::Blob(b) => rw.write_col(b.as_slice())?,
-                        }
-                    }
-                    rw.end_row().await?;
-                }
-
-                rw.finish().await
+                    .filter_map(|r| r.get(i))
+                    .find(|v| !matches!(v, Value::Null))
+                    .map_or(ColumnType::MYSQL_TYPE_VAR_STRING, mysql_type_for_value)
+            };
+            Column {
+                table: String::new(),
+                column: c.name.clone(),
+                coltype,
+                colflags: ColumnFlags::empty(),
             }
-            Err(e) => write_backend_error(results, &e.to_string()).await,
+        })
+        .collect();
+
+    let mut rw: RowWriter<'_, W> = results.start(&columns).await?;
+
+    for row in &rs.rows {
+        for val in row {
+            // Write each value in its native form so the binary
+            // (prepared-statement) protocol accepts it against
+            // the declared column type. Previously integers were
+            // stringified, which worked only because every
+            // column was declared as VAR_STRING. Now that
+            // decltype flows through from `column_decltype`,
+            // integer columns arrive at the wire as LONGLONG
+            // and opensrv rejects a `String` payload.
+            match val {
+                Value::Null => rw.write_col(None::<&str>)?,
+                Value::Integer(i) => rw.write_col(*i)?,
+                Value::Float(f) => rw.write_col(*f)?,
+                Value::Text(s) => rw.write_col(s.as_str())?,
+                Value::Blob(b) => rw.write_col(b.as_slice())?,
+            }
         }
+        rw.end_row().await?;
     }
 
-    /// Execute a mutation and write OK response.
-    async fn do_execute<W: AsyncWrite + Send + Unpin>(
-        &self,
-        sql: &str,
-        params: &[Value],
-        results: QueryResultWriter<'_, W>,
-    ) -> Result<(), std::io::Error> {
-        match self.conn.execute(sql, params).await {
-            Ok(r) => {
-                // last_insert_rowid comes back as i64 -- clamp negatives (should
-                // never happen; SQLite rowids are always >= 1 for a real insert)
-                // to 0 rather than reinterpret via `as u64`.
-                let last_id_u64: u64 = r
-                    .last_insert_rowid
-                    .and_then(|v| u64::try_from(v.max(0)).ok())
-                    .unwrap_or(0);
-                let resp = ok_response(r.affected_rows, last_id_u64, self.in_transaction);
-                results.completed(resp).await
-            }
-            Err(e) => write_backend_error(results, &e.to_string()).await,
-        }
-    }
+    rw.finish().await
+}
 
-    /// Execute a transaction command (BEGIN/COMMIT/ROLLBACK) and update state.
-    async fn do_transaction<W: AsyncWrite + Send + Unpin>(
-        &mut self,
-        sql: &str,
-        results: QueryResultWriter<'_, W>,
-    ) -> Result<(), std::io::Error> {
-        match self.conn.execute(sql, &[]).await {
-            Ok(_) => {
-                let upper = sql.trim().to_ascii_uppercase();
-                if upper.starts_with("BEGIN") || upper.starts_with("START") {
-                    self.in_transaction = true;
-                } else if upper.starts_with("COMMIT") || upper.starts_with("ROLLBACK") {
-                    self.in_transaction = false;
-                }
-                let resp = ok_response(0, 0, self.in_transaction);
-                results.completed(resp).await
-            }
-            Err(e) => write_backend_error(results, &e.to_string()).await,
-        }
-    }
-
-    /// Translate SQL and return the first translated result, or an error string.
-    fn translate_sql(&self, query: &str) -> Result<(String, StatementKind), String> {
-        let translated =
-            litewire_translate::translate_cached(&self.translate_cache, query, Dialect::MySQL)
-                .map_err(|e| e.to_string())?;
-
-        let Some(result) = translated.into_iter().next() else {
-            return Ok((String::new(), StatementKind::Other));
-        };
-
-        match result {
-            TranslateResult::Noop => Ok((String::new(), StatementKind::Other)),
-            TranslateResult::Metadata(meta) => {
-                let sql = meta.to_sqlite_sql();
-                Ok((sql, StatementKind::Query))
-            }
-            TranslateResult::Sql(sql) => {
-                let kind = classify(&sql);
-                Ok((sql, kind))
-            }
+/// Write a [`SessionError`] as a MySQL error packet.
+///
+/// Backend errors go through [`error_map::classify`] exactly as before the
+/// Session extraction (the classified message is the one [`SessionError::Db`]
+/// carries, so the mapping is identical); translation errors become
+/// `ER_PARSE_ERROR` with the error's Display output.
+async fn write_session_error<W: AsyncWrite + Send + Unpin>(
+    results: QueryResultWriter<'_, W>,
+    err: &SessionError,
+) -> Result<(), std::io::Error> {
+    match err {
+        SessionError::Db { message, .. } => write_backend_error(results, message).await,
+        translate_err => {
+            results
+                .error(
+                    ErrorKind::ER_PARSE_ERROR,
+                    translate_err.to_string().as_bytes(),
+                )
+                .await
         }
     }
 }
@@ -275,10 +246,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
     ) -> Result<(), Self::Error> {
         debug!(sql = %query, "COM_STMT_PREPARE");
 
-        let (sqlite_sql, kind) = match self.translate_sql(query) {
+        let (sqlite_sql, kind) = match self.session.translate_sql(query) {
             Ok(r) => r,
             Err(e) => {
-                return info.error(ErrorKind::ER_PARSE_ERROR, e.as_bytes()).await;
+                return info
+                    .error(ErrorKind::ER_PARSE_ERROR, e.to_string().as_bytes())
+                    .await;
             }
         };
 
@@ -300,7 +273,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         // reads column metadata off the prepared statement without
         // executing it (was: `SELECT ... LIMIT 0` round trip).
         let columns = if kind == StatementKind::Query && !sqlite_sql.is_empty() {
-            match self.conn.describe_columns(&sqlite_sql).await {
+            match self.session.conn.describe_columns(&sqlite_sql).await {
                 Ok(cols) => cols
                     .iter()
                     .map(|c| Column {
@@ -372,14 +345,22 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         // Noop statements (empty SQL from SET NAMES etc.)
         if sql.is_empty() {
             return results
-                .completed(ok_response(0, 0, self.in_transaction))
+                .completed(ok_response(0, 0, self.session.in_transaction))
                 .await;
         }
 
-        match kind {
-            StatementKind::Query => self.do_query(&sql, &values, results).await,
-            StatementKind::Transaction => self.do_transaction(&sql, results).await,
-            _ => self.do_execute(&sql, &values, results).await,
+        match self.session.run_translated(&sql, kind, &values).await {
+            Ok(SessionResult::Rows(rs)) => write_result_set(&rs, results).await,
+            Ok(SessionResult::Ok(ok)) => {
+                results
+                    .completed(ok_response(
+                        ok.affected_rows,
+                        ok.last_insert_id,
+                        ok.in_transaction,
+                    ))
+                    .await
+            }
+            Err(e) => write_session_error(results, &e).await,
         }
     }
 
@@ -395,37 +376,25 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
     ) -> Result<(), Self::Error> {
         debug!(sql = %query, "COM_QUERY");
 
-        let translated = match litewire_translate::translate_cached(
-            &self.translate_cache,
-            query,
-            Dialect::MySQL,
-        ) {
-            Ok(r) => r,
+        match self.session.query(query, &[]).await {
+            Ok(SessionResult::Rows(rs)) => write_result_set(&rs, results).await,
+            // No-ops (SET NAMES, empty input) keep their historical framing:
+            // a default OK packet without the transaction status flag.
+            Ok(SessionResult::Ok(ok)) if ok.noop => results.completed(OkResponse::default()).await,
+            Ok(SessionResult::Ok(ok)) => {
+                results
+                    .completed(ok_response(
+                        ok.affected_rows,
+                        ok.last_insert_id,
+                        ok.in_transaction,
+                    ))
+                    .await
+            }
             Err(e) => {
-                warn!("SQL translation error: {e}");
-                return results
-                    .error(ErrorKind::ER_PARSE_ERROR, e.to_string().as_bytes())
-                    .await;
-            }
-        };
-
-        let Some(result) = translated.into_iter().next() else {
-            return results.completed(OkResponse::default()).await;
-        };
-
-        match result {
-            TranslateResult::Noop => results.completed(OkResponse::default()).await,
-            TranslateResult::Metadata(meta) => {
-                let sqlite_sql = meta.to_sqlite_sql();
-                self.do_query(&sqlite_sql, &[], results).await
-            }
-            TranslateResult::Sql(sqlite_sql) => {
-                let kind = classify(&sqlite_sql);
-                match kind {
-                    StatementKind::Query => self.do_query(&sqlite_sql, &[], results).await,
-                    StatementKind::Transaction => self.do_transaction(&sqlite_sql, results).await,
-                    _ => self.do_execute(&sqlite_sql, &[], results).await,
+                if matches!(e, SessionError::Translate(_)) {
+                    warn!("SQL translation error: {e}");
                 }
+                write_session_error(results, &e).await
             }
         }
     }
