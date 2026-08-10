@@ -1,6 +1,6 @@
 [package]
-name = "litewire-mysql"
-description = "MySQL wire protocol frontend for litewire"
+name = "litewire-session"
+description = "Dialect-aware SQL session layer for litewire frontends and embedders"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,14 +8,10 @@ license.workspace = true
 
 [dependencies]
 litewire-backend = { workspace = true }
-litewire-session = { workspace = true }
 litewire-translate = { workspace = true }
-async-trait = { workspace = true }
-opensrv-mysql = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 litewire-backend = { workspace = true, features = ["rusqlite"] }
 tokio = { workspace = true, features = ["full"] }

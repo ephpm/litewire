@@ -1,12 +1,13 @@
 //! Map litewire-backend error messages to real MySQL error codes.
 //!
-//! `BackendError` is a stringly-typed pass-through of the underlying
-//! rusqlite error (see `litewire-backend`), so this module works by matching
-//! substrings of the message text against the shape of `rusqlite::Error`'s
-//! Display impl and the SQLite constraint-failure message conventions.
+//! The classification logic lives in [`litewire_session::error_map`] (it was
+//! extracted there so embedders get the same mapping without a wire-protocol
+//! dependency); this module is the thin wire-side adapter that converts the
+//! numeric code into `opensrv-mysql`'s [`ErrorKind`].
 //!
-//! This is deliberately conservative: any error we can't classify falls back
-//! to `ER_UNKNOWN_ERROR` (1105 / HY000) so callers still see the raw text.
+//! The mapping is deliberately conservative: any error the classifier can't
+//! recognize falls back to `ER_UNKNOWN_ERROR` (1105 / HY000) so callers
+//! still see the raw text.
 //!
 //! Reference: <https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html>
 
@@ -30,67 +31,19 @@ pub struct MysqlError {
 
 /// Classify a backend error string into a `MysqlError`.
 ///
+/// Delegates to [`litewire_session::error_map::classify`] -- the single
+/// source of truth for the message-substring mapping -- and converts the
+/// numeric MySQL code to the wire [`ErrorKind`].
+///
 /// This function is pure and infallible; unknown errors return
 /// `ER_UNKNOWN_ERROR` (MySQL 1105).
 #[must_use]
 pub fn classify(err_msg: &str) -> MysqlError {
-    let lower = err_msg.to_ascii_lowercase();
-
-    // -- Locking / busy --------------------------------------------------------
-    // SQLITE_BUSY / SQLITE_LOCKED -> MySQL 1205 "Lock wait timeout exceeded"
-    // (SQLSTATE HY000). This is the closest analogue clients will actually
-    // retry on.
-    if lower.contains("database is locked")
-        || lower.contains("database table is locked")
-        || lower.contains("sqlite_busy")
-        || lower.contains("sqlite_locked")
-    {
-        return MysqlError {
-            code: ErrorKind::ER_LOCK_WAIT_TIMEOUT,
-            sqlstate: *b"HY000",
-            message: err_msg.to_string(),
-        };
-    }
-
-    // -- Constraint violations -------------------------------------------------
-    // Unique / primary key -> 1062 (SQLSTATE 23000).
-    if lower.contains("unique constraint failed") || lower.contains("primary key constraint failed")
-    {
-        return MysqlError {
-            code: ErrorKind::ER_DUP_ENTRY,
-            sqlstate: *b"23000",
-            message: err_msg.to_string(),
-        };
-    }
-
-    // Foreign key -> 1452 (SQLSTATE 23000).
-    if lower.contains("foreign key constraint failed") {
-        return MysqlError {
-            code: ErrorKind::ER_NO_REFERENCED_ROW_2,
-            sqlstate: *b"23000",
-            message: err_msg.to_string(),
-        };
-    }
-
-    // -- Read-only ------------------------------------------------------------
-    // SQLITE_READONLY -> 1290 "The MySQL server is running with the ...
-    // --read-only option so it cannot execute this statement" (HY000).
-    if lower.contains("attempt to write a readonly database")
-        || lower.contains("readonly database")
-        || lower.contains("sqlite_readonly")
-    {
-        return MysqlError {
-            code: ErrorKind::ER_OPTION_PREVENTS_STATEMENT,
-            sqlstate: *b"HY000",
-            message: err_msg.to_string(),
-        };
-    }
-
-    // Fallback.
+    let mapped = litewire_session::error_map::classify(err_msg);
     MysqlError {
-        code: ErrorKind::ER_UNKNOWN_ERROR,
-        sqlstate: *b"HY000",
-        message: err_msg.to_string(),
+        code: ErrorKind::from(mapped.code),
+        sqlstate: mapped.sqlstate,
+        message: mapped.message,
     }
 }
 
