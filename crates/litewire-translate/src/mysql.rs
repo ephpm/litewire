@@ -4,15 +4,18 @@
 //! DML rewrites (`ON DUPLICATE KEY UPDATE`, `LIMIT offset, count`), and
 //! MySQL-specific expressions.
 
+use std::ops::ControlFlow;
+
 use sqlparser::ast::{
-    DataType, DoUpdate, LimitClause, Offset, OffsetRows, OnConflict, OnConflictAction, OnInsert,
-    Statement,
+    DataType, DoUpdate, Expr, LimitClause, Offset, OffsetRows, OnConflict, OnConflictAction,
+    OnInsert, Statement, visit_expressions_mut,
 };
 
 use crate::TranslateError;
 
 /// Apply MySQL-specific rewrites to a statement in-place.
 pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
+    add_default_like_escape(stmt);
     match stmt {
         Statement::CreateTable(create) => {
             rewrite_create_table(create);
@@ -29,6 +32,42 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
         _ => {}
     }
     Ok(())
+}
+
+// ── LIKE: add MySQL's implicit ESCAPE '\' ────────────────────────────────────
+
+/// Give every `LIKE` / `NOT LIKE` (and `ILIKE`, should the parser produce
+/// one on this path) without an explicit `ESCAPE` clause the escape
+/// character MySQL always has active: the backslash.
+///
+/// MySQL treats `\` as the implicit `LIKE` escape character, so
+/// `wpdb::esc_like('50%')` emits the pattern `'50\%'` expecting `%` to
+/// match literally. SQLite's `LIKE` has *no* default escape character:
+/// without this rewrite the backslash matches literally and `%` stays a
+/// wildcard, so MySQL-escaped patterns match the wrong rows.
+///
+/// String literals cooperate: sqlparser's MySQL tokenizer implements
+/// MySQL's "backslash retained" rule for LIKE escapes (`'\%'` and `'\_'`
+/// keep their backslash, while other escapes like `\\` and `\n` are
+/// resolved), and the emitter only doubles single quotes when writing
+/// string literals back out. The SQLite pattern therefore carries the same
+/// `\%` / `\_` byte pairs that this `ESCAPE '\'` clause interprets — and a
+/// resolved `\\` arrives as one backslash, which MySQL's LIKE engine also
+/// treats as an escape, so both `'50\%'` and `'50\\%'` match a literal
+/// `%` exactly as they do on MySQL. Bound parameters reach SQLite
+/// verbatim, matching MySQL's binary-protocol behavior.
+///
+/// An explicit `ESCAPE` clause in the input (including MySQL's
+/// `ESCAPE ''`) is preserved untouched.
+fn add_default_like_escape(stmt: &mut Statement) {
+    let _: ControlFlow<()> = visit_expressions_mut(stmt, |expr| {
+        if let Expr::Like { escape_char, .. } | Expr::ILike { escape_char, .. } = expr {
+            if escape_char.is_none() {
+                *escape_char = Some("\\".to_string());
+            }
+        }
+        ControlFlow::Continue(())
+    });
 }
 
 /// Strip table qualifiers from UPDATE SET targets: MySQL accepts
@@ -803,5 +842,92 @@ mod tests {
         let results = translate("DELETE FROM users WHERE id = 1", Dialect::MySQL).unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.to_ascii_uppercase().contains("DELETE"), "got: {sql}");
+    }
+
+    // ── LIKE: MySQL implicit ESCAPE '\' ─────────────────────────────────────
+
+    #[test]
+    fn like_gains_default_escape() {
+        let results = translate("SELECT * FROM t WHERE name LIKE 'a%b'", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains(r"LIKE 'a%b' ESCAPE '\'"), "got: {sql}");
+    }
+
+    #[test]
+    fn not_like_gains_default_escape() {
+        let results =
+            translate("SELECT * FROM t WHERE name NOT LIKE 'a%b'", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains(r"NOT LIKE 'a%b' ESCAPE '\'"), "got: {sql}");
+    }
+
+    #[test]
+    fn ilike_gains_default_escape() {
+        let results = translate("SELECT * FROM t WHERE name ILIKE 'a%b'", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains(r"ILIKE 'a%b' ESCAPE '\'"), "got: {sql}");
+    }
+
+    #[test]
+    fn explicit_escape_clause_preserved() {
+        let results = translate(
+            "SELECT * FROM t WHERE name LIKE 'a|%b' ESCAPE '|'",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("ESCAPE '|'"), "got: {sql}");
+        assert!(!sql.contains(r"ESCAPE '\'"), "got: {sql}");
+    }
+
+    #[test]
+    fn like_escape_added_in_update_and_delete() {
+        let results =
+            translate("UPDATE t SET v = 1 WHERE name LIKE 'x\\_%'", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains(r"ESCAPE '\'"), "got: {sql}");
+
+        let results = translate("DELETE FROM t WHERE name LIKE '%\\%%'", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains(r"ESCAPE '\'"), "got: {sql}");
+    }
+
+    #[test]
+    fn like_escape_added_inside_subquery() {
+        let results = translate(
+            "SELECT * FROM t WHERE id IN (SELECT id FROM u WHERE k LIKE 'a\\%')",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains(r"ESCAPE '\'"), "got: {sql}");
+    }
+
+    #[test]
+    fn like_pattern_backslash_percent_survives_to_sqlite() {
+        // MySQL input `'50\%'`: the tokenizer's "backslash retained" rule
+        // keeps the `\%` pair, and the emitter must not mangle it — the
+        // emitted pattern literal carries a real backslash for ESCAPE to see.
+        let results = translate(r"SELECT * FROM t WHERE v LIKE '50\%'", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains(r"'50\%'"), "got: {sql}");
+        assert!(sql.contains(r"ESCAPE '\'"), "got: {sql}");
+    }
+
+    #[test]
+    fn like_bound_parameter_gains_escape() {
+        let results = translate("SELECT * FROM t WHERE v LIKE ?", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains(r"LIKE ? ESCAPE '\'"), "got: {sql}");
+    }
+
+    #[test]
+    fn postgres_like_untouched() {
+        // The implicit-backslash rule is MySQL semantics; the PostgreSQL
+        // path must not gain an ESCAPE clause.
+        let results =
+            translate("SELECT * FROM t WHERE name LIKE 'a%b'", Dialect::PostgreSQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(!sql.to_ascii_uppercase().contains("ESCAPE"), "got: {sql}");
     }
 }
