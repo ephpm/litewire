@@ -256,16 +256,24 @@ fn rewrite_values_call_to_excluded(expr: &mut sqlparser::ast::Expr) {
 // ── LIMIT offset, count -> LIMIT count OFFSET offset ────────────────────────
 
 /// Rewrite MySQL's `LIMIT offset, count` to standard `LIMIT count OFFSET offset`.
+///
+/// Every other clause shape is put back untouched. (This previously
+/// `take()`-ed the clause and only restored the comma form, silently
+/// dropping a plain `LIMIT n` / `LIMIT n OFFSET m` from the emitted SQL —
+/// so LIMITed MySQL queries returned every row.)
 fn rewrite_limit_clause(query: &mut sqlparser::ast::Query) {
-    if let Some(LimitClause::OffsetCommaLimit { offset, limit }) = query.limit_clause.take() {
-        query.limit_clause = Some(LimitClause::LimitOffset {
-            limit: Some(limit),
-            offset: Some(Offset {
-                value: offset,
-                rows: OffsetRows::None,
-            }),
-            limit_by: vec![],
-        });
+    match query.limit_clause.take() {
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+            query.limit_clause = Some(LimitClause::LimitOffset {
+                limit: Some(limit),
+                offset: Some(Offset {
+                    value: offset,
+                    rows: OffsetRows::None,
+                }),
+                limit_by: vec![],
+            });
+        }
+        other => query.limit_clause = other,
     }
 }
 
@@ -503,6 +511,25 @@ mod tests {
         // sqlparser may or may not preserve LIMIT in the emitted SQL for MySQL dialect.
         // The key assertion is: no spurious OFFSET is introduced.
         assert!(!upper.contains("OFFSET"), "unexpected OFFSET: {sql}");
+    }
+
+    #[test]
+    fn standard_limit_preserved() {
+        // rewrite_limit_clause once dropped every non-comma LIMIT clause
+        // (take() only restored the OffsetCommaLimit shape), so LIMITed
+        // queries returned all rows. Pin the fix.
+        let results = translate("SELECT * FROM t LIMIT 10", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(
+            sql.to_ascii_uppercase().contains("LIMIT 10"),
+            "LIMIT lost: {sql}"
+        );
+
+        let results = translate("SELECT * FROM t LIMIT 10 OFFSET 5", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        let upper = sql.to_ascii_uppercase();
+        assert!(upper.contains("LIMIT 10"), "LIMIT lost: {sql}");
+        assert!(upper.contains("OFFSET 5"), "OFFSET lost: {sql}");
     }
 
     // ── DDL: type rewrites ──────────────────────────────────────────────────

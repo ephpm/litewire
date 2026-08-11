@@ -261,9 +261,12 @@ fn rewrite_function(func: &mut Function) {
             ))]);
         }
         // FOUND_ROWS(): the paired SQL_CALC_FOUND_ROWS hint is stripped
-        // before parsing (SQLite cannot emulate it without per-session
-        // state), so return 0. Known semantic gap: WP-style pagination
-        // totals read 0; result sets themselves are unaffected.
+        // before parsing, and stateless translation cannot know the count.
+        // `litewire_session::Session` intercepts a bare `SELECT
+        // FOUND_ROWS()` before translation and answers it from session
+        // state (see `crate::found_rows`); this 0 shim only remains for
+        // FOUND_ROWS() calls embedded in larger expressions and for
+        // callers using `translate()` without a session.
         "FOUND_ROWS" => {
             // abs(0): single-argument scalar that SQLite accepts (coalesce
             // and max need >= 2 args).

@@ -13,7 +13,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use litewire_backend::{BackendError, ResultSet, SharedBackend, Value};
-use litewire_session::{Session, SessionError, SessionResult};
+use litewire_session::{Prepared, Session, SessionError, SessionResult};
 use litewire_translate::{Dialect, StatementKind, TranslateCache};
 use opensrv_mysql::*;
 use tokio::io::AsyncWrite;
@@ -46,14 +46,6 @@ fn ok_response(affected_rows: u64, last_insert_id: u64, in_transaction: bool) ->
 
 use crate::types::{mysql_type_for_value, sqlite_to_mysql_column_type};
 
-/// A cached prepared statement.
-struct PreparedStmt {
-    /// The translated SQLite SQL (with `?` placeholders).
-    sqlite_sql: String,
-    /// Whether this is a query (SELECT) or mutation (INSERT/UPDATE/DELETE).
-    kind: StatementKind,
-}
-
 /// Handler for a single MySQL client connection.
 ///
 /// A thin wire codec over [`Session`], which owns the per-session
@@ -67,7 +59,7 @@ pub struct LiteWireHandler {
     /// The dialect-aware session this connection delegates to.
     session: Session,
     /// Prepared statements keyed by the statement ID assigned during `on_prepare`.
-    stmts: HashMap<u32, PreparedStmt>,
+    stmts: HashMap<u32, Prepared>,
     /// Next statement ID to assign.
     next_stmt_id: u32,
 }
@@ -246,8 +238,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
     ) -> Result<(), Self::Error> {
         debug!(sql = %query, "COM_STMT_PREPARE");
 
-        let (sqlite_sql, kind) = match self.session.translate_sql(query) {
-            Ok(r) => r,
+        // `Session::prepare` is `translate_sql` plus the FOUND_ROWS
+        // session specials, so prepared `SELECT FOUND_ROWS()` /
+        // `SQL_CALC_FOUND_ROWS` statements behave like the text protocol.
+        let prepared = match self.session.prepare(query) {
+            Ok(p) => p,
             Err(e) => {
                 return info
                     .error(ErrorKind::ER_PARSE_ERROR, e.to_string().as_bytes())
@@ -256,7 +251,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         };
 
         // Count `?` placeholders in the translated SQL.
-        let param_count = sqlite_sql.chars().filter(|&c| c == '?').count();
+        let param_count = prepared.sqlite_sql.chars().filter(|&c| c == '?').count();
 
         let params: Vec<Column> = (0..param_count)
             .map(|_| Column {
@@ -272,8 +267,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         // backend's `describe_columns`, which on the rusqlite backend
         // reads column metadata off the prepared statement without
         // executing it (was: `SELECT ... LIMIT 0` round trip).
-        let columns = if kind == StatementKind::Query && !sqlite_sql.is_empty() {
-            match self.session.conn.describe_columns(&sqlite_sql).await {
+        let columns = if prepared.kind == StatementKind::Query && !prepared.sqlite_sql.is_empty() {
+            match self
+                .session
+                .conn
+                .describe_columns(&prepared.sqlite_sql)
+                .await
+            {
                 Ok(cols) => cols
                     .iter()
                     .map(|c| Column {
@@ -313,8 +313,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         let stmt_id = self.next_stmt_id;
         self.next_stmt_id += 1;
 
-        self.stmts
-            .insert(stmt_id, PreparedStmt { sqlite_sql, kind });
+        self.stmts.insert(stmt_id, prepared);
 
         info.reply(stmt_id, &params, &columns).await
     }
@@ -336,20 +335,14 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
                 .await;
         };
 
-        let sql = stmt.sqlite_sql.clone();
-        let kind = stmt.kind;
+        let stmt = stmt.clone();
 
         // Extract parameter values.
         let values: Vec<Value> = params.into_iter().map(param_to_value).collect();
 
-        // Noop statements (empty SQL from SET NAMES etc.)
-        if sql.is_empty() {
-            return results
-                .completed(ok_response(0, 0, self.session.in_transaction))
-                .await;
-        }
-
-        match self.session.run_translated(&sql, kind, &values).await {
+        // `execute_prepared` handles no-ops (empty SQL from SET NAMES
+        // etc.) itself, returning the same OK the old inline check framed.
+        match self.session.execute_prepared(&stmt, &values).await {
             Ok(SessionResult::Rows(rs)) => write_result_set(&rs, results).await,
             Ok(SessionResult::Ok(ok)) => {
                 results
