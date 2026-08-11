@@ -36,8 +36,9 @@ tokio = { version = "1", features = ["full"] }
 opensrv-mysql = "0.7"
 pgwire = "0.28"
 
-# SQL parsing
-sqlparser = { version = "0.57", features = ["serde"] }
+# SQL parsing. `visitor` provides the derived AST walkers
+# (`visit_expressions_mut`) used by the MySQL LIKE-escape rewrite.
+sqlparser = { version = "0.57", features = ["serde", "visitor"] }
 
 # Backends. `column_decltype` exposes `Statement::columns()`, which we need
 # to fill in `Column.decltype` on empty result sets (an unexecuted prepared
