@@ -6,12 +6,14 @@
 pub mod cache;
 pub mod common;
 pub mod emit;
+pub mod found_rows;
 pub mod metadata;
 pub mod mysql;
 pub mod postgres;
 pub mod tds;
 
 pub use cache::TranslateCache;
+pub use found_rows::{calc_found_rows_count_sql, found_rows_select_column};
 
 use sqlparser::ast::Statement;
 use sqlparser::dialect::{MsSqlDialect, MySqlDialect, PostgreSqlDialect};
@@ -201,7 +203,7 @@ fn has_mysql_select_hint(sql: &str) -> bool {
 }
 
 /// Remove MySQL SELECT hint keywords outside string/identifier quotes.
-fn strip_mysql_select_hints(sql: &str) -> String {
+pub(crate) fn strip_mysql_select_hints(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut i = 0;
@@ -460,7 +462,10 @@ fn normalize_session_prefix(rest: &str) -> Option<String> {
 }
 
 /// Rewrite a parsed statement from the source dialect to SQLite-compatible form.
-fn rewrite_statement(mut stmt: Statement, dialect: Dialect) -> Result<Statement, TranslateError> {
+pub(crate) fn rewrite_statement(
+    mut stmt: Statement,
+    dialect: Dialect,
+) -> Result<Statement, TranslateError> {
     // Apply common rewrites (expressions, types).
     common::rewrite_statement(&mut stmt)?;
 

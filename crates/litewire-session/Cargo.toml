@@ -10,6 +10,7 @@ license.workspace = true
 litewire-backend = { workspace = true }
 litewire-translate = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

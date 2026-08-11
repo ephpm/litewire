@@ -17,10 +17,10 @@ pub mod error_map;
 
 use std::sync::Arc;
 
-use litewire_backend::{BackendConn, BackendError, ResultSet, Value};
+use litewire_backend::{BackendConn, BackendError, Column, ResultSet, Value};
 use litewire_translate::{
-    Dialect, StatementKind, TranslateCache, TranslateError, TranslateResult, classify,
-    translate_cached,
+    Dialect, StatementKind, TranslateCache, TranslateError, TranslateResult,
+    calc_found_rows_count_sql, classify, found_rows_select_column, translate_cached,
 };
 
 /// MySQL `ER_PARSE_ERROR` (SQLSTATE 42000) -- what translation failures map
@@ -108,6 +108,38 @@ pub enum SessionResult {
     Ok(SessionOk),
 }
 
+/// A statement prepared once via [`Session::prepare`] and executed any
+/// number of times via [`Session::execute_prepared`].
+///
+/// Unlike the raw [`Session::translate_sql`] + [`Session::run_translated`]
+/// pair, this carries the session-level specials that cannot be expressed
+/// in translated SQL alone -- `SELECT FOUND_ROWS()` (answered from session
+/// state) and `SQL_CALC_FOUND_ROWS` (triggers the extra `COUNT(*)` round
+/// trip after execution).
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    /// The translated SQLite SQL, `?` placeholders preserved. Empty for
+    /// dialect no-ops (`SET NAMES ...`). For a `SELECT FOUND_ROWS()` this
+    /// is an equivalent SQLite shim usable for column description, but it
+    /// is never executed.
+    pub sqlite_sql: String,
+    /// Classification of `sqlite_sql` for routing/framing decisions.
+    pub kind: StatementKind,
+    /// `FOUND_ROWS`-related special handling, if any.
+    special: Option<PreparedSpecial>,
+}
+
+/// Session-level special handling attached to a [`Prepared`] statement.
+#[derive(Debug, Clone)]
+enum PreparedSpecial {
+    /// A bare `SELECT FOUND_ROWS()`: executing it reads session state
+    /// instead of the backend. `column` is the result column name.
+    FoundRows { column: String },
+    /// The statement carried `SQL_CALC_FOUND_ROWS`: after executing it,
+    /// run `count_sql` (same parameter list) and store the total.
+    CalcFoundRows { count_sql: String },
+}
+
 /// A dialect-aware SQL session over one backend connection.
 ///
 /// One `Session` corresponds to one client (one MySQL wire connection, or
@@ -130,6 +162,9 @@ pub struct Session {
     /// introspection by wire codecs; it only drives status reporting, never
     /// backend behavior.
     pub in_transaction: bool,
+
+    /// What `SELECT FOUND_ROWS()` reports. See [`Session::found_rows`].
+    found_rows: u64,
 
     dialect: Dialect,
     cache: Arc<TranslateCache>,
@@ -157,6 +192,7 @@ impl Session {
         Self {
             conn,
             in_transaction: false,
+            found_rows: 0,
             dialect,
             cache,
         }
@@ -166,6 +202,29 @@ impl Session {
     #[must_use]
     pub fn dialect(&self) -> Dialect {
         self.dialect
+    }
+
+    /// The value the session's next `SELECT FOUND_ROWS()` will report.
+    ///
+    /// Implemented MySQL subset (the part WordPress and friends rely on):
+    ///
+    /// * After a `SELECT SQL_CALC_FOUND_ROWS ...`, this is the total row
+    ///   count the query would have produced without `LIMIT`/`OFFSET`
+    ///   (computed via one extra `COUNT(*)` round trip — only for
+    ///   statements that actually carried the hint).
+    /// * After any other statement returning rows (including metadata
+    ///   emulation), this is that result set's row count — MySQL's
+    ///   documented behavior for `SELECT`s without the hint.
+    /// * `SELECT FOUND_ROWS()` itself returns one row, so afterwards the
+    ///   value is 1, as on MySQL. Statements that return no result set
+    ///   leave the value unchanged; a fresh session reports 0.
+    ///
+    /// Not implemented: the hint inside multi-statement input, and
+    /// `LIMIT`/`OFFSET` given as bound placeholders — both fall back to
+    /// the plain returned-row count.
+    #[must_use]
+    pub fn found_rows(&self) -> u64 {
+        self.found_rows
     }
 
     /// Translate `query` and return the **first** translated statement as
@@ -182,7 +241,9 @@ impl Session {
     /// single-statement by protocol definition, and keeps that path's
     /// historical first-result-only behavior. Text-protocol statements
     /// should go through [`Session::query`], which executes *all*
-    /// translated statements.
+    /// translated statements -- and prepared statements are better served
+    /// by [`Session::prepare`] / [`Session::execute_prepared`], which add
+    /// the FOUND_ROWS session specials on top of this translation.
     ///
     /// # Errors
     ///
@@ -243,6 +304,16 @@ impl Session {
         sql: &str,
         params: &[Value],
     ) -> Result<SessionResult, SessionError> {
+        // A bare `SELECT FOUND_ROWS()` is answered from session state and
+        // never reaches the backend (see [`Session::found_rows`]).
+        if let Some(column) = found_rows_select_column(sql, self.dialect) {
+            return Ok(SessionResult::Rows(self.take_found_rows(column)));
+        }
+
+        // `None` for everything but statements carrying SQL_CALC_FOUND_ROWS
+        // (one allocation-free scan) -- non-calc queries pay no extra work.
+        let count_sql = calc_found_rows_count_sql(sql, self.dialect);
+
         let translated = translate_cached(&self.cache, sql, self.dialect)?;
 
         if translated.len() > 1 && !params.is_empty() {
@@ -260,7 +331,43 @@ impl Session {
             last = self.dispatch(result, params).await?;
         }
 
+        if let (Some(count_sql), SessionResult::Rows(_)) = (count_sql, &last) {
+            self.store_calc_found_rows(&count_sql, params).await;
+        }
+
         Ok(last)
+    }
+
+    /// Build the one-row result set for `SELECT FOUND_ROWS()` and update
+    /// the stored value to 1 (the `FOUND_ROWS` query itself returns one
+    /// row, which is what a subsequent call reports on MySQL too).
+    fn take_found_rows(&mut self, column: String) -> ResultSet {
+        let n = self.found_rows;
+        self.found_rows = 1;
+        ResultSet {
+            columns: vec![Column {
+                name: column,
+                decltype: Some("INTEGER".to_string()),
+            }],
+            rows: vec![vec![Value::Integer(i64::try_from(n).unwrap_or(i64::MAX))]],
+        }
+    }
+
+    /// Run the derived `COUNT(*)` statement for a `SQL_CALC_FOUND_ROWS`
+    /// query and store the total. Best-effort: the main statement already
+    /// succeeded, so a failure here logs and keeps the fallback value (the
+    /// returned-row count) rather than failing the whole query.
+    async fn store_calc_found_rows(&mut self, count_sql: &str, params: &[Value]) {
+        match self.conn.query(count_sql, params).await {
+            Ok(rs) => {
+                if let Some(Value::Integer(n)) = rs.rows.first().and_then(|row| row.first()) {
+                    self.found_rows = u64::try_from(*n).unwrap_or(0);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(sql = %count_sql, "SQL_CALC_FOUND_ROWS count query failed: {e}");
+            }
+        }
     }
 
     /// Execute one already-translated SQLite statement of a known
@@ -291,6 +398,11 @@ impl Session {
                     .query(sql, params)
                     .await
                     .map_err(map_backend_err)?;
+                // MySQL's FOUND_ROWS() reports the most recent SELECT's
+                // returned-row count when it carried no
+                // SQL_CALC_FOUND_ROWS hint; callers handling the hint
+                // (query / execute_prepared) overwrite this afterwards.
+                self.found_rows = u64::try_from(rs.rows.len()).unwrap_or(u64::MAX);
                 Ok(SessionResult::Rows(rs))
             }
             StatementKind::Transaction => {
@@ -321,6 +433,81 @@ impl Session {
                 Ok(SessionResult::Ok(self.ok(r.affected_rows, last_id, false)))
             }
         }
+    }
+
+    /// Prepare `query` for repeated execution via
+    /// [`Session::execute_prepared`].
+    ///
+    /// This is [`Session::translate_sql`] plus detection of the
+    /// `FOUND_ROWS` specials, so prepared `SELECT FOUND_ROWS()` and
+    /// `SELECT SQL_CALC_FOUND_ROWS ...` statements behave exactly like
+    /// their text-protocol counterparts. Wire frontends should prefer this
+    /// pair over the raw translate/run methods.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Translate`] if the SQL cannot be parsed or
+    /// contains unsupported constructs.
+    pub fn prepare(&self, query: &str) -> Result<Prepared, SessionError> {
+        if let Some(column) = found_rows_select_column(query, self.dialect) {
+            // A valid SQLite equivalent so callers can describe columns
+            // and count placeholders; execute_prepared never runs it.
+            let sqlite_sql = format!("SELECT abs(0) AS \"{}\"", column.replace('"', "\"\""));
+            return Ok(Prepared {
+                sqlite_sql,
+                kind: StatementKind::Query,
+                special: Some(PreparedSpecial::FoundRows { column }),
+            });
+        }
+
+        let (sqlite_sql, kind) = self.translate_sql(query)?;
+        let special = calc_found_rows_count_sql(query, self.dialect)
+            .map(|count_sql| PreparedSpecial::CalcFoundRows { count_sql });
+        Ok(Prepared {
+            sqlite_sql,
+            kind,
+            special,
+        })
+    }
+
+    /// Execute a [`Prepared`] statement.
+    ///
+    /// Semantics match the text-protocol path statement-for-statement:
+    /// no-ops return OK without touching the backend, `SELECT
+    /// FOUND_ROWS()` is answered from session state, and a statement
+    /// prepared with `SQL_CALC_FOUND_ROWS` triggers the extra `COUNT(*)`
+    /// round trip that feeds [`Session::found_rows`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Db`] with the mapped MySQL error triple when
+    /// the backend rejects the statement.
+    pub async fn execute_prepared(
+        &mut self,
+        stmt: &Prepared,
+        params: &[Value],
+    ) -> Result<SessionResult, SessionError> {
+        if let Some(PreparedSpecial::FoundRows { column }) = &stmt.special {
+            let column = column.clone();
+            return Ok(SessionResult::Rows(self.take_found_rows(column)));
+        }
+
+        // Noop statements (empty SQL from SET NAMES etc.).
+        if stmt.sqlite_sql.is_empty() {
+            return Ok(SessionResult::Ok(self.ok(0, 0, true)));
+        }
+
+        let result = self
+            .run_translated(&stmt.sqlite_sql, stmt.kind, params)
+            .await?;
+
+        if let (Some(PreparedSpecial::CalcFoundRows { count_sql }), SessionResult::Rows(_)) =
+            (&stmt.special, &result)
+        {
+            self.store_calc_found_rows(count_sql, params).await;
+        }
+
+        Ok(result)
     }
 
     /// Execute a single [`TranslateResult`].
