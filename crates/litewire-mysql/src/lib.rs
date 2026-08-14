@@ -6,13 +6,14 @@
 
 mod error_map;
 mod handler;
+pub mod native_password;
 mod resultset;
 mod types;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use litewire_backend::{ConnectionLimiter, SharedBackend};
+use litewire_backend::{ConnectionLimiter, SharedAuthenticator, SharedBackend};
 use litewire_translate::TranslateCache;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -80,17 +81,50 @@ async fn refuse_too_many(stream: &mut tokio::net::TcpStream, limit: usize) {
     let _ = stream.shutdown().await;
 }
 
+/// How a connection accepted by this frontend gets its backend.
+#[derive(Clone)]
+enum BackendSource {
+    /// One backend for every connection, chosen when the frontend is built.
+    Fixed(SharedBackend),
+    /// Resolved per connection during the handshake, by embedder policy.
+    /// There is no default backend on this path.
+    PerConnection(SharedAuthenticator),
+}
+
 /// MySQL wire protocol frontend.
 pub struct MysqlFrontend {
     config: MysqlFrontendConfig,
-    backend: SharedBackend,
+    source: BackendSource,
 }
 
 impl MysqlFrontend {
-    /// Create a new MySQL frontend.
+    /// Create a new MySQL frontend serving one backend to every client.
     #[must_use]
     pub fn new(config: MysqlFrontendConfig, backend: SharedBackend) -> Self {
-        Self { config, backend }
+        Self {
+            config,
+            source: BackendSource::Fixed(backend),
+        }
+    }
+
+    /// Create a MySQL frontend whose connections are bound to a backend
+    /// chosen per connection by `authenticator`.
+    ///
+    /// The multi-tenant shape: one listener, many databases. The frontend
+    /// holds no backend of its own, so a connection whose handshake is not
+    /// accepted by `authenticator` has nothing to reach — see
+    /// [`ConnectionAuthenticator`](litewire_backend::ConnectionAuthenticator)
+    /// for the security contract you are signing up to, in particular why the
+    /// handshake username is a claim rather than an identity.
+    #[must_use]
+    pub fn new_authenticating(
+        config: MysqlFrontendConfig,
+        authenticator: SharedAuthenticator,
+    ) -> Self {
+        Self {
+            config,
+            source: BackendSource::PerConnection(authenticator),
+        }
     }
 
     /// Start accepting MySQL client connections.
@@ -102,14 +136,19 @@ impl MysqlFrontend {
     /// Returns an error if binding the listen address fails.
     pub async fn serve(self) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(self.config.listen).await?;
+        // The address actually bound, which differs from the configured one
+        // when port 0 was requested. This is what an authenticator keying on
+        // the listener must see, so read it back rather than echoing config.
+        let local_addr = listener.local_addr()?;
         let limiter = ConnectionLimiter::new(self.config.max_connections);
         info!(
-            listen = %self.config.listen,
+            listen = %local_addr,
             max_connections = ?limiter.limit(),
+            authenticating = matches!(self.source, BackendSource::PerConnection(_)),
             "MySQL frontend listening"
         );
 
-        let backend = Arc::clone(&self.backend);
+        let source = self.source.clone();
         // Shared parse+rewrite cache across every accepted connection.
         // Hot workloads (WordPress, Laravel) re-issue the same handful of
         // prepared statements repeatedly; caching drops sqlparser off the
@@ -140,7 +179,7 @@ impl MysqlFrontend {
             };
             debug!(%peer, live = limiter.live(), "MySQL client connected");
 
-            let be = Arc::clone(&backend);
+            let source = source.clone();
             let cache = Arc::clone(&translate_cache);
             tokio::spawn(async move {
                 // Moved in, never touched again: dropping the task -- for
@@ -149,11 +188,18 @@ impl MysqlFrontend {
                 // path that drops the handler and reclaims its session's
                 // worker thread.
                 let _slot = slot;
-                let handler = match LiteWireHandler::new(be, cache).await {
-                    Ok(h) => h,
-                    Err(e) => {
-                        warn!(%peer, "MySQL: failed to open backend session: {e}");
-                        return;
+                let handler = match source {
+                    BackendSource::Fixed(be) => match LiteWireHandler::new(be, cache).await {
+                        Ok(h) => h,
+                        Err(e) => {
+                            warn!(%peer, "MySQL: failed to open backend session: {e}");
+                            return;
+                        }
+                    },
+                    // No backend is opened yet: the handshake decides which
+                    // one (if any) this connection may have.
+                    BackendSource::PerConnection(auth) => {
+                        LiteWireHandler::new_authenticating(auth, cache, local_addr, peer)
                     }
                 };
                 let (reader, writer) = stream.into_split();

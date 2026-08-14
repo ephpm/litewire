@@ -68,6 +68,16 @@ clap = { version = "4", features = ["derive"] }
 
 # Misc
 async-trait = "0.1"
+# OS entropy for the per-connection `mysql_native_password` challenge. Chosen
+# over `rand` deliberately: this is the whole requirement, and `getrandom` is a
+# thin syscall shim with no generator state or distribution machinery to pull
+# in. litewire ships no other crypto — credential verification is the
+# embedder's job (see `litewire_backend::auth`).
+getrandom = "0.3"
+# SHA-1 is not a choice — `mysql_native_password` is defined in terms of it.
+# Used only to verify a client's challenge response (see
+# `litewire_mysql::native_password`), never to hash anything at rest.
+sha1 = "0.10"
 bytes = "1"
 base64 = "0.22"
 futures = "0.3"

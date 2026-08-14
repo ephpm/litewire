@@ -9,10 +9,12 @@
 //! prepared-statement cache remain here.
 
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 
-use litewire_backend::{BackendError, ResultSet, SharedBackend, Value};
+use litewire_backend::{
+    AuthRequest, BackendError, ResultSet, SharedAuthenticator, SharedBackend, Value,
+};
 use litewire_session::{Prepared, Session, SessionError, SessionResult};
 use litewire_translate::{Dialect, StatementKind, TranslateCache};
 use opensrv_mysql::*;
@@ -28,6 +30,12 @@ use crate::error_map;
 /// per connection is generous for real workloads and prevents a runaway client
 /// from exhausting memory via COM_STMT_PREPARE without matching COM_STMT_CLOSE.
 const MAX_PREPARED_STMTS_PER_CONN: usize = 1024;
+
+/// Length of a `mysql_native_password` challenge, in bytes.
+///
+/// Mirrors `opensrv_mysql`'s own `SCRAMBLE_SIZE`, which is private to that
+/// crate; it is fixed by the MySQL protocol, not a tunable.
+const SCRAMBLE_SIZE: usize = 20;
 
 /// Build an `OkResponse` with the correct transaction status flag.
 fn ok_response(affected_rows: u64, last_insert_id: u64, in_transaction: bool) -> OkResponse {
@@ -46,64 +54,168 @@ fn ok_response(affected_rows: u64, last_insert_id: u64, in_transaction: bool) ->
 
 use crate::types::{mysql_type_for_value, sqlite_to_mysql_column_type};
 
+/// Everything the authenticating (multi-tenant) path needs to resolve this
+/// connection's backend from its handshake.
+struct ConnAuth {
+    /// Embedder policy: verifies the handshake and picks the backend.
+    authenticator: SharedAuthenticator,
+    /// Handed to the [`Session`] once the backend is known.
+    translate_cache: Arc<TranslateCache>,
+    /// The listener this connection was accepted on -- the one handshake
+    /// input the client cannot forge.
+    local_addr: SocketAddr,
+    /// The client's address.
+    peer_addr: SocketAddr,
+    /// This connection's `mysql_native_password` challenge. Freshly random
+    /// per connection (see [`random_scramble`]), so an `auth_response`
+    /// captured from one connection is worthless against the next.
+    scramble: [u8; SCRAMBLE_SIZE],
+}
+
 /// Handler for a single MySQL client connection.
 ///
 /// A thin wire codec over [`Session`], which owns the per-session
-/// [`litewire_backend::BackendConn`] (obtained from the shared factory at
-/// accept time), dialect translation, transaction-state tracking, and error
-/// mapping. All statements from this MySQL client hit the same backend
-/// session, so `BEGIN`/`COMMIT`/`ROLLBACK` are properly isolated from other
-/// MySQL clients. Only MySQL-protocol state lives here: the
+/// [`litewire_backend::BackendConn`], dialect translation, transaction-state
+/// tracking, and error mapping. All statements from this MySQL client hit the
+/// same backend session, so `BEGIN`/`COMMIT`/`ROLLBACK` are properly isolated
+/// from other MySQL clients. Only MySQL-protocol state lives here: the
 /// prepared-statement cache and packet framing.
+///
+/// # Two ways a connection gets its backend
+///
+/// * **Fixed** ([`new`](Self::new)) -- the backend is chosen at accept time and
+///   the session is open before the handshake starts. The single-tenant path;
+///   unchanged.
+/// * **Authenticating** ([`new_authenticating`](Self::new_authenticating)) --
+///   there is *no* backend until [`AsyncMysqlShim::authenticate`] runs the
+///   embedder's [`ConnectionAuthenticator`](litewire_backend::ConnectionAuthenticator)
+///   and it returns one. Until then `session` is empty and **every** command
+///   is refused with `ER_ACCESS_DENIED_ERROR`.
+///
+/// # Why the authenticating path must fail closed, structurally
+///
+/// `opensrv-mysql` only invokes `authenticate()` when the client's handshake
+/// carries a username: its handshake code is wrapped in
+/// `if let Some(username) = &handshake.username`. A client that sends *no*
+/// username therefore skips authentication entirely and drops straight into
+/// the command loop. So "reject in `authenticate()`" is not sufficient on its
+/// own -- the guarantee has to be that a connection with no successful
+/// `authenticate()` has no backend to reach. That is why the session is an
+/// empty [`OnceLock`] rather than something pre-opened: there is no default
+/// backend on this path to fall back to, so the omitted-username handshake
+/// gets an access-denied error on its first command instead of somebody
+/// else's database.
 pub struct LiteWireHandler {
     /// The dialect-aware session this connection delegates to.
-    session: Session,
+    ///
+    /// Filled at construction on the fixed path; filled by `authenticate()` on
+    /// the authenticating path. Empty means "this connection has no backend" --
+    /// never "use the default one".
+    session: OnceLock<Session>,
+    /// `Some` on the authenticating path only.
+    auth: Option<ConnAuth>,
     /// Prepared statements keyed by the statement ID assigned during `on_prepare`.
     stmts: HashMap<u32, Prepared>,
     /// Next statement ID to assign.
     next_stmt_id: u32,
 }
 
-/// The handler *is* a session plus wire framing -- delegate the rest.
-///
-/// Gives internal callers (including this crate's tests) direct access to
-/// [`Session::conn`], [`Session::in_transaction`], and
-/// [`Session::translate_sql`] exactly as when that state lived on the
-/// handler itself.
-impl Deref for LiteWireHandler {
-    type Target = Session;
-
-    fn deref(&self) -> &Session {
-        &self.session
-    }
-}
-
-impl DerefMut for LiteWireHandler {
-    fn deref_mut(&mut self) -> &mut Session {
-        &mut self.session
-    }
-}
-
 impl LiteWireHandler {
     /// Open a fresh backend session for this MySQL client.
+    ///
+    /// The single-tenant path: this connection is bound to `backend` before
+    /// the handshake begins, and `authenticate()` accepts everyone (the
+    /// `opensrv-mysql` default). Behaviour is identical to every litewire
+    /// release before per-connection backends existed.
     ///
     /// # Errors
     ///
     /// Returns the backend's error verbatim if the underlying session
-    /// (e.g. a rusqlite `Connection` open or an sqld health probe) fails.
-    /// Callers should treat this as "reject the client" -- there is no
-    /// meaningful retry at this layer.
+    /// (e.g. a rusqlite `Connection` open) fails. Callers should treat this as
+    /// "reject the client" -- there is no meaningful retry at this layer.
     pub async fn new(
         backend: SharedBackend,
         translate_cache: Arc<TranslateCache>,
     ) -> Result<Self, BackendError> {
         let conn = backend.connect().await?;
+        let session = OnceLock::new();
+        let _ = session.set(Session::with_cache(conn, Dialect::MySQL, translate_cache));
         Ok(Self {
-            session: Session::with_cache(conn, Dialect::MySQL, translate_cache),
+            session,
+            auth: None,
             stmts: HashMap::new(),
             next_stmt_id: 1,
         })
     }
+
+    /// Build a handler whose backend is resolved during the handshake by
+    /// `authenticator`.
+    ///
+    /// Cannot fail and opens nothing: the multi-tenant path deliberately does
+    /// no backend work for a connection that has not authenticated yet.
+    #[must_use]
+    pub fn new_authenticating(
+        authenticator: SharedAuthenticator,
+        translate_cache: Arc<TranslateCache>,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            session: OnceLock::new(),
+            auth: Some(ConnAuth {
+                authenticator,
+                translate_cache,
+                local_addr,
+                peer_addr,
+                scramble: random_scramble(),
+            }),
+            stmts: HashMap::new(),
+            next_stmt_id: 1,
+        }
+    }
+
+    /// This connection's session, or `None` if it never authenticated.
+    pub(crate) fn session(&self) -> Option<&Session> {
+        self.session.get()
+    }
+
+    /// Mutable access to this connection's session, or `None` if it never
+    /// authenticated. Every command path goes through here, which is what
+    /// makes an unauthenticated connection structurally unable to reach a
+    /// backend.
+    fn session_mut(&mut self) -> Option<&mut Session> {
+        self.session.get_mut()
+    }
+}
+
+/// Error text for a command issued on a connection that never authenticated.
+const NOT_AUTHENTICATED: &str = "Access denied: connection is not authenticated";
+
+/// A fresh 20-byte `mysql_native_password` challenge.
+///
+/// Restricted to printable ASCII (`0x21..=0x7e`) because the handshake writes
+/// the scramble as a NUL-terminated string -- a random `0x00` byte would
+/// silently truncate the challenge the client hashes against, and the
+/// resulting `auth_response` would never verify. 20 bytes drawn from 94
+/// symbols is ~131 bits, far past what the 20-byte challenge needs.
+///
+/// This replaces the `opensrv-mysql` default, which is a **compile-time
+/// constant** shared by every connection ever made. A constant challenge makes
+/// `auth_response` a static function of the password, so anyone who observes
+/// one handshake can replay it forever. Only used on the authenticating path;
+/// the fixed path keeps the upstream default, since it does not check
+/// credentials at all.
+fn random_scramble() -> [u8; SCRAMBLE_SIZE] {
+    let mut raw = [0u8; SCRAMBLE_SIZE];
+    // A failure here means the OS entropy source is unavailable, which is not
+    // a condition this process can sensibly continue past: a predictable
+    // challenge would silently weaken every authentication that follows.
+    getrandom::fill(&mut raw).expect("OS entropy source unavailable");
+    for b in &mut raw {
+        // 94 printable symbols, 0x21..=0x7e.
+        *b = 0x21 + (*b % 94);
+    }
+    raw
 }
 
 /// Write a [`ResultSet`] in MySQL wire format.
@@ -231,6 +343,89 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         "8.0.36-litewire".to_string()
     }
 
+    /// The `mysql_native_password` challenge for this connection.
+    ///
+    /// Random per connection on the authenticating path (see
+    /// [`random_scramble`]); the upstream constant on the fixed path, which
+    /// verifies nothing and so has nothing to protect.
+    fn salt(&self) -> [u8; SCRAMBLE_SIZE] {
+        match &self.auth {
+            Some(auth) => auth.scramble,
+            // Reproduces the `opensrv-mysql` default verbatim.
+            None => {
+                let mut scramble = [0u8; SCRAMBLE_SIZE];
+                for (out, &b) in scramble.iter_mut().zip(b";X,po_k}>o6^Wz!/kM}N") {
+                    *out = if b == b'\0' || b == b'$' { b + 1 } else { b };
+                }
+                scramble
+            }
+        }
+    }
+
+    /// Resolve this connection's backend from its handshake.
+    ///
+    /// On the fixed path there is nothing to do: the backend was chosen at
+    /// accept time, so accept the client exactly as the `opensrv-mysql`
+    /// default does.
+    ///
+    /// On the authenticating path this is the *only* place a backend is ever
+    /// installed. The embedder's authenticator decides; `None` means the
+    /// connection is refused and — because the session stays empty — can reach
+    /// nothing even if the client keeps talking.
+    async fn authenticate(
+        &self,
+        auth_plugin: &str,
+        username: &[u8],
+        salt: &[u8],
+        auth_data: &[u8],
+    ) -> bool {
+        let Some(auth) = &self.auth else {
+            return true;
+        };
+
+        let request = AuthRequest {
+            auth_plugin,
+            username,
+            salt,
+            auth_response: auth_data,
+            local_addr: auth.local_addr,
+            peer_addr: auth.peer_addr,
+        };
+
+        let Some(backend) = auth.authenticator.authenticate(&request) else {
+            warn!(
+                user = %String::from_utf8_lossy(username),
+                peer = %auth.peer_addr,
+                "MySQL authentication rejected by authenticator"
+            );
+            return false;
+        };
+
+        // Open the session now rather than lazily on first query, so a backend
+        // that cannot be opened is reported as a failed *connection* instead of
+        // a confusing error on an arbitrary later statement.
+        let conn = match backend.connect().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!(
+                    user = %String::from_utf8_lossy(username),
+                    "MySQL: authenticated but failed to open backend session: {e}"
+                );
+                return false;
+            }
+        };
+
+        let session = Session::with_cache(conn, Dialect::MySQL, Arc::clone(&auth.translate_cache));
+        if self.session.set(session).is_err() {
+            // Unreachable: `opensrv-mysql` runs the handshake once per
+            // connection. Refuse rather than risk serving a connection whose
+            // session is not the one just authorised.
+            warn!("MySQL: authenticate() ran twice on one connection; refusing");
+            return false;
+        }
+        true
+    }
+
     async fn on_prepare<'a>(
         &'a mut self,
         query: &'a str,
@@ -238,10 +433,22 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
     ) -> Result<(), Self::Error> {
         debug!(sql = %query, "COM_STMT_PREPARE");
 
+        // Fail closed: no session means the handshake never authenticated
+        // (including the no-username handshake `opensrv-mysql` lets past
+        // `authenticate()` entirely). There is no backend to fall back to.
+        let Some(session) = self.session_mut() else {
+            return info
+                .error(
+                    ErrorKind::ER_ACCESS_DENIED_ERROR,
+                    NOT_AUTHENTICATED.as_bytes(),
+                )
+                .await;
+        };
+
         // `Session::prepare` is `translate_sql` plus the FOUND_ROWS
         // session specials, so prepared `SELECT FOUND_ROWS()` /
         // `SQL_CALC_FOUND_ROWS` statements behave like the text protocol.
-        let prepared = match self.session.prepare(query) {
+        let prepared = match session.prepare(query) {
             Ok(p) => p,
             Err(e) => {
                 return info
@@ -268,12 +475,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         // reads column metadata off the prepared statement without
         // executing it (was: `SELECT ... LIMIT 0` round trip).
         let columns = if prepared.kind == StatementKind::Query && !prepared.sqlite_sql.is_empty() {
-            match self
-                .session
-                .conn
-                .describe_columns(&prepared.sqlite_sql)
-                .await
-            {
+            match session.conn.describe_columns(&prepared.sqlite_sql).await {
                 Ok(cols) => cols
                     .iter()
                     .map(|c| Column {
@@ -326,6 +528,18 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
     ) -> Result<(), Self::Error> {
         debug!(stmt_id = id, "COM_STMT_EXECUTE");
 
+        // Fail closed -- see `on_prepare`. (Unreachable in practice, since
+        // `on_prepare` refuses first and the statement id would be unknown,
+        // but the guard is what makes the property structural.)
+        if self.session().is_none() {
+            return results
+                .error(
+                    ErrorKind::ER_ACCESS_DENIED_ERROR,
+                    NOT_AUTHENTICATED.as_bytes(),
+                )
+                .await;
+        }
+
         let Some(stmt) = self.stmts.get(&id) else {
             return results
                 .error(
@@ -342,7 +556,16 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
 
         // `execute_prepared` handles no-ops (empty SQL from SET NAMES
         // etc.) itself, returning the same OK the old inline check framed.
-        match self.session.execute_prepared(&stmt, &values).await {
+        let Some(session) = self.session_mut() else {
+            return results
+                .error(
+                    ErrorKind::ER_ACCESS_DENIED_ERROR,
+                    NOT_AUTHENTICATED.as_bytes(),
+                )
+                .await;
+        };
+
+        match session.execute_prepared(&stmt, &values).await {
             Ok(SessionResult::Rows(rs)) => write_result_set(&rs, results).await,
             Ok(SessionResult::Ok(ok)) => {
                 results
@@ -369,7 +592,18 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
     ) -> Result<(), Self::Error> {
         debug!(sql = %query, "COM_QUERY");
 
-        match self.session.query(query, &[]).await {
+        // Fail closed -- see `on_prepare`. This is the guard that stops a
+        // no-username handshake from running SQL.
+        let Some(session) = self.session_mut() else {
+            return results
+                .error(
+                    ErrorKind::ER_ACCESS_DENIED_ERROR,
+                    NOT_AUTHENTICATED.as_bytes(),
+                )
+                .await;
+        };
+
+        match session.query(query, &[]).await {
             Ok(SessionResult::Rows(rs)) => write_result_set(&rs, results).await,
             // No-ops (SET NAMES, empty input) keep their historical framing:
             // a default OK packet without the transaction status flag.
@@ -398,6 +632,19 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         writer: InitWriter<'a, W>,
     ) -> Result<(), Self::Error> {
         debug!(schema = %schema, "COM_INIT_DB (USE)");
+        // `USE <db>` is a no-op for litewire (one backend per connection, no
+        // schema switching) -- but on the authenticating path it must not
+        // report success to a connection that has no backend, or a client
+        // learns nothing until its first real query. More importantly, the
+        // schema name is client-asserted and never selects anything.
+        if self.session().is_none() {
+            return writer
+                .error(
+                    ErrorKind::ER_ACCESS_DENIED_ERROR,
+                    NOT_AUTHENTICATED.as_bytes(),
+                )
+                .await;
+        }
         writer.ok().await
     }
 }
@@ -413,6 +660,17 @@ mod tests {
     /// `LiteWireHandler::new` is async (it opens a per-connection backend
     /// session), so block on it here to keep the many synchronous unit tests
     /// below simple.
+    /// The session of a fixed-backend handler.
+    ///
+    /// The handler no longer `Deref`s to `Session`: a connection may now have
+    /// no session at all until it authenticates, so reaching the session is
+    /// fallible by design. Handlers built by the helpers below always have
+    /// one, hence the `expect`.
+    fn sess(h: &LiteWireHandler) -> &Session {
+        h.session()
+            .expect("a fixed-backend handler is constructed with its session already open")
+    }
+
     fn memory_handler() -> LiteWireHandler {
         let backend = Arc::new(Rusqlite::memory().unwrap()) as SharedBackend;
         let cache = Arc::new(TranslateCache::default());
@@ -469,7 +727,7 @@ mod tests {
     #[test]
     fn translate_simple_select() {
         let handler = memory_handler();
-        let (sql, kind) = handler.translate_sql("SELECT 1").unwrap();
+        let (sql, kind) = sess(&handler).translate_sql("SELECT 1").unwrap();
         assert!(!sql.is_empty());
         assert_eq!(kind, StatementKind::Query);
     }
@@ -477,7 +735,7 @@ mod tests {
     #[test]
     fn translate_select_from_table() {
         let handler = memory_handler();
-        let (sql, kind) = handler
+        let (sql, kind) = sess(&handler)
             .translate_sql("SELECT id, name FROM users WHERE id = 1")
             .unwrap();
         assert!(sql.to_ascii_lowercase().contains("select"));
@@ -487,7 +745,7 @@ mod tests {
     #[test]
     fn translate_insert() {
         let handler = memory_handler();
-        let (sql, kind) = handler
+        let (sql, kind) = sess(&handler)
             .translate_sql("INSERT INTO users (name) VALUES ('Alice')")
             .unwrap();
         assert!(sql.to_ascii_lowercase().contains("insert"));
@@ -497,7 +755,7 @@ mod tests {
     #[test]
     fn translate_update() {
         let handler = memory_handler();
-        let (sql, kind) = handler
+        let (sql, kind) = sess(&handler)
             .translate_sql("UPDATE users SET name = 'Bob' WHERE id = 1")
             .unwrap();
         assert!(sql.to_ascii_lowercase().contains("update"));
@@ -507,7 +765,7 @@ mod tests {
     #[test]
     fn translate_delete() {
         let handler = memory_handler();
-        let (sql, kind) = handler
+        let (sql, kind) = sess(&handler)
             .translate_sql("DELETE FROM users WHERE id = 1")
             .unwrap();
         assert!(sql.to_ascii_lowercase().contains("delete"));
@@ -517,7 +775,7 @@ mod tests {
     #[test]
     fn translate_create_table() {
         let handler = memory_handler();
-        let (sql, kind) = handler
+        let (sql, kind) = sess(&handler)
             .translate_sql("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(255))")
             .unwrap();
         assert!(sql.to_ascii_lowercase().contains("create"));
@@ -527,7 +785,7 @@ mod tests {
     #[test]
     fn translate_begin_returns_transaction() {
         let handler = memory_handler();
-        let (sql, kind) = handler.translate_sql("BEGIN").unwrap();
+        let (sql, kind) = sess(&handler).translate_sql("BEGIN").unwrap();
         assert!(sql.to_ascii_lowercase().contains("begin"));
         assert_eq!(kind, StatementKind::Transaction);
     }
@@ -535,7 +793,7 @@ mod tests {
     #[test]
     fn translate_commit_returns_transaction() {
         let handler = memory_handler();
-        let (sql, kind) = handler.translate_sql("COMMIT").unwrap();
+        let (sql, kind) = sess(&handler).translate_sql("COMMIT").unwrap();
         assert!(sql.to_ascii_lowercase().contains("commit"));
         assert_eq!(kind, StatementKind::Transaction);
     }
@@ -543,7 +801,7 @@ mod tests {
     #[test]
     fn translate_rollback_returns_transaction() {
         let handler = memory_handler();
-        let (sql, kind) = handler.translate_sql("ROLLBACK").unwrap();
+        let (sql, kind) = sess(&handler).translate_sql("ROLLBACK").unwrap();
         assert!(sql.to_ascii_lowercase().contains("rollback"));
         assert_eq!(kind, StatementKind::Transaction);
     }
@@ -551,7 +809,7 @@ mod tests {
     #[test]
     fn translate_set_names_returns_noop() {
         let handler = memory_handler();
-        let (sql, kind) = handler.translate_sql("SET NAMES utf8mb4").unwrap();
+        let (sql, kind) = sess(&handler).translate_sql("SET NAMES utf8mb4").unwrap();
         // Noop branch returns empty SQL and Other kind.
         assert!(sql.is_empty());
         assert_eq!(kind, StatementKind::Other);
@@ -560,7 +818,9 @@ mod tests {
     #[test]
     fn translate_set_character_set_returns_noop() {
         let handler = memory_handler();
-        let (sql, kind) = handler.translate_sql("SET CHARACTER SET utf8").unwrap();
+        let (sql, kind) = sess(&handler)
+            .translate_sql("SET CHARACTER SET utf8")
+            .unwrap();
         assert!(sql.is_empty());
         assert_eq!(kind, StatementKind::Other);
     }
@@ -568,7 +828,7 @@ mod tests {
     #[test]
     fn translate_show_tables_returns_metadata() {
         let handler = memory_handler();
-        let (sql, kind) = handler.translate_sql("SHOW TABLES").unwrap();
+        let (sql, kind) = sess(&handler).translate_sql("SHOW TABLES").unwrap();
         // Metadata branch returns a SQLite query and Query kind.
         assert!(!sql.is_empty());
         assert_eq!(kind, StatementKind::Query);
@@ -579,7 +839,9 @@ mod tests {
     #[test]
     fn translate_show_columns_returns_metadata() {
         let handler = memory_handler();
-        let (sql, kind) = handler.translate_sql("SHOW COLUMNS FROM users").unwrap();
+        let (sql, kind) = sess(&handler)
+            .translate_sql("SHOW COLUMNS FROM users")
+            .unwrap();
         assert!(!sql.is_empty());
         assert_eq!(kind, StatementKind::Query);
     }
@@ -587,14 +849,16 @@ mod tests {
     #[test]
     fn translate_invalid_sql_returns_error() {
         let handler = memory_handler();
-        let result = handler.translate_sql("NOT VALID SQL !!! @@@ {{{}}");
+        let result = sess(&handler).translate_sql("NOT VALID SQL !!! @@@ {{{}}");
         assert!(result.is_err());
     }
 
     #[test]
     fn translate_select_with_mysql_backticks() {
         let handler = memory_handler();
-        let (sql, kind) = handler.translate_sql("SELECT `id` FROM `users`").unwrap();
+        let (sql, kind) = sess(&handler)
+            .translate_sql("SELECT `id` FROM `users`")
+            .unwrap();
         assert!(!sql.is_empty());
         assert_eq!(kind, StatementKind::Query);
     }
@@ -602,7 +866,7 @@ mod tests {
     #[test]
     fn translate_select_with_limit() {
         let handler = memory_handler();
-        let (sql, kind) = handler
+        let (sql, kind) = sess(&handler)
             .translate_sql("SELECT * FROM users LIMIT 10")
             .unwrap();
         assert!(!sql.is_empty());
@@ -742,15 +1006,15 @@ mod tests {
         let handler = memory_handler_async().await;
         // Verify that the per-connection backend can execute BEGIN and COMMIT
         // without error.
-        handler.conn.execute("BEGIN", &[]).await.unwrap();
-        handler.conn.execute("COMMIT", &[]).await.unwrap();
+        sess(&handler).conn.execute("BEGIN", &[]).await.unwrap();
+        sess(&handler).conn.execute("COMMIT", &[]).await.unwrap();
     }
 
     #[tokio::test]
     async fn transaction_backend_begin_rollback() {
         let handler = memory_handler_async().await;
-        handler.conn.execute("BEGIN", &[]).await.unwrap();
-        handler.conn.execute("ROLLBACK", &[]).await.unwrap();
+        sess(&handler).conn.execute("BEGIN", &[]).await.unwrap();
+        sess(&handler).conn.execute("ROLLBACK", &[]).await.unwrap();
     }
 
     // ── handler construction ───────────────────────────────────────────────
@@ -758,7 +1022,7 @@ mod tests {
     #[test]
     fn handler_initial_state() {
         let handler = memory_handler();
-        assert!(!handler.in_transaction);
+        assert!(!sess(&handler).in_transaction);
         assert!(handler.stmts.is_empty());
         assert_eq!(handler.next_stmt_id, 1);
     }
