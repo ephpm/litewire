@@ -4,21 +4,26 @@
 //! incoming SQL from MySQL dialect to SQLite, executes against the backend,
 //! and returns results in MySQL wire format.
 
+mod command_filter;
 mod error_map;
 mod handler;
 pub mod native_password;
 mod resultset;
 mod types;
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
 
 use litewire_backend::{ConnectionLimiter, SharedAuthenticator, SharedBackend};
 use litewire_translate::TranslateCache;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
+use command_filter::CommandFilter;
 use handler::LiteWireHandler;
 
 /// MySQL server error code `ER_CON_COUNT_ERROR` -- "Too many connections".
@@ -79,6 +84,91 @@ async fn refuse_too_many(stream: &mut tokio::net::TcpStream, limit: usize) {
     let _ = stream.write_all(&packet).await;
     let _ = stream.flush().await;
     let _ = stream.shutdown().await;
+}
+
+/// One of several independent handles to the same accepted connection.
+///
+/// A MySQL connection needs three: the read half feeding
+/// [`CommandFilter`], the write half `opensrv-mysql` buffers its responses
+/// through, and a second write handle the filter answers intercepted
+/// commands on. `TcpStream::into_split` yields only two, so share the
+/// socket through an `Arc` and drive it with `TcpStream`'s `&self`
+/// readiness API instead.
+///
+/// Concurrent use is safe because the MySQL wire protocol is strictly
+/// half-duplex: `opensrv-mysql` flushes its writer at the end of every
+/// command and is then parked in `poll_read`, so the only moment the filter
+/// writes is a moment nothing else is writing.
+struct SocketHandle(Arc<TcpStream>);
+
+impl AsyncRead for SocketHandle {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            ready!(self.0.poll_read_ready(cx))?;
+            match self.0.try_read(buf.initialize_unfilled()) {
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                // Readiness is edge-triggered and can be stale; re-arm.
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for SocketHandle {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            ready!(self.0.poll_write_ready(cx))?;
+            match self.0.try_write(buf) {
+                Ok(n) => return Poll::Ready(Ok(n)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    /// Kept vectored so `opensrv-mysql` can still emit a packet's header and
+    /// payload in one call, as it did when this was an `OwnedWriteHalf`.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            ready!(self.0.poll_write_ready(cx))?;
+            match self.0.try_write_vectored(bufs) {
+                Ok(n) => return Poll::Ready(Ok(n)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    /// A TCP socket holds nothing back, so there is nothing to flush.
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    /// The connection is closed by dropping the last handle, which is what
+    /// happens when the per-connection task ends.
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// How a connection accepted by this frontend gets its backend.
@@ -188,6 +278,10 @@ impl MysqlFrontend {
                 // path that drops the handler and reclaims its session's
                 // worker thread.
                 let _slot = slot;
+                // Whether `COM_CHANGE_USER` may be answered with a no-op OK:
+                // safe when every connection reaches the same backend, not
+                // when a handshake selects one (see `CommandFilter`).
+                let single_backend = matches!(source, BackendSource::Fixed(_));
                 let handler = match source {
                     BackendSource::Fixed(be) => match LiteWireHandler::new(be, cache).await {
                         Ok(h) => h,
@@ -202,7 +296,20 @@ impl MysqlFrontend {
                         LiteWireHandler::new_authenticating(auth, cache, local_addr, peer)
                     }
                 };
-                let (reader, writer) = stream.into_split();
+                let reset_signal = handler.reset_signal();
+                // Three handles to one socket; see `SocketHandle`.
+                let stream = Arc::new(stream);
+                let reader = SocketHandle(Arc::clone(&stream));
+                let writer = SocketHandle(Arc::clone(&stream));
+                // Screen out the command packets `opensrv-mysql` would
+                // answer with a stray OK packet. Buffered so reassembling a
+                // packet header costs memory copies rather than syscalls.
+                let reader = CommandFilter::new(
+                    tokio::io::BufReader::with_capacity(8 * 1024, reader),
+                    SocketHandle(stream),
+                    reset_signal,
+                    single_backend,
+                );
                 // Coalesce the whole response into a single write.
                 //
                 // A result set is emitted by opensrv-mysql as several distinct
