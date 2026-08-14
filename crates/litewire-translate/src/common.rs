@@ -181,7 +181,7 @@ fn rewrite_expr(expr: &mut Expr) {
 }
 
 /// Helper to create a `ValueWithSpan` from a `Value`.
-fn value_expr(val: Value) -> Expr {
+pub(crate) fn value_expr(val: Value) -> Expr {
     Expr::Value(ValueWithSpan {
         value: val,
         span: sqlparser::tokenizer::Span::empty(),
@@ -189,14 +189,14 @@ fn value_expr(val: Value) -> Expr {
 }
 
 /// Helper to build a function name `ObjectName`.
-fn func_name(name: &str) -> ObjectName {
+pub(crate) fn func_name(name: &str) -> ObjectName {
     ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
         Ident::new(name),
     )])
 }
 
 /// Helper to build function args list.
-fn func_args(args: Vec<Expr>) -> FunctionArguments {
+pub(crate) fn func_args(args: Vec<Expr>) -> FunctionArguments {
     FunctionArguments::List(FunctionArgumentList {
         args: args
             .into_iter()

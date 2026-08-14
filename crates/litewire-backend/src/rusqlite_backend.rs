@@ -108,7 +108,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use regex::Regex;
 use rusqlite::Connection;
+use rusqlite::types::ValueRef;
 use tokio::sync::oneshot;
 
 use crate::{Backend, BackendConn, BackendError, Column, ExecuteResult, ResultSet, Value};
@@ -294,7 +296,79 @@ fn open_session(
         .map_err(|e| BackendError::Sqlite(e.to_string()))?;
     conn.pragma_update(None, "synchronous", synchronous.as_pragma_str())
         .map_err(|e| BackendError::Sqlite(e.to_string()))?;
+    register_regexp(&conn).map_err(|e| BackendError::Sqlite(e.to_string()))?;
     Ok(conn)
+}
+
+/// Register the `regexp` scalar function that SQLite's `X REGEXP Y` operator
+/// resolves to.
+///
+/// SQLite parses `REGEXP` but ships no implementation: the operator is
+/// defined as a call to a two-argument `regexp(pattern, haystack)` function
+/// the host application must supply, and without one every use fails with
+/// "no such function: regexp". MySQL clients do use it — WordPress's
+/// `populate_options()` deletes stale transients with
+/// `WHERE option_name REGEXP '^rss_...'` at install time.
+///
+/// # Semantics, and where they differ from MySQL
+///
+/// * The pattern syntax is the Rust `regex` crate's, which is the same
+///   engine Turso's built-in `regexp` uses, so both litewire backends agree.
+///   It is not MySQL's ICU syntax; the constructs WordPress and Laravel
+///   actually emit (anchors, classes, alternation, repetition) are common to
+///   both, but ICU-only extensions and backreferences are not supported.
+/// * Matching is case-sensitive. MySQL's `REGEXP` follows the column
+///   collation and is therefore case-insensitive under the usual
+///   `utf8mb4_general_ci`. Matching Turso's built-in was chosen over
+///   matching MySQL, so that one query cannot mean two things depending on
+///   which backend litewire was built with.
+/// * A `NULL` operand yields `NULL`, as in MySQL. Non-text operands are
+///   coerced to text, which is what MySQL's implicit conversion does.
+/// * An invalid pattern is an error rather than MySQL's error code 3692,
+///   but it is still an error and not a silent non-match.
+///
+/// Registered per session connection, and pooled handles keep it: parking a
+/// worker in [`IdlePool`] keeps the same `Connection` alive. It does not
+/// disturb the reuse fingerprint either — [`STATE_FINGERPRINT_SQL`] counts
+/// temp objects, attached databases and boolean PRAGMAs, none of which a
+/// function registration moves.
+fn register_regexp(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+
+    conn.create_scalar_function(
+        "regexp",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            // `X REGEXP Y` calls `regexp(Y, X)`: pattern first, subject
+            // second. Both NULL-propagate.
+            if matches!(ctx.get_raw(0), ValueRef::Null) || matches!(ctx.get_raw(1), ValueRef::Null)
+            {
+                return Ok(None);
+            }
+            // Cached per statement per argument by SQLite, so a constant
+            // pattern is compiled once for the whole scan rather than once
+            // per row.
+            let regex = ctx.get_or_create_aux(0, |pattern| {
+                Regex::new(&coerce_text(pattern).unwrap_or_default())
+            })?;
+            let Some(haystack) = coerce_text(ctx.get_raw(1)) else {
+                return Ok(None);
+            };
+            Ok(Some(regex.is_match(&haystack)))
+        },
+    )
+}
+
+/// Render a SQLite value as the text MySQL's `REGEXP` would have operated
+/// on. `None` only for `NULL`, which the caller turns into a `NULL` result.
+fn coerce_text(value: ValueRef<'_>) -> Option<String> {
+    match value {
+        ValueRef::Null => None,
+        ValueRef::Integer(i) => Some(i.to_string()),
+        ValueRef::Real(f) => Some(f.to_string()),
+        ValueRef::Text(t) | ValueRef::Blob(t) => Some(String::from_utf8_lossy(t).into_owned()),
+    }
 }
 
 /// The session worker's main loop.

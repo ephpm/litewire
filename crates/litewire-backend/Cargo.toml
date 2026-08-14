@@ -14,6 +14,7 @@ parking_lot = { workspace = true }
 # create a cycle.
 litewire-translate = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -29,7 +30,7 @@ tracing-subscriber = { workspace = true }
 
 [features]
 default = ["rusqlite"]
-rusqlite = ["dep:rusqlite"]
+rusqlite = ["dep:rusqlite", "dep:regex"]
 hrana-client = [
     "dep:reqwest",
     "dep:serde",

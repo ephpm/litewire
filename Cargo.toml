@@ -43,7 +43,10 @@ sqlparser = { version = "0.57", features = ["serde", "visitor"] }
 # Backends. `column_decltype` exposes `Statement::columns()`, which we need
 # to fill in `Column.decltype` on empty result sets (an unexecuted prepared
 # SELECT). Without it, wire-frontend type inference has to LIMIT-0 probe.
-rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
+# `functions` registers the `regexp` scalar that SQLite's `X REGEXP Y`
+# operator resolves to -- SQLite parses the operator but ships no
+# implementation of it.
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype", "functions"] }
 # Turso Database — the ground-up Rust rewrite of SQLite
 # (github.com/tursodatabase/turso). Pinned exactly: the engine is Beta and
 # API/behavior move between releases. 0.7.0 is the first non-pre release on
@@ -74,6 +77,10 @@ async-trait = "0.1"
 # in. litewire ships no other crypto — credential verification is the
 # embedder's job (see `litewire_backend::auth`).
 getrandom = "0.3"
+# Regex engine behind the `regexp` SQLite function (see
+# `litewire_backend::rusqlite_backend`). The same crate Turso's built-in
+# `regexp` uses, so pattern semantics agree across both backends.
+regex = "1"
 # SHA-1 is not a choice — `mysql_native_password` is defined in terms of it.
 # Used only to verify a client's challenge response (see
 # `litewire_mysql::native_password`), never to hash anything at rest.

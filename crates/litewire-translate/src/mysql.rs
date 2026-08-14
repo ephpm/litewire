@@ -7,15 +7,19 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    DataType, DoUpdate, Expr, LimitClause, Offset, OffsetRows, OnConflict, OnConflictAction,
-    OnInsert, Statement, visit_expressions_mut,
+    CastKind, DataType, DoUpdate, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    LimitClause, Offset, OffsetRows, OnConflict, OnConflictAction, OnInsert, Statement, Value,
+    visit_expressions_mut,
 };
 
 use crate::TranslateError;
+use crate::common::{func_args, func_name, value_expr};
 
 /// Apply MySQL-specific rewrites to a statement in-place.
 pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
     add_default_like_escape(stmt);
+    rewrite_date_part_functions(stmt);
+    normalize_regexp(stmt);
     match stmt {
         Statement::CreateTable(create) => {
             rewrite_create_table(create);
@@ -32,6 +36,109 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
         _ => {}
     }
     Ok(())
+}
+
+// ── YEAR() / MONTH() / DAYOFMONTH() ──────────────────────────────────────────
+
+/// The `strftime` format specifier a MySQL date-part function maps to.
+///
+/// `DAY` is MySQL's documented synonym for `DAYOFMONTH`, so both land on the
+/// same specifier. Deliberately absent: `DAYOFWEEK`, `DAYOFYEAR`, `WEEK` and
+/// friends, whose MySQL numbering does not line up with `strftime`'s and
+/// which would need arithmetic rather than a rename.
+fn strftime_specifier(name: &str) -> Option<&'static str> {
+    match name {
+        "YEAR" => Some("%Y"),
+        "MONTH" => Some("%m"),
+        "DAYOFMONTH" | "DAY" => Some("%d"),
+        _ => None,
+    }
+}
+
+/// The single argument of a function call, if it has exactly one positional
+/// argument. Anything else (no args, several, `DISTINCT`, a wildcard) is
+/// left for SQLite to reject rather than silently reinterpreted.
+fn single_positional_arg(args: &FunctionArguments) -> Option<&Expr> {
+    let FunctionArguments::List(list) = args else {
+        return None;
+    };
+    if list.args.len() != 1 || list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return None;
+    }
+    match &list.args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+        _ => None,
+    }
+}
+
+/// Translate MySQL's date-part functions to `strftime` calls.
+///
+/// `YEAR(post_date)` becomes `CAST(strftime('%Y', post_date) AS INTEGER)`.
+/// WordPress reaches for these in `wp_old_slug_redirect` and
+/// `redirect_guess_404_permalink`, whose date-guess queries compare the
+/// result against an integer from the URL.
+///
+/// The `CAST` is not decoration. MySQL's `YEAR()` returns an integer, while
+/// `strftime` returns text — and `'2024' = 2024` is false in SQLite, which
+/// applies no affinity to a function result. Without the cast the queries
+/// parse, run, and quietly match nothing. The cast also drops `strftime`'s
+/// leading zeros, so `MONTH()` yields 1..12 and `DAYOFMONTH()` 1..31 exactly
+/// as MySQL does.
+///
+/// `NULL` propagates: `strftime` returns `NULL` for a `NULL` or unparseable
+/// input and `CAST(NULL AS INTEGER)` is `NULL`, matching MySQL. An
+/// unparseable date is where the two differ — MySQL returns `NULL` too, but
+/// only after its own laxer parsing.
+fn rewrite_date_part_functions(stmt: &mut Statement) {
+    let _: ControlFlow<()> = visit_expressions_mut(stmt, |expr| {
+        let Expr::Function(func) = expr else {
+            return ControlFlow::Continue(());
+        };
+        let name = func.name.to_string().to_ascii_uppercase();
+        let Some(specifier) = strftime_specifier(&name) else {
+            return ControlFlow::Continue(());
+        };
+        let Some(arg) = single_positional_arg(&func.args) else {
+            return ControlFlow::Continue(());
+        };
+
+        let mut call = func.clone();
+        call.name = func_name("strftime");
+        call.args = func_args(vec![
+            value_expr(Value::SingleQuotedString(specifier.into())),
+            arg.clone(),
+        ]);
+        *expr = Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(Expr::Function(call)),
+            data_type: DataType::Integer(None),
+            format: None,
+        };
+        ControlFlow::Continue(())
+    });
+}
+
+// ── REGEXP / RLIKE ───────────────────────────────────────────────────────────
+
+/// Emit MySQL's `RLIKE` as `REGEXP`, the spelling SQLite understands.
+///
+/// The two are the same operator in MySQL, and sqlparser keeps which one was
+/// written so it can print it back. SQLite has only `REGEXP`, so normalise
+/// on that; `NOT REGEXP` survives, since SQLite's grammar takes an optional
+/// `NOT` in front of the operator too.
+///
+/// SQLite resolves `x REGEXP y` to a `regexp(y, x)` function call that the
+/// host application has to provide — litewire's rusqlite backend registers
+/// one, and Turso ships a built-in. Against a bare SQLite with neither, the
+/// statement fails with "no such function: regexp", which is the same
+/// outcome as before this rewrite and better than a silently wrong answer.
+fn normalize_regexp(stmt: &mut Statement) {
+    let _: ControlFlow<()> = visit_expressions_mut(stmt, |expr| {
+        if let Expr::RLike { regexp, .. } = expr {
+            *regexp = true;
+        }
+        ControlFlow::Continue(())
+    });
 }
 
 // ── LIKE: add MySQL's implicit ESCAPE '\' ────────────────────────────────────
@@ -956,5 +1063,102 @@ mod tests {
             translate("SELECT * FROM t WHERE name LIKE 'a%b'", Dialect::PostgreSQL).unwrap();
         let sql = extract_sql(&results[0]);
         assert!(!sql.to_ascii_uppercase().contains("ESCAPE"), "got: {sql}");
+    }
+
+    // ── Date-part functions ──────────────────────────────────────────────
+
+    #[test]
+    fn year_month_dayofmonth_become_strftime_casts() {
+        for (mysql_fn, specifier) in [
+            ("YEAR", "%Y"),
+            ("MONTH", "%m"),
+            ("DAYOFMONTH", "%d"),
+            ("DAY", "%d"),
+        ] {
+            let results = translate(
+                &format!("SELECT {mysql_fn}(post_date) FROM p"),
+                Dialect::MySQL,
+            )
+            .unwrap();
+            let sql = extract_sql(&results[0]);
+            assert!(
+                sql.contains(&format!("strftime('{specifier}', post_date)")),
+                "{mysql_fn}: got {sql}"
+            );
+            // The cast is what makes the result comparable to an integer.
+            assert!(
+                sql.to_ascii_uppercase().contains("AS INTEGER"),
+                "got: {sql}"
+            );
+            assert!(
+                !sql.to_ascii_uppercase().contains(&format!("{mysql_fn}(")),
+                "got: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_parts_translate_in_a_where_clause() {
+        // The shape `wp_old_slug_redirect` emits.
+        let results = translate(
+            "SELECT ID FROM wp_posts WHERE YEAR(post_date) = 2024 AND MONTH(post_date) = 3 \
+             AND DAYOFMONTH(post_date) = 17",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("strftime('%Y', post_date)"), "got: {sql}");
+        assert!(sql.contains("strftime('%m', post_date)"), "got: {sql}");
+        assert!(sql.contains("strftime('%d', post_date)"), "got: {sql}");
+    }
+
+    #[test]
+    fn date_parts_with_the_wrong_arity_are_left_alone() {
+        // Two arguments is not MySQL's YEAR(); rewriting it would invent
+        // semantics. Leave it for SQLite to reject.
+        let results = translate("SELECT YEAR(a, b) FROM t", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(!sql.contains("strftime"), "got: {sql}");
+    }
+
+    #[test]
+    fn date_parts_are_not_rewritten_for_postgres() {
+        // PostgreSQL has no YEAR(); its callers use EXTRACT. This rewrite is
+        // MySQL-only, like the LIKE escape above.
+        let results = translate("SELECT YEAR(d) FROM t", Dialect::PostgreSQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(!sql.contains("strftime"), "got: {sql}");
+    }
+
+    // ── REGEXP / RLIKE ───────────────────────────────────────────────────
+
+    #[test]
+    fn regexp_is_preserved() {
+        // The shape WordPress's populate_options() emits at install time.
+        let results = translate(
+            "DELETE FROM wp_options WHERE option_name REGEXP '^rss_[0-9a-f]{32}(_ts)?$'",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(
+            sql.contains("option_name REGEXP '^rss_[0-9a-f]{32}(_ts)?$'"),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn rlike_is_emitted_as_regexp() {
+        let results = translate("SELECT * FROM t WHERE v RLIKE '^a'", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("v REGEXP '^a'"), "got: {sql}");
+        assert!(!sql.to_ascii_uppercase().contains("RLIKE"), "got: {sql}");
+    }
+
+    #[test]
+    fn negated_regexp_keeps_its_not() {
+        let results = translate("SELECT * FROM t WHERE v NOT RLIKE '^a'", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("v NOT REGEXP '^a'"), "got: {sql}");
     }
 }
