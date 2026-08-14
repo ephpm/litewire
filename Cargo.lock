@@ -2043,6 +2043,7 @@ dependencies = [
  "litewire-hrana",
  "litewire-translate",
  "parking_lot",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

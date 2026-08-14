@@ -186,6 +186,20 @@ Rewrite rules are organized by category:
 - `ENGINE=InnoDB` -> stripped
 - `DEFAULT CHARSET=...` -> stripped
 
+**MySQL expressions** (`mysql.rs`):
+- `YEAR(x)` / `MONTH(x)` / `DAYOFMONTH(x)` / `DAY(x)` ->
+  `CAST(strftime('%Y'|'%m'|'%d', x) AS INTEGER)` (the cast matters: MySQL
+  returns an integer, and `'03' = 3` is false in SQLite)
+- `x RLIKE p` -> `x REGEXP p` (SQLite knows only the `REGEXP` spelling)
+- `LIKE` without `ESCAPE` -> `LIKE ... ESCAPE '\'` (MySQL's implicit escape)
+
+SQLite parses `REGEXP` but ships no implementation of it: the operator
+resolves to a `regexp(pattern, subject)` function the host must supply. The
+rusqlite backend registers one backed by the Rust `regex` crate, and the
+Turso engine ships an equivalent built-in, so `REGEXP` behaves the same on
+both. It is case-sensitive on both, where MySQL follows the column
+collation.
+
 **DML** (`mysql.rs`):
 - `INSERT ... ON DUPLICATE KEY UPDATE` -> `INSERT ... ON CONFLICT DO UPDATE`
 - `REPLACE INTO` -> passed through (SQLite supports it)

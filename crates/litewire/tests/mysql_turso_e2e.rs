@@ -103,3 +103,59 @@ async fn basic_crud_over_wire() {
 
     drop(conn);
 }
+
+/// `REGEXP` and the date-part functions work on the Turso backend too.
+///
+/// The two backends get `REGEXP` from different places — litewire registers
+/// a `regexp` scalar on its rusqlite connections, while Turso's engine ships
+/// one built in — so the claim that a translated statement means the same
+/// thing on both is worth holding down with a test rather than a comment.
+#[tokio::test]
+async fn wordpress_functions_over_wire() {
+    let port = free_port().await;
+    let _server = start_litewire_turso(port).await;
+    let mut conn = connect(port).await;
+
+    conn.query_drop("CREATE TABLE wp_options (option_id INTEGER PRIMARY KEY, option_name TEXT)")
+        .await
+        .unwrap();
+    for name in [
+        "rss_0123456789abcdef0123456789abcdef",
+        "rss_0123456789abcdef0123456789abcdef_ts",
+        "rss_not_a_hash",
+        "siteurl",
+    ] {
+        conn.exec_drop("INSERT INTO wp_options (option_name) VALUES (?)", (name,))
+            .await
+            .unwrap();
+    }
+
+    conn.query_drop("DELETE FROM wp_options WHERE option_name REGEXP '^rss_[0-9a-f]{32}(_ts)?$'")
+        .await
+        .unwrap();
+    let names: Vec<(String,)> = conn
+        .query("SELECT option_name FROM wp_options ORDER BY option_id")
+        .await
+        .unwrap();
+    assert_eq!(
+        names,
+        vec![("rss_not_a_hash".to_string(),), ("siteurl".to_string(),)]
+    );
+
+    conn.query_drop("CREATE TABLE wp_posts (ID INTEGER PRIMARY KEY, post_date TEXT)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO wp_posts (ID, post_date) VALUES (1, '2024-03-17 10:00:00')")
+        .await
+        .unwrap();
+    let ids: Vec<(i64,)> = conn
+        .query(
+            "SELECT ID FROM wp_posts WHERE YEAR(post_date) = 2024 AND MONTH(post_date) = 3 \
+             AND DAYOFMONTH(post_date) = 17",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![(1,)]);
+
+    drop(conn);
+}
