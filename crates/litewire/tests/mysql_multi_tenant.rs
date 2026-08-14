@@ -11,8 +11,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use litewire::backend::{AuthRequest, ConnectionAuthenticator, Rusqlite, SharedBackend};
+use litewire::backend::Rusqlite;
+use litewire::backend::SharedBackend;
 use litewire::litewire_mysql::native_password;
+use litewire::{AuthRequest, ConnectionAuthenticator};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder};
 use tokio::net::TcpListener;
@@ -30,8 +32,9 @@ struct Tenant {
 /// so a username on its own selects nothing.
 struct TenantDirectory(HashMap<Vec<u8>, Tenant>);
 
+#[litewire::async_trait]
 impl ConnectionAuthenticator for TenantDirectory {
-    fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend> {
+    async fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend> {
         let tenant = self.0.get(req.username)?;
         native_password::verify(&tenant.password_hash, req.salt, req.auth_response)
             .then(|| Arc::clone(&tenant.backend))
@@ -191,17 +194,19 @@ async fn unknown_username_is_denied() {
     assert_denied(&err);
 }
 
-/// The structural guarantee, tested at the protocol level.
+/// A hand-rolled handshake that names no tenant, then asks for data anyway.
 ///
-/// `opensrv-mysql` skips `authenticate()` entirely when the handshake carries
-/// no username, so a hand-rolled handshake can reach the command loop without
-/// ever being authorised. It must still find no backend: the connection is
-/// refused per-command instead of silently getting somebody's database.
+/// Written at the byte level because no real client offers "send an empty
+/// username" as an option, and the interesting question is what the *server*
+/// does with a handshake a client library would never produce.
 ///
-/// The handshake is written by hand because no real client offers "omit the
-/// username" as an option — that is precisely why it is worth testing.
+/// The answer must be: nothing readable. An empty username matches no tenant,
+/// the authenticator refuses, and the connection is closed at the handshake —
+/// and even if it were not, the connection holds no backend, so the command
+/// loop has nothing to serve. See the `LiteWireHandler` docs for why that
+/// second half is a structural property rather than a second check.
 #[tokio::test]
-async fn handshake_without_a_username_can_run_no_sql() {
+async fn handshake_with_an_empty_username_reads_nothing() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let port = free_port().await;
@@ -226,14 +231,18 @@ async fn handshake_without_a_username_can_run_no_sql() {
 
     // HandshakeResponse41 with an empty username and no auth response.
     let mut body: Vec<u8> = Vec::new();
-    // Capability flags: CLIENT_PROTOCOL_41 (0x200) | CLIENT_SECURE_CONNECTION
-    // (0x8000). Deliberately no CONNECT_WITH_DB and no PLUGIN_AUTH.
-    body.extend_from_slice(&0x0000_8200u32.to_le_bytes());
+    // CLIENT_PROTOCOL_41 (0x200) | CLIENT_SECURE_CONNECTION (0x8000) |
+    // CLIENT_PLUGIN_AUTH (0x80000). Naming the plugin we were offered avoids
+    // an auth-switch round trip, so the server decides on this packet alone.
+    // Deliberately no CONNECT_WITH_DB — there is no database name to hide
+    // behind.
+    body.extend_from_slice(&0x0008_8200u32.to_le_bytes());
     body.extend_from_slice(&0x0100_0000u32.to_le_bytes()); // max packet size
     body.push(33); // collation: utf8_general_ci
     body.extend_from_slice(&[0u8; 23]); // reserved
     body.push(0); // username: the empty NUL-terminated string
     body.push(0); // auth response length: 0
+    body.extend_from_slice(b"mysql_native_password\0");
 
     let mut packet = Vec::new();
     let len = u32::try_from(body.len()).unwrap();
@@ -242,7 +251,20 @@ async fn handshake_without_a_username_can_run_no_sql() {
     packet.extend_from_slice(&body);
     sock.write_all(&packet).await.unwrap();
 
-    // COM_QUERY: read the other tenants' data, if it will let us.
+    // Read the server's verdict *before* writing anything else. Sending into a
+    // socket the server has already closed provokes an RST, and an RST
+    // discards whatever is still sitting in our receive buffer — including the
+    // error packet this test is about.
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    if let Ok(Ok(n)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut chunk)).await
+    {
+        response.extend_from_slice(&chunk[..n]);
+    }
+
+    // Then ask for data anyway, and append whatever comes back (usually
+    // nothing: the connection is already gone).
     let sql = b"SELECT owner FROM secrets";
     let mut query = vec![0u8; 4];
     query.push(0x03);
@@ -250,28 +272,30 @@ async fn handshake_without_a_username_can_run_no_sql() {
     let qlen = u32::try_from(query.len() - 4).unwrap();
     query[..3].copy_from_slice(&qlen.to_le_bytes()[..3]);
     query[3] = 0; // sequence id
-    sock.write_all(&query).await.unwrap();
+    let _ = sock.write_all(&query).await;
 
-    let mut response = Vec::new();
-    // Either an error packet or a closed connection is acceptable; a result
-    // set is not.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        sock.read_to_end(&mut response),
-    )
-    .await;
+    if let Ok(Ok(n)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut chunk)).await
+    {
+        response.extend_from_slice(&chunk[..n]);
+    }
 
+    // The only thing that actually matters: no tenant's data came back.
+    for secret in [&b"a-secret"[..], b"b-secret"] {
+        assert!(
+            !contains(&response, secret),
+            "an unauthenticated connection read tenant data: {:?}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    // And it was refused, not merely starved: either at the handshake
+    // (`28000`, what happens today — the empty username matches no tenant) or
+    // per-command by the no-backend guard, depending on whether `authenticate`
+    // ran at all. Both are correct; a silent hang or an OK packet is not.
     assert!(
-        !response.windows(9).any(|w| w == b"a-secret\0") && !contains(&response, b"a-secret"),
-        "an unauthenticated connection read tenant data: {response:?}"
-    );
-    assert!(
-        !contains(&response, b"b-secret"),
-        "an unauthenticated connection read tenant data: {response:?}"
-    );
-    assert!(
-        response.is_empty() || contains(&response, b"not authenticated"),
-        "expected an access-denied error or a closed connection, got: {:?}",
+        contains(&response, b"28000") || contains(&response, b"not authenticated"),
+        "expected an access-denied error, got: {:?}",
         String::from_utf8_lossy(&response)
     );
 }

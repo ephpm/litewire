@@ -22,7 +22,9 @@ pub use litewire_backend as backend;
 /// listener in front of many databases. See the [`backend::auth`] module docs
 /// for the security contract before implementing
 /// [`ConnectionAuthenticator`](backend::ConnectionAuthenticator).
-pub use litewire_backend::{AuthRequest, ConnectionAuthenticator, SharedAuthenticator};
+pub use litewire_backend::{
+    AuthRequest, ConnectionAuthenticator, SharedAuthenticator, async_trait,
+};
 pub use litewire_session as session;
 /// The dialect-aware session layer -- translation, transaction-state
 /// tracking, and error mapping over one [`backend::BackendConn`] -- for

@@ -94,17 +94,28 @@ struct ConnAuth {
 ///
 /// # Why the authenticating path must fail closed, structurally
 ///
-/// `opensrv-mysql` only invokes `authenticate()` when the client's handshake
-/// carries a username: its handshake code is wrapped in
-/// `if let Some(username) = &handshake.username`. A client that sends *no*
-/// username therefore skips authentication entirely and drops straight into
-/// the command loop. So "reject in `authenticate()`" is not sufficient on its
-/// own -- the guarantee has to be that a connection with no successful
-/// `authenticate()` has no backend to reach. That is why the session is an
-/// empty [`OnceLock`] rather than something pre-opened: there is no default
-/// backend on this path to fall back to, so the omitted-username handshake
-/// gets an access-denied error on its first command instead of somebody
-/// else's database.
+/// `opensrv-mysql` invokes `authenticate()` *conditionally*: the call sits
+/// inside `if let Some(username) = &handshake.username`, and its handshake
+/// parser yields `username: None` on one branch -- a client that sets
+/// `CLIENT_SSL` before TLS is negotiated. Authentication is then skipped and
+/// the connection drops straight into the command loop.
+///
+/// In the current default build that branch is not reachable: `opensrv-mysql`
+/// enables its `tls` feature by default, and `init_after_ssl` re-reads and
+/// re-parses the handshake for a `CLIENT_SSL` client, which does produce a
+/// username. But the whole design's safety would then rest on a conditional
+/// inside a dependency, one feature flag away from inverting -- building
+/// `opensrv-mysql` with `default-features = false` drops `tls`, leaves that
+/// re-parse compiled out, and turns the `None` branch into an authentication
+/// bypass.
+///
+/// So "reject in `authenticate()`" is not the guarantee. The guarantee is that
+/// a connection with no successful `authenticate()` has no backend to reach:
+/// the session is an empty [`OnceLock`] that only `authenticate()` fills, there
+/// is no default backend on this path to fall back to, and every command path
+/// refuses when it is empty. An unauthorised connection then gets an
+/// access-denied error rather than somebody else's database, whatever upstream
+/// decides to do with that `if let`.
 pub struct LiteWireHandler {
     /// The dialect-aware session this connection delegates to.
     ///
@@ -392,7 +403,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
             peer_addr: auth.peer_addr,
         };
 
-        let Some(backend) = auth.authenticator.authenticate(&request) else {
+        let Some(backend) = auth.authenticator.authenticate(&request).await else {
             warn!(
                 user = %String::from_utf8_lossy(username),
                 peer = %auth.peer_addr,
@@ -669,6 +680,48 @@ mod tests {
     fn sess(h: &LiteWireHandler) -> &Session {
         h.session()
             .expect("a fixed-backend handler is constructed with its session already open")
+    }
+
+    /// A freshly-accepted authenticating connection holds no backend.
+    ///
+    /// This is the precondition the whole fail-closed argument rests on: if
+    /// construction ever pre-opened a session here, an unauthorised connection
+    /// would have something to reach and every command-path guard would become
+    /// decorative.
+    #[test]
+    fn an_authenticating_handler_starts_with_no_session() {
+        struct NeverAuthenticates;
+
+        #[async_trait::async_trait]
+        impl litewire_backend::ConnectionAuthenticator for NeverAuthenticates {
+            async fn authenticate(
+                &self,
+                _req: &litewire_backend::AuthRequest<'_>,
+            ) -> Option<SharedBackend> {
+                None
+            }
+        }
+
+        let handler = LiteWireHandler::new_authenticating(
+            Arc::new(NeverAuthenticates),
+            Arc::new(TranslateCache::default()),
+            "127.0.0.1:3306".parse().unwrap(),
+            "127.0.0.1:5555".parse().unwrap(),
+        );
+        assert!(handler.session().is_none());
+    }
+
+    /// Each connection gets its own challenge, so an `auth_response` captured
+    /// from one is worthless against another.
+    #[test]
+    fn each_authenticating_connection_gets_a_distinct_scramble() {
+        let a = random_scramble();
+        let b = random_scramble();
+        assert_ne!(a, b, "two connections drew the same challenge");
+        assert!(
+            a.iter().all(|&c| (0x21..=0x7e).contains(&c)),
+            "a NUL or non-printable byte would truncate the challenge on the wire"
+        );
     }
 
     fn memory_handler() -> LiteWireHandler {

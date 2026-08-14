@@ -100,11 +100,9 @@ pub struct AuthRequest<'a> {
 /// Chooses the backend a freshly-accepted connection is bound to, from its
 /// authenticated identity.
 ///
-/// Implementations must be cheap and non-blocking: this runs inline on the
-/// connection's task during the handshake.
-///
 /// See the [module docs](self) for the security contract — in particular, why
 /// returning a backend chosen from `username` alone is not isolation.
+#[async_trait::async_trait]
 pub trait ConnectionAuthenticator: Send + Sync + 'static {
     /// Verify `req` and return the backend this connection may use.
     ///
@@ -114,7 +112,17 @@ pub trait ConnectionAuthenticator: Send + Sync + 'static {
     /// no backend at all, so there is nothing to fall back to and nothing to
     /// leak. Failing closed is the frontend's job, not yours; just return
     /// `None`.
-    fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend>;
+    ///
+    /// Async because a multi-tenant implementation usually has to *find* the
+    /// backend — open a database file on first use, consult a registry, hit a
+    /// credential store. It runs inline on the connection's task, so it delays
+    /// only this connection's handshake, but do not park on a long lock here:
+    /// every tenant's first connection funnels through whatever you await.
+    ///
+    /// Verify the credential **before** doing that work. Resolving a backend
+    /// for a caller that has not proved anything turns an unauthenticated
+    /// handshake into a way to make the server open files.
+    async fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend>;
 }
 
 /// A shared [`ConnectionAuthenticator`], as the frontends hold it.
@@ -128,8 +136,9 @@ mod tests {
     /// per-tenant-listener topology from the module docs.
     struct ByListener(SocketAddr, SharedBackend);
 
+    #[async_trait::async_trait]
     impl ConnectionAuthenticator for ByListener {
-        fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend> {
+        async fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend> {
             (req.local_addr == self.0).then(|| Arc::clone(&self.1))
         }
     }
@@ -145,22 +154,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn authenticator_matching_its_listener_returns_a_backend() {
+    #[tokio::test]
+    async fn authenticator_matching_its_listener_returns_a_backend() {
         let mine: SocketAddr = "127.0.0.1:3306".parse().unwrap();
         let backend: SharedBackend = Arc::new(crate::Rusqlite::memory().unwrap());
         let auth = ByListener(mine, backend);
-        assert!(auth.authenticate(&request(mine)).is_some());
+        assert!(auth.authenticate(&request(mine)).await.is_some());
     }
 
     /// The same claimed username on a *different* listener gets nothing —
     /// the discriminator is the address, which the client cannot forge.
-    #[test]
-    fn authenticator_on_another_listener_is_denied() {
+    #[tokio::test]
+    async fn authenticator_on_another_listener_is_denied() {
         let mine: SocketAddr = "127.0.0.1:3306".parse().unwrap();
         let other: SocketAddr = "127.0.0.1:3307".parse().unwrap();
         let backend: SharedBackend = Arc::new(crate::Rusqlite::memory().unwrap());
         let auth = ByListener(mine, backend);
-        assert!(auth.authenticate(&request(other)).is_none());
+        assert!(auth.authenticate(&request(other)).await.is_none());
     }
 }
