@@ -88,15 +88,50 @@ mod tests {
 
     #[test]
     fn unknown_falls_back_to_1105() {
-        let e = classify("no such table: sprockets");
-        assert!(matches!(e.code, ErrorKind::ER_UNKNOWN_ERROR));
-        assert_eq!(&e.sqlstate, b"HY000");
+        // Re-fixtured alongside `litewire_session::error_map` (issue #22):
+        // `"no such table: ..."` is now deliberately classified as 1146, so
+        // it can no longer stand in for an unclassifiable error.
+        for msg in ["disk I/O error", "something the classifier never heard of"] {
+            let e = classify(msg);
+            assert!(matches!(e.code, ErrorKind::ER_UNKNOWN_ERROR), "{msg}");
+            assert_eq!(&e.sqlstate, b"HY000", "{msg}");
+        }
     }
 
     #[test]
     fn classify_preserves_message() {
+        // Narrowed to "the backend's text survives" because 1062 now
+        // carries a MySQL-shaped prefix (issue #22). Verbatim forwarding is
+        // still asserted for every classification that is not reshaped.
         let msg = "UNIQUE constraint failed: users.email";
         let e = classify(msg);
-        assert_eq!(e.message, msg);
+        assert!(e.message.contains(msg), "lost SQLite's text: {}", e.message);
+
+        for msg in ["database is locked", "no such table: sprockets"] {
+            assert_eq!(classify(msg).message, msg, "{msg} must be forwarded as-is");
+        }
+    }
+
+    /// The wire code and SQLSTATE a client actually receives for a missing
+    /// table.
+    ///
+    /// This is the reason the adapter is tested separately from the
+    /// classifier: the packet's SQLSTATE comes from
+    /// `ErrorKind::sqlstate()` inside `opensrv-mysql`, not from the
+    /// `sqlstate` field mapped here, so both have to agree.
+    #[test]
+    fn no_such_table_maps_to_1146() {
+        let e = classify("no such table: sprockets");
+        assert!(matches!(e.code, ErrorKind::ER_NO_SUCH_TABLE));
+        assert_eq!(&e.sqlstate, b"42S02");
+        assert_eq!(e.code.sqlstate(), b"42S02");
+    }
+
+    #[test]
+    fn duplicate_entry_message_reaches_the_wire_layer_reshaped() {
+        let e = classify("UNIQUE constraint failed: users.email");
+        assert!(matches!(e.code, ErrorKind::ER_DUP_ENTRY));
+        assert!(e.message.starts_with("Duplicate entry "), "{}", e.message);
+        assert!(e.message.contains("for key 'users.email'"), "{}", e.message);
     }
 }
