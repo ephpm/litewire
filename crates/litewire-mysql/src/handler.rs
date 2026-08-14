@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use litewire_backend::{
@@ -129,6 +130,10 @@ pub struct LiteWireHandler {
     stmts: HashMap<u32, Prepared>,
     /// Next statement ID to assign.
     next_stmt_id: u32,
+    /// Set by [`crate::command_filter::CommandFilter`] when the client sent
+    /// `COM_RESET_CONNECTION` or `COM_CHANGE_USER`; drained by
+    /// [`Self::apply_pending_reset`] before the next statement.
+    reset_pending: Arc<AtomicBool>,
 }
 
 impl LiteWireHandler {
@@ -156,6 +161,7 @@ impl LiteWireHandler {
             auth: None,
             stmts: HashMap::new(),
             next_stmt_id: 1,
+            reset_pending: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -182,7 +188,43 @@ impl LiteWireHandler {
             }),
             stmts: HashMap::new(),
             next_stmt_id: 1,
+            reset_pending: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The flag [`crate::command_filter::CommandFilter`] sets when the client
+    /// asks for a session reset.
+    pub(crate) fn reset_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.reset_pending)
+    }
+
+    /// Apply a `COM_RESET_CONNECTION` / `COM_CHANGE_USER` if one arrived.
+    ///
+    /// Both commands are defined to put the connection back into the state it
+    /// had just after connecting. Applying it here, at the start of the next
+    /// statement, rather than when the packet arrives, is what lets the
+    /// command filter answer it with `opensrv-mysql`'s own `OK` path: that
+    /// reply is written without the shim being called at all, so there is no
+    /// earlier point at which the handler runs.
+    ///
+    /// A rollback failure is deliberately swallowed. There is no packet to
+    /// report it on (the client has already been told `OK`), and the
+    /// alternative — leaving the flag set — would retry the rollback before
+    /// every subsequent statement.
+    async fn apply_pending_reset(&mut self) {
+        if !self.reset_pending.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        self.stmts.clear();
+        if let Some(session) = self.session_mut() {
+            if session.in_transaction {
+                if let Err(e) = session.query("ROLLBACK", &[]).await {
+                    warn!("MySQL: rollback during connection reset failed: {e}");
+                }
+                session.in_transaction = false;
+            }
+        }
+        debug!("MySQL connection state reset");
     }
 
     /// This connection's session, or `None` if it never authenticated.
@@ -446,6 +488,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         info: StatementMetaWriter<'a, W>,
     ) -> Result<(), Self::Error> {
         debug!(sql = %query, "COM_STMT_PREPARE");
+        self.apply_pending_reset().await;
 
         // Fail closed: no session means the handshake never authenticated
         // (including the no-username handshake `opensrv-mysql` lets past
@@ -541,6 +584,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
         debug!(stmt_id = id, "COM_STMT_EXECUTE");
+        self.apply_pending_reset().await;
 
         // Fail closed -- see `on_prepare`. (Unreachable in practice, since
         // `on_prepare` refuses first and the statement id would be unknown,
@@ -596,6 +640,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
 
     async fn on_close(&mut self, id: u32) {
         debug!(stmt_id = id, "COM_STMT_CLOSE");
+        self.apply_pending_reset().await;
         self.stmts.remove(&id);
     }
 
@@ -605,6 +650,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), Self::Error> {
         debug!(sql = %query, "COM_QUERY");
+        self.apply_pending_reset().await;
 
         // Fail closed -- see `on_prepare`. This is the guard that stops a
         // no-username handshake from running SQL.
@@ -646,6 +692,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         writer: InitWriter<'a, W>,
     ) -> Result<(), Self::Error> {
         debug!(schema = %schema, "COM_INIT_DB (USE)");
+        self.apply_pending_reset().await;
         // `USE <db>` is a no-op for litewire (one backend per connection, no
         // schema switching) -- but on the authenticating path it must not
         // report success to a connection that has no backend, or a client
