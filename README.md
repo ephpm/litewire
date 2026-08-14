@@ -93,6 +93,47 @@ async fn main() -> anyhow::Result<()> {
 
 The `HranaClient` backend connects to [sqld](https://github.com/tursodatabase/libsql) via HTTP, enabling embedded replicas and distributed SQLite clusters.
 
+### Multi-Tenant: One Listener, Many Databases
+
+SQLite has no `GRANT` and no per-schema ACL, so the database *file* is the only
+tenant boundary. `LiteWire::with_authenticator` lets one MySQL listener sit in
+front of many of them: the backend is chosen per connection, during the
+handshake, and a connection that is not accepted gets **no** backend at all.
+
+```rust
+use std::sync::Arc;
+use litewire::backend::{AuthRequest, ConnectionAuthenticator, SharedBackend};
+use litewire::litewire_mysql::native_password;
+
+struct Tenants { /* username -> (SHA1(SHA1(password)), backend) */ }
+
+impl ConnectionAuthenticator for Tenants {
+    fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend> {
+        let tenant = self.lookup(req.username)?;
+        // The username only selects a *candidate*; the password is what
+        // entitles the client to it.
+        native_password::verify(&tenant.password_hash, req.salt, req.auth_response)
+            .then(|| tenant.backend.clone())
+    }
+}
+
+LiteWire::with_authenticator(Arc::new(tenants))
+    .mysql("127.0.0.1:3306")
+    .serve()
+    .await
+```
+
+**The username in a handshake is a claim, not an identity** — a hostile client
+will happily type its neighbour's. Selecting a backend from it alone is not
+isolation. Bind the choice to something the client cannot forge: either a
+per-tenant secret (as above), or `req.local_addr` when tenants are separated by
+OS credentials and genuinely cannot reach each other's listener. See the
+`litewire_backend::auth` module docs for the full contract.
+
+MySQL is the only frontend that can resolve a backend per connection;
+`serve()` refuses to start if Hrana, PostgreSQL, or TDS is also configured
+under an authenticator, rather than quietly serving them one shared database.
+
 ## SQL Translation
 
 litewire translates MySQL and PostgreSQL SQL dialects to SQLite on the fly:
