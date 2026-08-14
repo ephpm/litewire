@@ -18,6 +18,13 @@
 //! ```
 
 pub use litewire_backend as backend;
+/// Per-connection backend selection, for embedders putting one litewire
+/// listener in front of many databases. See the [`backend::auth`] module docs
+/// for the security contract before implementing
+/// [`ConnectionAuthenticator`](backend::ConnectionAuthenticator).
+pub use litewire_backend::{
+    AuthRequest, ConnectionAuthenticator, SharedAuthenticator, async_trait,
+};
 pub use litewire_session as session;
 /// The dialect-aware session layer -- translation, transaction-state
 /// tracking, and error mapping over one [`backend::BackendConn`] -- for
@@ -51,9 +58,19 @@ use std::sync::Arc;
 
 use litewire_backend::SharedBackend;
 
+/// How the server picks the backend for an accepted connection.
+enum BackendSource {
+    /// One backend for every connection (the default, and every release
+    /// before per-connection backends existed).
+    Fixed(SharedBackend),
+    /// Chosen per connection during the handshake by embedder policy. Only
+    /// the MySQL frontend can do this; see [`LiteWire::with_authenticator`].
+    PerConnection(SharedAuthenticator),
+}
+
 /// Builder for a litewire server instance.
 pub struct LiteWire {
-    backend: SharedBackend,
+    source: BackendSource,
     max_connections: usize,
     #[cfg(feature = "mysql")]
     mysql_listen: Option<SocketAddr>,
@@ -67,9 +84,41 @@ pub struct LiteWire {
 
 impl LiteWire {
     /// Create a new litewire builder with the given backend.
+    ///
+    /// Every accepted connection talks to `backend`. This is the single-tenant
+    /// shape and is unchanged.
     pub fn new(backend: impl litewire_backend::Backend) -> Self {
+        Self::with_source(BackendSource::Fixed(Arc::new(backend)))
+    }
+
+    /// Create a builder with **no** fixed backend: each connection's backend is
+    /// chosen during its handshake by `authenticator`.
+    ///
+    /// The multi-tenant shape — one listener in front of many databases. A
+    /// connection the authenticator does not accept gets no backend at all and
+    /// is refused, so there is nothing to fall back to and nothing to leak.
+    ///
+    /// Read
+    /// [`ConnectionAuthenticator`](litewire_backend::ConnectionAuthenticator)'s
+    /// module docs before implementing one: the handshake username is a claim,
+    /// not an identity, and selecting a backend from it without verifying a
+    /// secret (or without a per-tenant listener that the client genuinely
+    /// cannot reach) is not isolation.
+    ///
+    /// # Frontend support
+    ///
+    /// Only the MySQL frontend can resolve a backend per connection.
+    /// [`serve`](Self::serve) **refuses to start** if a Hrana, PostgreSQL, or
+    /// TDS listener is also configured, rather than quietly serving them
+    /// something. Enable only [`mysql`](Self::mysql) with this constructor.
+    #[must_use]
+    pub fn with_authenticator(authenticator: SharedAuthenticator) -> Self {
+        Self::with_source(BackendSource::PerConnection(authenticator))
+    }
+
+    fn with_source(source: BackendSource) -> Self {
         Self {
-            backend: Arc::new(backend),
+            source,
             max_connections: 0,
             #[cfg(feature = "mysql")]
             mysql_listen: None,
@@ -158,47 +207,92 @@ impl LiteWire {
     pub async fn serve(self) -> anyhow::Result<()> {
         let mut handles: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
+        // Fail closed before binding anything. Only the MySQL frontend can
+        // resolve a backend per connection; the others would need a single
+        // shared backend, which in a multi-tenant deployment is precisely the
+        // hole `with_authenticator` exists to close. Refuse to start rather
+        // than serve one tenant's database on a port the operator believed
+        // was isolated.
+        if let BackendSource::PerConnection(_) = &self.source {
+            let mut unsupported: Vec<&str> = Vec::new();
+            #[cfg(feature = "hrana")]
+            if self.hrana_listen.is_some() {
+                unsupported.push("hrana");
+            }
+            #[cfg(feature = "postgres")]
+            if self.postgres_listen.is_some() {
+                unsupported.push("postgres");
+            }
+            #[cfg(feature = "tds")]
+            if self.tds_listen.is_some() {
+                unsupported.push("tds");
+            }
+            anyhow::ensure!(
+                unsupported.is_empty(),
+                "per-connection backend resolution (with_authenticator) is supported only by the \
+                 MySQL frontend; refusing to start with {} also configured, because those \
+                 frontends would need one shared backend for every client",
+                unsupported.join(", "),
+            );
+        }
+
         #[cfg(feature = "mysql")]
         if let Some(addr) = self.mysql_listen {
             let config = litewire_mysql::MysqlFrontendConfig {
                 listen: addr,
                 max_connections: self.max_connections,
             };
-            let frontend = litewire_mysql::MysqlFrontend::new(config, Arc::clone(&self.backend));
+            let frontend = match &self.source {
+                BackendSource::Fixed(backend) => {
+                    litewire_mysql::MysqlFrontend::new(config, Arc::clone(backend))
+                }
+                BackendSource::PerConnection(auth) => {
+                    litewire_mysql::MysqlFrontend::new_authenticating(config, Arc::clone(auth))
+                }
+            };
             handles.push(tokio::spawn(async move {
                 frontend.serve().await.map_err(Into::into)
             }));
         }
 
+        // The remaining frontends need one backend for every client, so they
+        // only start on the `Fixed` source. The `ensure!` above already
+        // rejected the other combination; matching here keeps that a
+        // type-level fact rather than an assumption.
+        #[cfg(any(feature = "hrana", feature = "postgres", feature = "tds"))]
+        let fixed_backend = match &self.source {
+            BackendSource::Fixed(backend) => Some(backend),
+            BackendSource::PerConnection(_) => None,
+        };
+
         #[cfg(feature = "hrana")]
-        if let Some(addr) = self.hrana_listen {
+        if let (Some(addr), Some(backend)) = (self.hrana_listen, fixed_backend) {
             let config = litewire_hrana::HranaFrontendConfig { listen: addr };
-            let frontend = litewire_hrana::HranaFrontend::new(config, Arc::clone(&self.backend));
+            let frontend = litewire_hrana::HranaFrontend::new(config, Arc::clone(backend));
             handles.push(tokio::spawn(async move {
                 frontend.serve().await.map_err(Into::into)
             }));
         }
 
         #[cfg(feature = "postgres")]
-        if let Some(addr) = self.postgres_listen {
+        if let (Some(addr), Some(backend)) = (self.postgres_listen, fixed_backend) {
             let config = litewire_postgres::PostgresFrontendConfig {
                 listen: addr,
                 max_connections: self.max_connections,
             };
-            let frontend =
-                litewire_postgres::PostgresFrontend::new(config, Arc::clone(&self.backend));
+            let frontend = litewire_postgres::PostgresFrontend::new(config, Arc::clone(backend));
             handles.push(tokio::spawn(async move {
                 frontend.serve().await.map_err(Into::into)
             }));
         }
 
         #[cfg(feature = "tds")]
-        if let Some(addr) = self.tds_listen {
+        if let (Some(addr), Some(backend)) = (self.tds_listen, fixed_backend) {
             let config = litewire_tds::TdsFrontendConfig {
                 listen: addr,
                 max_connections: self.max_connections,
             };
-            let frontend = litewire_tds::TdsFrontend::new(config, Arc::clone(&self.backend));
+            let frontend = litewire_tds::TdsFrontend::new(config, Arc::clone(backend));
             handles.push(tokio::spawn(async move {
                 frontend.serve().await.map_err(Into::into)
             }));

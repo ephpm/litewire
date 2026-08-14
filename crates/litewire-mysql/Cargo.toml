@@ -11,7 +11,9 @@ litewire-backend = { workspace = true }
 litewire-session = { workspace = true }
 litewire-translate = { workspace = true }
 async-trait = { workspace = true }
+getrandom = { workspace = true }
 opensrv-mysql = { workspace = true }
+sha1 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
