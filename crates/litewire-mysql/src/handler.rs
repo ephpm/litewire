@@ -349,9 +349,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
     /// The opensrv default is `5.1.10-alpha-msql-proxy`, which WordPress
     /// >= 6.5 rejects outright ("requires MySQL 5.5.5 or higher") — clients
     /// read this from `mysqli_get_server_info()`, not `SELECT VERSION()`.
-    /// Advertise a modern 8.0.x version, suffixed so it is identifiable.
+    ///
+    /// Shared with the emulated `SELECT VERSION()` and `@@version` through
+    /// [`litewire_translate::SERVER_VERSION`], so a client cannot get two
+    /// different answers depending on which one it asks.
     fn version(&self) -> String {
-        "8.0.36-litewire".to_string()
+        litewire_translate::SERVER_VERSION.to_string()
     }
 
     /// The `mysql_native_password` challenge for this connection.

@@ -3,7 +3,7 @@
 //! Handles `SHOW TABLES`, `SHOW COLUMNS`, `DESCRIBE`, `INFORMATION_SCHEMA`
 //! queries, and their T-SQL equivalents (`sys.tables`, `sp_tables`).
 
-use crate::Dialect;
+use crate::{Dialect, server_version};
 
 /// A detected metadata query that requires special handling.
 #[derive(Debug, Clone)]
@@ -184,7 +184,10 @@ fn system_variable_value(name: &str) -> &'static str {
         "character_set_server" => "'utf8mb4'",
         "collation_connection" => "'utf8mb4_general_ci'",
         "collation_server" => "'utf8mb4_general_ci'",
-        "version" => "'8.0.0-litewire'",
+        // Quoted here, but the value itself comes from `crate::SERVER_VERSION`
+        // via the macro so the handshake and `SELECT VERSION()` cannot drift
+        // away from `@@version` again (issue #21).
+        "version" => concat!('\'', server_version!(), '\''),
         "version_comment" => "'litewire'",
         "sql_mode" => "''",
         "lower_case_table_names" => "0",
@@ -638,7 +641,10 @@ mod tests {
         .to_sqlite_sql();
         assert!(sql.contains("@@version"), "got: {sql}");
         assert!(sql.contains("@@max_allowed_packet"), "got: {sql}");
-        assert!(sql.contains("8.0.0-litewire"), "got: {sql}");
+        // Deliberate behaviour change (issue #21): was `8.0.0-litewire`,
+        // which disagreed with the version the wire handshake advertises.
+        assert!(sql.contains(crate::SERVER_VERSION), "got: {sql}");
+        assert!(sql.contains("8.0.36-litewire"), "got: {sql}");
         assert!(sql.contains("67108864"), "got: {sql}");
     }
 
@@ -736,7 +742,8 @@ mod tests {
     #[test]
     fn known_system_variables_produce_expected_values() {
         let cases = vec![
-            ("version", "8.0.0-litewire"),
+            // Deliberate behaviour change (issue #21): was `8.0.0-litewire`.
+            ("version", "8.0.36-litewire"),
             ("max_allowed_packet", "67108864"),
             ("autocommit", "1"),
             ("character_set_client", "utf8mb4"),

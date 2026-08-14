@@ -15,6 +15,39 @@ pub mod tds;
 pub use cache::TranslateCache;
 pub use found_rows::{calc_found_rows_count_sql, found_rows_select_column};
 
+/// The MySQL server version litewire reports, as a bare string literal.
+///
+/// Exists as a macro rather than only a constant because one of the three
+/// places that needs it — the `@@version` fast path in [`metadata`] — splices
+/// SQL literals together at compile time and needs the value *quoted*, which
+/// `concat!` can only do with a literal. Prefer [`SERVER_VERSION`]; reach for
+/// the macro only where a constant will not do.
+macro_rules! server_version {
+    () => {
+        "8.0.36-litewire"
+    };
+}
+pub(crate) use server_version;
+
+/// The MySQL server version litewire reports, everywhere.
+///
+/// Three code paths answer "what version is this server?" and a client can
+/// hit any of them: the wire handshake (`mysqli_get_server_info()`,
+/// `PDO::ATTR_SERVER_VERSION`), the emulated `SELECT VERSION()`, and the
+/// `@@version` system variable (`wpdb::db_version()`). They used to disagree
+/// — the handshake said `8.0.36-litewire` while the two emulated paths said
+/// `8.0.0-litewire` — so a client's answer depended on which one it asked.
+/// See [issue #21](https://github.com/ephpm/litewire/issues/21).
+///
+/// This constant is the single source of truth for all three, so they cannot
+/// drift apart again.
+///
+/// The value is a real MySQL 8.0.x version with an identifying suffix. It
+/// has to be modern: WordPress >= 6.5 refuses to run against a server
+/// reporting below 5.5.5, and it reads that from the handshake rather than
+/// from `SELECT VERSION()`.
+pub const SERVER_VERSION: &str = server_version!();
+
 use sqlparser::ast::Statement;
 use sqlparser::dialect::{MsSqlDialect, MySqlDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
