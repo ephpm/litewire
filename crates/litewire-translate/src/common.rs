@@ -207,6 +207,34 @@ fn func_args(args: Vec<Expr>) -> FunctionArguments {
     })
 }
 
+/// Turn `func` into a call that evaluates to the constant string `text`.
+///
+/// The rewrite pass only ever sees the [`Function`] node, never its parent
+/// [`Expr`], so a built-in with no SQLite analogue cannot be replaced by a
+/// bare literal — it has to stay a function call. That call has to be one
+/// SQLite actually accepts with a single argument, which rules out the
+/// obvious `coalesce()`: SQLite requires at least two arguments and rejects
+/// `coalesce('x')` at prepare time with "wrong number of arguments". Every
+/// one of these built-ins used to emit exactly that, so none of them worked
+/// at runtime; the unit tests only ever inspected the emitted SQL string.
+///
+/// `trim()` takes one argument and returns it unchanged when there is no
+/// surrounding whitespace, which there never is in a constant we chose.
+fn constant_text(func: &mut Function, text: &str) {
+    func.name = func_name("trim");
+    func.args = func_args(vec![value_expr(Value::SingleQuotedString(text.into()))]);
+}
+
+/// Turn `func` into a call that evaluates to the constant number `number`.
+///
+/// `abs()` is the numeric counterpart to [`constant_text`]'s `trim()`: a
+/// single-argument SQLite scalar that returns a non-negative constant
+/// unchanged.
+fn constant_number(func: &mut Function, number: &str) {
+    func.name = func_name("abs");
+    func.args = func_args(vec![value_expr(Value::Number(number.into(), false))]);
+}
+
 /// Rewrite function calls to SQLite equivalents.
 fn rewrite_function(func: &mut Function) {
     let name_upper = func.name.to_string().to_ascii_uppercase();
@@ -246,19 +274,15 @@ fn rewrite_function(func: &mut Function) {
         // constant placeholders that mirror the values used by the metadata
         // fast path in `metadata::system_variable_value`.
         //   DATABASE() / SCHEMA()       -> 'main'
-        //   VERSION()                   -> '8.0.0-litewire'
+        //   VERSION()                   -> crate::SERVER_VERSION
         //   USER() / CURRENT_USER() /
         //   SESSION_USER() / SYSTEM_USER() -> 'root@localhost'
         //   CONNECTION_ID()             -> 0  (SQLite has no per-connection ID)
         "DATABASE" | "SCHEMA" => {
-            func.name = func_name("coalesce");
-            func.args = func_args(vec![value_expr(Value::SingleQuotedString("main".into()))]);
+            constant_text(func, "main");
         }
         "VERSION" => {
-            func.name = func_name("coalesce");
-            func.args = func_args(vec![value_expr(Value::SingleQuotedString(
-                "8.0.0-litewire".into(),
-            ))]);
+            constant_text(func, crate::SERVER_VERSION);
         }
         // FOUND_ROWS(): the paired SQL_CALC_FOUND_ROWS hint is stripped
         // before parsing, and stateless translation cannot know the count.
@@ -268,20 +292,13 @@ fn rewrite_function(func: &mut Function) {
         // FOUND_ROWS() calls embedded in larger expressions and for
         // callers using `translate()` without a session.
         "FOUND_ROWS" => {
-            // abs(0): single-argument scalar that SQLite accepts (coalesce
-            // and max need >= 2 args).
-            func.name = func_name("abs");
-            func.args = func_args(vec![value_expr(Value::Number("0".into(), false))]);
+            constant_number(func, "0");
         }
         "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => {
-            func.name = func_name("coalesce");
-            func.args = func_args(vec![value_expr(Value::SingleQuotedString(
-                "root@localhost".into(),
-            ))]);
+            constant_text(func, "root@localhost");
         }
         "CONNECTION_ID" => {
-            func.name = func_name("coalesce");
-            func.args = func_args(vec![value_expr(Value::Number("0".into(), false))]);
+            constant_number(func, "0");
         }
         "NEWID" => {
             // NEWID() -> lower(hex(randomblob(16)))
@@ -463,7 +480,13 @@ mod tests {
     fn version_rewrite() {
         let results = translate("SELECT VERSION()", Dialect::MySQL).unwrap();
         let sql = extract_sql(&results[0]);
-        assert!(sql.contains("8.0.0-litewire"), "got: {sql}");
+        // Deliberate behaviour change (issue #21): this used to answer
+        // `8.0.0-litewire` while the wire handshake advertised
+        // `8.0.36-litewire`. Asserted against the shared constant rather
+        // than a second copy of the literal, so this test cannot be the
+        // thing that lets them drift apart again.
+        assert!(sql.contains(crate::SERVER_VERSION), "got: {sql}");
+        assert!(sql.contains("8.0.36-litewire"), "got: {sql}");
     }
 
     #[test]
