@@ -2,11 +2,11 @@
 
 MySQL, PostgreSQL, SQL Server, and Hrana protocol proxy for SQLite. Connect your existing apps to SQLite without changing a line of code.
 
-litewire accepts connections from MySQL, PostgreSQL, SQL Server, and libsql SDK clients, translates the SQL dialect on the fly, and executes against a SQLite backend. Your app thinks it's talking to a real database server -- it's actually talking to SQLite.
+litewire accepts connections from MySQL, PostgreSQL, SQL Server, and Hrana HTTP clients, translates the SQL dialect on the fly, and executes against a SQLite backend. Your app thinks it's talking to a real database server -- it's actually talking to SQLite.
 
 ```
 PHP/Rails/Django (pdo_mysql, pdo_pgsql, pdo_sqlsrv)
-libsql SDK (Rust, JS, Python, Go)
+Hrana HTTP clients
         |
         v
    +---------+
@@ -27,11 +27,21 @@ libsql SDK (Rust, JS, Python, Go)
 
 ## Quick Start
 
+litewire is not on crates.io yet; build the CLI from this repository. The
+binary is behind the `cli` feature -- a plain `cargo build` produces no
+executable.
+
 ```bash
+# Build the CLI (MySQL + Hrana frontends are in the default feature set)
+cargo install --git https://github.com/ephpm/litewire litewire --features cli
+# ...or from a checkout:
+cargo build --release --features cli            # -> target/release/litewire
+
 # Start with a MySQL frontend
 litewire --mysql-listen 127.0.0.1:3306 --db app.db
 
-# Start with all frontends (postgres + tds require --features postgres,tds at build time)
+# Start with all frontends (postgres + tds must also be enabled at build
+# time: --features cli,postgres,tds)
 litewire --mysql-listen 127.0.0.1:3306 --postgres-listen 127.0.0.1:5432 --tds-listen 127.0.0.1:1433 --hrana-listen 127.0.0.1:8080 --db app.db
 
 # Connect from any MySQL client
@@ -45,24 +55,31 @@ psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM users"
 # Or SQL Server
 sqlcmd -S 127.0.0.1,1433 -Q "SELECT * FROM users"
 
-# Or via libsql SDK (Hrana protocol -- no SQL translation, native SQLite)
-# Any libsql client SDK works: Rust, JavaScript, Python, Go
+# Or over the Hrana HTTP protocol (no SQL translation -- native SQLite SQL)
+curl -s http://127.0.0.1:8080/v2/pipeline -d '{"requests":[{"type":"execute","stmt":{"sql":"SELECT * FROM users","args":[]}}]}'
 ```
 
-litewire also serves as a **lightweight drop-in replacement for sqld** (libsql-server). Apps using the Turso/libsql SDK can point at litewire instead of sqld for CI, development, and single-node deployments -- no replication server needed.
+The Hrana frontend serves a **stateless subset** of sqld's HTTP API: the
+`/v2/pipeline` endpoint with `execute`/`close` requests, plus `/health` and
+`/version`. There is no baton-based session continuity (multi-request
+interactive transactions are not supported over Hrana), no `batch`/`sequence`
+request types, and no authentication. For single-shot queries and CI-style
+workloads it can stand in for sqld with a single process and instant startup:
 
 ```bash
-# CI/CD: replace sqld with litewire
 litewire --hrana-listen 127.0.0.1:8080 --db test.db
 ```
 
 ## As a Library
 
-litewire is also a Rust crate with a pluggable backend:
+litewire is also a Rust crate with a pluggable backend. It is **not published
+on crates.io** -- depend on it as a git dependency:
 
 ```toml
 [dependencies]
-litewire = { version = "0.1", features = ["mysql", "postgres", "tds", "hrana"] }
+# mysql, hrana, and backend-rusqlite are on by default;
+# add features = ["postgres", "tds"] for the other frontends.
+litewire = { git = "https://github.com/ephpm/litewire" }
 ```
 
 ```rust
@@ -74,13 +91,14 @@ async fn main() -> anyhow::Result<()> {
 
     LiteWire::new(backend)
         .mysql("127.0.0.1:3306")
-        .postgres("127.0.0.1:5432")
-        .tds("127.0.0.1:1433")
         .hrana("127.0.0.1:8080")
         .serve()
         .await
 }
 ```
+
+With the `postgres` / `tds` features enabled, `.postgres("127.0.0.1:5432")`
+and `.tds("127.0.0.1:1433")` add those frontends to the same builder.
 
 ### Pluggable Backends
 
@@ -91,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
 | `Turso` | `turso` | **Experimental** — [Turso Database](https://github.com/tursodatabase/turso) engine (Rust rewrite of SQLite, Beta upstream; pinned `=0.7.0`). See `crates/litewire-turso` docs for limitations (no `VACUUM`, no multi-process access) |
 | Custom | implement `Backend` trait | Bring your own |
 
-The `HranaClient` backend connects to [sqld](https://github.com/tursodatabase/libsql) via HTTP, enabling embedded replicas and distributed SQLite clusters.
+The `HranaClient` backend connects to [sqld](https://github.com/tursodatabase/libsql) via HTTP (per-session Hrana streams plus write admission control), so litewire's wire frontends can sit in front of a sqld server.
 
 ### Multi-Tenant: One Listener, Many Databases
 
@@ -171,7 +189,10 @@ litewire translates MySQL and PostgreSQL SQL dialects to SQLite on the fly:
 | `SET NAMES utf8mb4` / `SET NOCOUNT ON` | No-op |
 | Backtick / `[bracket]` quoting | Passed through or converted |
 
-See [docs/architecture.md](docs/architecture.md) for the full architecture and translation reference.
+See [docs/sql-translation.md](docs/sql-translation.md) for the full
+translation reference -- every rewrite, every emulated metadata query, and
+what is rejected -- and [docs/architecture.md](docs/architecture.md) for the
+architecture.
 
 ## Compatibility
 

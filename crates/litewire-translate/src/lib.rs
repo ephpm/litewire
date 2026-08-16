@@ -486,10 +486,10 @@ fn normalize_session_prefix(rest: &str) -> Option<String> {
             return Some(after.trim_start().to_string());
         }
     }
-    if let Some(after) = rest.strip_prefix("GLOBAL ") {
-        if after.trim_start().starts_with("TRANSACTION") {
-            return Some(after.trim_start().to_string());
-        }
+    if let Some(after) = rest.strip_prefix("GLOBAL ")
+        && after.trim_start().starts_with("TRANSACTION")
+    {
+        return Some(after.trim_start().to_string());
     }
     None
 }

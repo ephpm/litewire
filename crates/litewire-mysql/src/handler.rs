@@ -216,13 +216,13 @@ impl LiteWireHandler {
             return;
         }
         self.stmts.clear();
-        if let Some(session) = self.session_mut() {
-            if session.in_transaction {
-                if let Err(e) = session.query("ROLLBACK", &[]).await {
-                    warn!("MySQL: rollback during connection reset failed: {e}");
-                }
-                session.in_transaction = false;
+        if let Some(session) = self.session_mut()
+            && session.in_transaction
+        {
+            if let Err(e) = session.query("ROLLBACK", &[]).await {
+                warn!("MySQL: rollback during connection reset failed: {e}");
             }
+            session.in_transaction = false;
         }
         debug!("MySQL connection state reset");
     }
