@@ -835,14 +835,14 @@ fn ensure_single_statement(sql: &str, object: SchemaObject) -> Result<(), Backen
     // A single trailing `;` is tolerated (SQLite does not store one, but
     // refusing it would be pedantry); anything of substance after it is
     // a second statement.
-    if let Some(pos) = first_semicolon {
-        if !skip_blank_and_comments(&sql[pos + 1..]).is_empty() {
-            return Err(BackendError::Other(format!(
-                "cdc apply: replayed CREATE {} carries more than one statement: {}",
-                object.as_str(),
-                truncate_for_log(sql)
-            )));
-        }
+    if let Some(pos) = first_semicolon
+        && !skip_blank_and_comments(&sql[pos + 1..]).is_empty()
+    {
+        return Err(BackendError::Other(format!(
+            "cdc apply: replayed CREATE {} carries more than one statement: {}",
+            object.as_str(),
+            truncate_for_log(sql)
+        )));
     }
     Ok(())
 }

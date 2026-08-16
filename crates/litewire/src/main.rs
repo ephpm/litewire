@@ -59,30 +59,30 @@ async fn main() -> anyhow::Result<()> {
 
     let mut builder = litewire::LiteWire::new(backend);
 
-    if !cli.no_mysql {
-        if let Some(ref addr) = cli.mysql_listen {
-            builder = builder.mysql(addr);
-        }
+    if !cli.no_mysql
+        && let Some(ref addr) = cli.mysql_listen
+    {
+        builder = builder.mysql(addr);
     }
 
-    if !cli.no_hrana {
-        if let Some(ref addr) = cli.hrana_listen {
-            builder = builder.hrana(addr);
-        }
+    if !cli.no_hrana
+        && let Some(ref addr) = cli.hrana_listen
+    {
+        builder = builder.hrana(addr);
     }
 
     #[cfg(feature = "postgres")]
-    if !cli.no_postgres {
-        if let Some(ref addr) = cli.postgres_listen {
-            builder = builder.postgres(addr);
-        }
+    if !cli.no_postgres
+        && let Some(ref addr) = cli.postgres_listen
+    {
+        builder = builder.postgres(addr);
     }
 
     #[cfg(feature = "tds")]
-    if !cli.no_tds {
-        if let Some(ref addr) = cli.tds_listen {
-            builder = builder.tds(addr);
-        }
+    if !cli.no_tds
+        && let Some(ref addr) = cli.tds_listen
+    {
+        builder = builder.tds(addr);
     }
 
     // Run until Ctrl+C or a frontend error.

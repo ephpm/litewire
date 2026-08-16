@@ -168,10 +168,10 @@ fn normalize_regexp(stmt: &mut Statement) {
 /// `ESCAPE ''`) is preserved untouched.
 fn add_default_like_escape(stmt: &mut Statement) {
     let _: ControlFlow<()> = visit_expressions_mut(stmt, |expr| {
-        if let Expr::Like { escape_char, .. } | Expr::ILike { escape_char, .. } = expr {
-            if escape_char.is_none() {
-                *escape_char = Some("\\".to_string());
-            }
+        if let Expr::Like { escape_char, .. } | Expr::ILike { escape_char, .. } = expr
+            && escape_char.is_none()
+        {
+            *escape_char = Some("\\".to_string());
         }
         ControlFlow::Continue(())
     });
@@ -183,12 +183,11 @@ fn add_default_like_escape(stmt: &mut Statement) {
 fn rewrite_update_assignment_targets(assignments: &mut [sqlparser::ast::Assignment]) {
     use sqlparser::ast::{AssignmentTarget, ObjectName};
     for a in assignments {
-        if let AssignmentTarget::ColumnName(name) = &mut a.target {
-            if name.0.len() > 1 {
-                if let Some(last) = name.0.pop() {
-                    *name = ObjectName(vec![last]);
-                }
-            }
+        if let AssignmentTarget::ColumnName(name) = &mut a.target
+            && name.0.len() > 1
+            && let Some(last) = name.0.pop()
+        {
+            *name = ObjectName(vec![last]);
         }
     }
 }
@@ -333,19 +332,14 @@ fn rewrite_insert_on_duplicate(insert: &mut sqlparser::ast::Insert) {
 fn rewrite_values_call_to_excluded(expr: &mut sqlparser::ast::Expr) {
     use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident};
 
-    if let Expr::Function(func) = expr {
-        if func.name.to_string().eq_ignore_ascii_case("VALUES") {
-            if let FunctionArguments::List(args) = &func.args {
-                if args.args.len() == 1 {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(col))) =
-                        &args.args[0]
-                    {
-                        *expr = Expr::CompoundIdentifier(vec![Ident::new("excluded"), col.clone()]);
-                        return;
-                    }
-                }
-            }
-        }
+    if let Expr::Function(func) = expr
+        && func.name.to_string().eq_ignore_ascii_case("VALUES")
+        && let FunctionArguments::List(args) = &func.args
+        && args.args.len() == 1
+        && let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(col))) = &args.args[0]
+    {
+        *expr = Expr::CompoundIdentifier(vec![Ident::new("excluded"), col.clone()]);
+        return;
     }
     // Recurse through common wrappers so `VALUES(a) + 1` style values work.
     match expr {

@@ -26,25 +26,24 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
 
 /// Rewrite `SELECT TOP n ...` to `SELECT ... LIMIT n`.
 fn rewrite_top_to_limit(query: &mut sqlparser::ast::Query) {
-    if let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() {
-        if let Some(top) = select.top.take() {
-            if let Some(quantity) = top.quantity {
-                use sqlparser::ast::{LimitClause, TopQuantity};
-                let limit_expr = match quantity {
-                    TopQuantity::Expr(e) => e,
-                    TopQuantity::Constant(n) => Expr::Value(sqlparser::ast::ValueWithSpan {
-                        value: sqlparser::ast::Value::Number(n.to_string(), false),
-                        span: sqlparser::tokenizer::Span::empty(),
-                    }),
-                };
-                if query.limit_clause.is_none() {
-                    query.limit_clause = Some(LimitClause::LimitOffset {
-                        limit: Some(limit_expr),
-                        offset: None,
-                        limit_by: vec![],
-                    });
-                }
-            }
+    if let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut()
+        && let Some(top) = select.top.take()
+        && let Some(quantity) = top.quantity
+    {
+        use sqlparser::ast::{LimitClause, TopQuantity};
+        let limit_expr = match quantity {
+            TopQuantity::Expr(e) => e,
+            TopQuantity::Constant(n) => Expr::Value(sqlparser::ast::ValueWithSpan {
+                value: sqlparser::ast::Value::Number(n.to_string(), false),
+                span: sqlparser::tokenizer::Span::empty(),
+            }),
+        };
+        if query.limit_clause.is_none() {
+            query.limit_clause = Some(LimitClause::LimitOffset {
+                limit: Some(limit_expr),
+                offset: None,
+                limit_by: vec![],
+            });
         }
     }
 }

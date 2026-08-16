@@ -263,10 +263,10 @@ pub fn detect_metadata_query(sql: &str, _dialect: Dialect) -> Option<MetadataQue
             // Existence probe (`SELECT EXISTS (...)` with a TABLE_NAME
             // filter) must produce a single scalar column — Laravel's
             // Schema::hasTable calls Connection::scalar() on it.
-            if upper.starts_with("SELECT EXISTS") {
-                if let Some(table) = extract_where_value_original(trimmed, "TABLE_NAME") {
-                    return Some(MetadataQuery::TableExists { table });
-                }
+            if upper.starts_with("SELECT EXISTS")
+                && let Some(table) = extract_where_value_original(trimmed, "TABLE_NAME")
+            {
+                return Some(MetadataQuery::TableExists { table });
             }
             let schema_filter = extract_where_value_original(trimmed, "TABLE_SCHEMA");
             return Some(MetadataQuery::InformationSchemaTables { schema_filter });
@@ -1206,11 +1206,11 @@ mod tests {
              WHERE TABLE_NAME = 'users''; DROP TABLE x; --'",
             Dialect::PostgreSQL,
         );
-        if let Some(MetadataQuery::PgCatalogColumns { table }) = &q {
-            if !table.is_empty() {
-                let sql = q.as_ref().unwrap().to_sqlite_sql();
-                assert_single_safe_statement(&sql);
-            }
+        if let Some(MetadataQuery::PgCatalogColumns { table }) = &q
+            && !table.is_empty()
+        {
+            let sql = q.as_ref().unwrap().to_sqlite_sql();
+            assert_single_safe_statement(&sql);
         }
     }
 }

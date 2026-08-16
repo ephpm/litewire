@@ -38,6 +38,23 @@ jobs:
       # `approx_constant` denials were sitting in feature-gated test code.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-version = "1.88" is declared in Cargo.toml; this job is what
+      # makes that declaration true. (1.85 was declared for a while but was
+      # never verified and never true with the locked dependency graph --
+      # the turso engine's `aristo` dependency requires rustc 1.88.)
+      # cargo check (not test) keeps it cheap -- the goal is "compiles on
+      # the MSRV", the stable jobs own correctness.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features --all-targets
+
   test:
     name: test
     runs-on: ubuntu-latest
