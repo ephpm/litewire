@@ -80,7 +80,9 @@ pub mod cdc;
 /// `turso` dependency.
 pub use turso::Connection as TursoConnection;
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as SyncMutex};
+use std::time::{Duration, Instant};
 
 use litewire_backend::{
     Backend, BackendConn, BackendError, Column, ExecuteResult, ResultSet, Value,
@@ -123,6 +125,8 @@ pub struct TursoBuilder {
     busy_timeout_ms: u32,
     synchronous: Synchronous,
     enable_cdc_on_connect: bool,
+    max_idle: usize,
+    idle_max_age: Duration,
 }
 
 impl TursoBuilder {
@@ -160,6 +164,36 @@ impl TursoBuilder {
         self
     }
 
+    /// **Experimental** — enable idle-connection reuse with room for
+    /// `max_idle` parked connections (0, the default, disables reuse).
+    ///
+    /// A wire session's connection is normally freed when the session
+    /// ends. With reuse on, a *clean* connection (autocommit, no temp
+    /// objects, no drifted `PRAGMA`s) is instead parked and handed to a
+    /// later session, keeping the engine's per-connection prepared-
+    /// statement cache warm. State hygiene is validated at checkout, so a
+    /// dirty connection is discarded rather than leaked (see
+    /// [`ReuseStats`]).
+    ///
+    /// Ignored when [`TursoBuilder::enable_cdc_on_connect`] is set: CDC
+    /// capture is per-connection state the reuse fingerprint does not
+    /// model.
+    #[must_use]
+    pub fn handle_reuse(mut self, max_idle: usize) -> Self {
+        self.max_idle = max_idle;
+        self
+    }
+
+    /// Maximum time a parked connection may sit idle before it is
+    /// discarded at checkout instead of reused (default 60s). Bounds how
+    /// long a reused handle can pin resources and how stale a cached
+    /// schema view may be.
+    #[must_use]
+    pub fn idle_max_age(mut self, age: Duration) -> Self {
+        self.idle_max_age = age;
+        self
+    }
+
     /// Finalize the builder: open (or create) the database with the Turso
     /// engine. The engine is WAL-native; no journal-mode bootstrap is
     /// required.
@@ -173,11 +207,24 @@ impl TursoBuilder {
             .build()
             .await
             .map_err(map_turso_err)?;
+        let reuse = if self.max_idle > 0 && !self.enable_cdc_on_connect {
+            Some(Arc::new(ReusePool::new(self.max_idle, self.idle_max_age)))
+        } else {
+            if self.max_idle > 0 && self.enable_cdc_on_connect {
+                tracing::warn!(
+                    "turso reuse: handle_reuse ignored because \
+                     enable_cdc_on_connect is set (CDC capture is \
+                     per-connection state the reuse layer does not track)"
+                );
+            }
+            None
+        };
         Ok(Turso {
             db,
             busy_timeout_ms: self.busy_timeout_ms,
             synchronous: self.synchronous,
             enable_cdc_on_connect: self.enable_cdc_on_connect,
+            reuse,
         })
     }
 }
@@ -194,6 +241,9 @@ pub struct Turso {
     /// If set, [`Backend::connect`] enables full CDC capture on every
     /// session. See [`TursoBuilder::enable_cdc_on_connect`].
     pub(crate) enable_cdc_on_connect: bool,
+    /// Idle-connection reuse pool, present iff enabled via
+    /// [`TursoBuilder::handle_reuse`]. See the reuse-pool section below.
+    reuse: Option<Arc<ReusePool>>,
 }
 
 impl Turso {
@@ -242,7 +292,27 @@ impl Turso {
             busy_timeout_ms: 5000,
             synchronous: Synchronous::Normal,
             enable_cdc_on_connect: false,
+            max_idle: 0,
+            idle_max_age: Duration::from_secs(60),
         }
+    }
+
+    /// Snapshot the idle-connection reuse counters, or `None` if reuse
+    /// is disabled (the default). See [`TursoBuilder::handle_reuse`].
+    #[must_use]
+    pub fn reuse_stats(&self) -> Option<ReuseStats> {
+        self.reuse.as_ref().map(|p| p.stats())
+    }
+
+    /// Open a fresh per-session connection with the standard session
+    /// setup (busy timeout, `synchronous`, optional CDC capture).
+    async fn fresh_connection(&self) -> Result<turso::Connection, BackendError> {
+        let conn = self.db.connect().map_err(map_turso_err)?;
+        apply_session_setup(&conn, self.busy_timeout_ms, self.synchronous).await?;
+        if self.enable_cdc_on_connect {
+            cdc::enable_cdc(&conn).await?;
+        }
+        Ok(conn)
     }
 }
 
@@ -253,30 +323,65 @@ impl Turso {
 /// is why this is the tokio mutex and not a std/parking_lot one).
 pub struct TursoConn {
     conn: Mutex<turso::Connection>,
+    /// Pool to park this connection back into on drop, if reuse is
+    /// enabled. `None` disables parking (and is what a discarded checkout
+    /// candidate carries, so it cannot re-park itself).
+    reuse: Option<Arc<ReusePool>>,
+    /// `last_insert_rowid()` observed at checkout. A reused connection
+    /// inherits the previous session's value (the engine exposes no
+    /// setter), so `execute` reports a rowid only once it moves past this
+    /// baseline — never leaking the prior session's insert id.
+    baseline_rowid: i64,
+    /// Set once this session runs a statement that leaves connection-
+    /// scoped state behind (see [`statement_dirties_connection`]); a dirty
+    /// connection is never parked. Always `false` when reuse is disabled.
+    dirty: AtomicBool,
+}
+
+impl TursoConn {
+    /// Flag the connection dirty if `sql` leaves connection-scoped state
+    /// behind, so [`Drop`] will not park it. A cheap keyword scan, and a
+    /// no-op when reuse is disabled (the default).
+    fn mark_dirty_if_needed(&self, sql: &str) {
+        if self.reuse.is_some() && statement_dirties_connection(sql) {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl Backend for Turso {
     async fn connect(&self) -> Result<Box<dyn BackendConn>, BackendError> {
-        let conn = self.db.connect().map_err(map_turso_err)?;
-        conn.busy_timeout(Duration::from_millis(u64::from(self.busy_timeout_ms)))
-            .map_err(map_turso_err)?;
-        // The engine's own default is synchronous=FULL; bring the session
-        // to parity with the rusqlite backend (NORMAL by default).
-        conn.pragma_update("synchronous", self.synchronous.as_pragma_str())
-            .await
-            .map_err(map_turso_err)?;
-        if self.enable_cdc_on_connect {
-            // Experimental: opt every wire session into CDC capture. Only
-            // set when litewire-turso is being used as the primary in
-            // ePHPm's Phase 2 replication mode. The pragma is
-            // per-connection, so a session that skips this (e.g. a
-            // direct `raw_connection()` caller like the tail loop) is
-            // unaffected.
-            cdc::enable_cdc(&conn).await?;
+        // Reuse path: hand out a parked, still-clean connection so its
+        // warm prepared-statement cache survives across sessions.
+        if let Some(pool) = &self.reuse {
+            while let Some(conn) = pool.take_fresh() {
+                if ReusePool::reusable_at_checkout(&conn) {
+                    pool.hits.fetch_add(1, Ordering::Relaxed);
+                    let baseline_rowid = conn.last_insert_rowid();
+                    return Ok(Box::new(TursoConn {
+                        conn: Mutex::new(conn),
+                        reuse: Some(Arc::clone(pool)),
+                        baseline_rowid,
+                        dirty: AtomicBool::new(false),
+                    }));
+                }
+                // Defensive: not in autocommit (engine's lazy dangling-tx
+                // handling). Drop it (its `reuse` is None, so no re-park)
+                // and try the next parked connection.
+                pool.discards.fetch_add(1, Ordering::Relaxed);
+            }
+            pool.misses.fetch_add(1, Ordering::Relaxed);
         }
+        let conn = self.fresh_connection().await?;
+        // Fresh connection: last_insert_rowid() is 0, so the baseline is a
+        // no-op and reporting matches the pre-reuse behaviour exactly.
+        let baseline_rowid = conn.last_insert_rowid();
         Ok(Box::new(TursoConn {
             conn: Mutex::new(conn),
+            reuse: self.reuse.clone(),
+            baseline_rowid,
+            dirty: AtomicBool::new(false),
         }))
     }
 }
@@ -502,6 +607,7 @@ fn check_param_count(sql: &str, got: usize) -> Result<(), BackendError> {
 impl BackendConn for TursoConn {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> {
         reject_unsupported(sql)?;
+        self.mark_dirty_if_needed(sql);
         let conn = self.conn.lock().await;
         // `prepare_cached` interns the parsed statement in the engine's
         // per-connection cache, mirroring the rusqlite backend.
@@ -549,6 +655,7 @@ impl BackendConn for TursoConn {
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, BackendError> {
         reject_unsupported(sql)?;
+        self.mark_dirty_if_needed(sql);
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
         // Same bind-count parity check as `query` (see `check_param_count`).
@@ -561,7 +668,15 @@ impl BackendConn for TursoConn {
 
         Ok(ExecuteResult {
             affected_rows: affected,
-            last_insert_rowid: if last_id != 0 { Some(last_id) } else { None },
+            // Suppress the inherited rowid a reused connection carries from
+            // the prior session (baseline); report only this session's own
+            // inserts. For a fresh connection baseline is 0, so this is
+            // identical to the previous `last_id != 0` check.
+            last_insert_rowid: if last_id != 0 && last_id != self.baseline_rowid {
+                Some(last_id)
+            } else {
+                None
+            },
         })
     }
 
@@ -571,6 +686,229 @@ impl BackendConn for TursoConn {
         // no LIMIT-0 probe needed.
         let stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
         Ok(to_columns(&stmt.columns()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idle-connection reuse pool (opt-in; see `TursoBuilder::handle_reuse`)
+// ---------------------------------------------------------------------------
+//
+// When enabled, a wire session's `turso::Connection` is parked on drop
+// instead of freed, and a later `Backend::connect` checks it back out —
+// keeping the engine's per-connection prepared-statement cache warm across
+// sessions. That cache is the whole prize: on this engine `connect()` itself
+// is cheap, but the first `prepare` of each distinct statement on a fresh
+// connection is the dominant per-session cost that a warm handle avoids.
+
+/// Apply the standard per-session setup (busy timeout, `synchronous`) shared
+/// by fresh connections and the fingerprint-calibration probe.
+async fn apply_session_setup(
+    conn: &turso::Connection,
+    busy_timeout_ms: u32,
+    synchronous: Synchronous,
+) -> Result<(), BackendError> {
+    conn.busy_timeout(Duration::from_millis(u64::from(busy_timeout_ms)))
+        .map_err(map_turso_err)?;
+    // The engine's own default is synchronous=FULL; bring the session to
+    // parity with the rusqlite backend (NORMAL by default).
+    conn.pragma_update("synchronous", synchronous.as_pragma_str())
+        .await
+        .map_err(map_turso_err)?;
+    Ok(())
+}
+
+/// Does executing `sql` leave *connection-scoped* state behind that must
+/// not bleed into a reused session? If so the connection is marked dirty
+/// and never parked — a fail-safe denylist: a false positive only costs a
+/// fresh connect, never correctness.
+///
+/// The vectors, and why the list is short:
+/// * A wire client's `SET ...` statements translate to no-ops (they never
+///   reach the engine as pragmas), so the only way to change a
+///   connection-scoped pragma is a literal `PRAGMA name = value` — caught
+///   generically by "starts with PRAGMA and assigns".
+/// * `CREATE TEMP`/`TEMPORARY ...` makes a connection-local object
+///   (visible via `sqlite_temp_master`) other sessions must not see.
+/// * `ATTACH`/`DETACH` change the attached-database set.
+///
+/// Metadata reads (`SELECT ... FROM pragma_table_info(...)`, or a
+/// non-assigning `PRAGMA table_info(...)`) are *not* dirtying: they read,
+/// and the pragma-TVF phantom-transaction workaround restores autocommit.
+///
+/// One O(len) keyword scan per statement — orders of magnitude cheaper than
+/// the per-checkout `PRAGMA`-readback probe it replaced, which measured as
+/// costly as the statement-cache win it was meant to protect.
+fn statement_dirties_connection(sql: &str) -> bool {
+    let s = strip_leading_trivia(sql);
+    let kw = leading_word(s);
+    if kw.eq_ignore_ascii_case("PRAGMA") {
+        // A pragma *write* assigns (`PRAGMA x = y`); a read does not.
+        return s.contains('=');
+    }
+    if kw.eq_ignore_ascii_case("ATTACH") || kw.eq_ignore_ascii_case("DETACH") {
+        return true;
+    }
+    if kw.eq_ignore_ascii_case("CREATE") {
+        let rest = strip_leading_trivia(&s[kw.len()..]);
+        let w2 = leading_word(rest);
+        return w2.eq_ignore_ascii_case("TEMP") || w2.eq_ignore_ascii_case("TEMPORARY");
+    }
+    false
+}
+
+/// Skip leading whitespace and SQL comments (`-- …`, `/* … */`) so the
+/// keyword scan sees the real first token even behind a comment prefix.
+fn strip_leading_trivia(sql: &str) -> &str {
+    let mut s = sql.trim_start();
+    loop {
+        if let Some(rest) = s.strip_prefix("--") {
+            s = rest.find('\n').map_or("", |i| &rest[i + 1..]).trim_start();
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.find("*/").map_or("", |i| &rest[i + 2..]).trim_start();
+        } else {
+            return s;
+        }
+    }
+}
+
+/// The leading run of identifier characters (a SQL keyword), stopping at
+/// the first non-`[A-Za-z0-9_]` byte.
+fn leading_word(s: &str) -> &str {
+    let end = s
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// One parked, idle connection and when it was parked (for age-out).
+struct IdleEntry {
+    conn: turso::Connection,
+    parked_at: Instant,
+}
+
+/// Observability counters for the reuse pool. Snapshot via
+/// [`Turso::reuse_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReuseStats {
+    /// Checkouts satisfied by a clean idle connection.
+    pub hits: u64,
+    /// Checkouts that fell through to a fresh connect (pool empty of clean
+    /// candidates).
+    pub misses: u64,
+    /// Idle connections rejected at checkout (aged out, or not in
+    /// autocommit).
+    pub discards: u64,
+    /// Connections successfully parked on drop.
+    pub parked: u64,
+    /// Connections dropped at park because the pool was already full.
+    pub dropped_full: u64,
+}
+
+/// The idle pool and its counters.
+struct ReusePool {
+    idle: SyncMutex<Vec<IdleEntry>>,
+    max_idle: usize,
+    idle_max_age: Duration,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    discards: AtomicU64,
+    parked: AtomicU64,
+    dropped_full: AtomicU64,
+}
+
+impl ReusePool {
+    /// Build an empty pool. No engine probe is needed: hygiene is enforced
+    /// cheaply per statement (see [`statement_dirties_connection`]) and at
+    /// park, not by a checkout-time readback.
+    fn new(max_idle: usize, idle_max_age: Duration) -> Self {
+        Self {
+            idle: SyncMutex::new(Vec::new()),
+            max_idle,
+            idle_max_age,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            discards: AtomicU64::new(0),
+            parked: AtomicU64::new(0),
+            dropped_full: AtomicU64::new(0),
+        }
+    }
+
+    /// Pop the most-recently-parked non-stale idle connection, discarding
+    /// (and counting) any that have aged past `idle_max_age`.
+    fn take_fresh(&self) -> Option<turso::Connection> {
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while let Some(entry) = idle.pop() {
+            if entry.parked_at.elapsed() <= self.idle_max_age {
+                return Some(entry.conn);
+            }
+            self.discards.fetch_add(1, Ordering::Relaxed);
+        }
+        None
+    }
+
+    /// Park a clean connection, or drop it if the pool is at capacity.
+    fn park(&self, conn: turso::Connection) {
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if idle.len() >= self.max_idle {
+            drop(idle);
+            self.dropped_full.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        idle.push(IdleEntry {
+            conn,
+            parked_at: Instant::now(),
+        });
+        self.parked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cheap checkout guard. Parking already refuses any connection that
+    /// is mid-transaction or that ran a dirtying statement, so a parked
+    /// handle is known-clean; this only re-confirms autocommit (a free
+    /// sync call) as defence against the engine's lazy dangling-transaction
+    /// handling. No `.await`, no queries — the checkout hot path stays
+    /// free.
+    fn reusable_at_checkout(conn: &turso::Connection) -> bool {
+        matches!(conn.is_autocommit(), Ok(true))
+    }
+
+    fn stats(&self) -> ReuseStats {
+        ReuseStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            discards: self.discards.load(Ordering::Relaxed),
+            parked: self.parked.load(Ordering::Relaxed),
+            dropped_full: self.dropped_full.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for TursoConn {
+    fn drop(&mut self) {
+        let Some(pool) = self.reuse.take() else {
+            return;
+        };
+        // A statement that left connection-scoped state behind (a temp
+        // object, a pragma write, an ATTACH) makes this connection unsafe
+        // to hand to another session — never park it.
+        if self.dirty.load(Ordering::Relaxed) {
+            return;
+        }
+        // `get_mut` needs no lock: we hold `&mut self`, so no other task
+        // can be mid-statement on this connection.
+        let conn = self.conn.get_mut();
+        // Never park a connection with an open transaction: a reused
+        // session must start in autocommit. `is_autocommit` is a cheap sync
+        // call. Cloning shares the inner `Arc<TursoConnection>`, so the
+        // parked handle keeps the warm prepared-statement cache alive.
+        if matches!(conn.is_autocommit(), Ok(true)) {
+            pool.park(conn.clone());
+        }
     }
 }
 
@@ -1061,5 +1399,188 @@ mod tests {
 
         let rs = b.query("SELECT id FROM t", &[]).await.unwrap();
         assert_eq!(rs.rows[0][0], Value::Integer(7));
+    }
+    // -- Idle-connection reuse pool ---------------------------------------
+
+    async fn reuse_backend(max_idle: usize) -> Turso {
+        Turso::builder(":memory:")
+            .handle_reuse(max_idle)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reuse_disabled_by_default() {
+        let backend = Turso::memory().await.unwrap();
+        assert!(backend.reuse_stats().is_none());
+        // Sessions still work with no pool.
+        let a = backend.connect().await.unwrap();
+        a.execute("CREATE TABLE t (id INTEGER)", &[]).await.unwrap();
+        drop(a);
+        let b = backend.connect().await.unwrap();
+        b.execute("INSERT INTO t VALUES (1)", &[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clean_connection_is_parked_and_reused() {
+        let backend = reuse_backend(4).await;
+        {
+            let a = backend.connect().await.unwrap();
+            a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[])
+                .await
+                .unwrap();
+            a.execute("INSERT INTO t VALUES (1, 'x')", &[])
+                .await
+                .unwrap();
+        } // `a` dropped -> parked (autocommit, no temp, clean pragmas).
+        let s = backend.reuse_stats().unwrap();
+        assert_eq!(s.parked, 1, "clean connection should have parked: {s:?}");
+
+        let b = backend.connect().await.unwrap();
+        let s = backend.reuse_stats().unwrap();
+        assert_eq!(
+            s.hits, 1,
+            "second connect should reuse the parked conn: {s:?}"
+        );
+        let rs = b.query("SELECT v FROM t WHERE id = 1", &[]).await.unwrap();
+        assert_eq!(rs.rows[0][0], Value::Text("x".into()));
+    }
+
+    #[tokio::test]
+    async fn temp_table_does_not_leak_across_reuse() {
+        let backend = reuse_backend(4).await;
+        {
+            let a = backend.connect().await.unwrap();
+            a.execute("CREATE TEMP TABLE leak (id INTEGER)", &[])
+                .await
+                .unwrap();
+            a.execute("INSERT INTO leak VALUES (1)", &[]).await.unwrap();
+        } // ran CREATE TEMP -> dirty -> must not park.
+        assert_eq!(
+            backend.reuse_stats().unwrap().parked,
+            0,
+            "temp-carrying connection must not be parked"
+        );
+        let b = backend.connect().await.unwrap();
+        // The temp table must not be visible to the new session.
+        assert!(
+            b.query("SELECT * FROM leak", &[]).await.is_err(),
+            "temp table leaked into reused session"
+        );
+    }
+
+    #[tokio::test]
+    async fn pragma_write_prevents_parking() {
+        let backend = reuse_backend(4).await;
+        // Only meaningful if the engine actually honours a query_only write.
+        let observed = {
+            let a = backend.connect().await.unwrap();
+            a.execute("PRAGMA query_only = 1", &[]).await.unwrap();
+            let rs = a.query("PRAGMA query_only", &[]).await.unwrap();
+            rs.rows[0][0].clone()
+        }; // `a` ran a pragma write -> dirty -> must not park.
+        if observed != Value::Integer(1) {
+            return; // Engine ignores query_only; nothing to prove.
+        }
+        assert_eq!(
+            backend.reuse_stats().unwrap().parked,
+            0,
+            "pragma-writing connection must not be parked"
+        );
+        // A fresh session is at the clean default.
+        let c = backend.connect().await.unwrap();
+        let rs = c.query("PRAGMA query_only", &[]).await.unwrap();
+        assert_eq!(rs.rows[0][0], Value::Integer(0));
+    }
+
+    #[tokio::test]
+    async fn open_transaction_is_not_parked() {
+        let backend = reuse_backend(4).await;
+        {
+            let a = backend.connect().await.unwrap();
+            a.execute("CREATE TABLE t (id INTEGER)", &[]).await.unwrap();
+            a.execute("BEGIN", &[]).await.unwrap();
+            a.execute("INSERT INTO t VALUES (99)", &[]).await.unwrap();
+            // dropped mid-transaction
+        }
+        let s = backend.reuse_stats().unwrap();
+        assert_eq!(s.parked, 0, "open-transaction conn must not park: {s:?}");
+        // The uncommitted row must not be visible to a new session.
+        let b = backend.connect().await.unwrap();
+        let rs = b.query("SELECT COUNT(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rs.rows[0][0], Value::Integer(0));
+    }
+
+    #[tokio::test]
+    async fn last_insert_rowid_does_not_leak_across_reuse() {
+        let backend = reuse_backend(4).await;
+        {
+            let a = backend.connect().await.unwrap();
+            a.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[])
+                .await
+                .unwrap();
+            let r = a
+                .execute("INSERT INTO t VALUES (1, 'a')", &[])
+                .await
+                .unwrap();
+            assert_eq!(r.last_insert_rowid, Some(1));
+        } // parked with last_insert_rowid == 1.
+        let b = backend.connect().await.unwrap();
+        assert_eq!(backend.reuse_stats().unwrap().hits, 1);
+        // A non-insert statement on the reused conn must NOT report the
+        // inherited rowid 1.
+        let r = b
+            .execute("UPDATE t SET v = 'b' WHERE id = 1", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            r.last_insert_rowid, None,
+            "reused conn leaked prior session's insert id"
+        );
+        // Its own insert reports its own id.
+        let r = b
+            .execute("INSERT INTO t VALUES (2, 'c')", &[])
+            .await
+            .unwrap();
+        assert_eq!(r.last_insert_rowid, Some(2));
+    }
+
+    #[tokio::test]
+    async fn stale_idle_connection_is_discarded() {
+        let backend = Turso::builder(":memory:")
+            .handle_reuse(4)
+            .idle_max_age(Duration::from_millis(1))
+            .build()
+            .await
+            .unwrap();
+        {
+            let a = backend.connect().await.unwrap();
+            a.execute("CREATE TABLE t (id INTEGER)", &[]).await.unwrap();
+        } // parked
+        assert_eq!(backend.reuse_stats().unwrap().parked, 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _b = backend.connect().await.unwrap();
+        let s = backend.reuse_stats().unwrap();
+        assert_eq!(s.hits, 0, "stale conn should not count as a hit: {s:?}");
+        assert!(s.discards >= 1, "stale conn should be discarded: {s:?}");
+        assert!(
+            s.misses >= 1,
+            "checkout should fall through to fresh: {s:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_idle_bounds_the_pool() {
+        let backend = reuse_backend(1).await;
+        // Two connections open at once, then both dropped: only one fits.
+        let a = backend.connect().await.unwrap();
+        a.execute("CREATE TABLE t (id INTEGER)", &[]).await.unwrap();
+        let b = backend.connect().await.unwrap();
+        drop(a);
+        drop(b);
+        let s = backend.reuse_stats().unwrap();
+        assert_eq!(s.parked, 1, "pool capacity 1 should park one: {s:?}");
+        assert_eq!(s.dropped_full, 1, "the overflow should be dropped: {s:?}");
     }
 }
