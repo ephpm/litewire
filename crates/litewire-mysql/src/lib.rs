@@ -26,6 +26,21 @@ use tracing::{debug, info, warn};
 use command_filter::CommandFilter;
 use handler::LiteWireHandler;
 
+// SECURITY: compile-time fence for opensrv-mysql's `tls` feature (issue #32).
+//
+// `secure_run_with_options` is re-exported by opensrv-mysql only when its
+// `tls` feature is enabled, so this import fails to compile the moment a
+// future dependency change (a `default-features = false`, a feature
+// unification shuffle) drops the feature. That matters because `tls` is
+// load-bearing for authentication, not just for TLS: without it, upstream's
+// pre-TLS CLIENT_SSL handshake branch yields `username: None` and skips
+// `authenticate()` entirely -- on the multi-tenant path, the only tenant
+// boundary. See the `LiteWireHandler` docs for the structural fail-closed
+// defence and the workspace Cargo.toml for the feature declaration this
+// fence pins.
+#[allow(unused_imports)]
+use opensrv_mysql::secure_run_with_options as _opensrv_tls_feature_is_enabled;
+
 /// MySQL server error code `ER_CON_COUNT_ERROR` -- "Too many connections".
 const ER_CON_COUNT_ERROR: u16 = 1040;
 

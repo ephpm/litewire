@@ -32,8 +32,21 @@ litewire-turso = { path = "crates/litewire-turso" }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# Wire protocol
-opensrv-mysql = "0.7"
+# Wire protocol.
+#
+# SECURITY: opensrv-mysql's `tls` feature is load-bearing for authentication,
+# not just for TLS (issue #32). Upstream calls `authenticate()` conditionally
+# on `handshake.username.is_some()`, and its parser yields `None` on the
+# pre-TLS CLIENT_SSL branch. With `tls` on, `init_after_ssl` re-reads and
+# re-parses the handshake so that branch always produces a username; with
+# `tls` off, the re-parse is compiled out and a CLIENT_SSL-flagged handshake
+# skips authentication entirely. The handler fails closed structurally either
+# way (a connection with no successful `authenticate()` holds no backend --
+# see litewire-mysql/src/handler.rs), but the feature must never be dropped
+# silently: it is declared explicitly here so `default-features = false`
+# cannot shed it, and litewire-mysql/src/lib.rs carries a compile-time fence
+# that breaks the build if the feature disappears.
+opensrv-mysql = { version = "0.7", features = ["tls"] }
 pgwire = "0.28"
 
 # SQL parsing. `visitor` provides the derived AST walkers
