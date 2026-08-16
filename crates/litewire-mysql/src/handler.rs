@@ -471,6 +471,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
             }
         };
 
+        // A session the authenticator establishes is tenant-scoped: the
+        // backend it returned is the whole world this connection may touch.
+        // Screen out the statements that reach past it (`ATTACH`/`DETACH`,
+        // `VACUUM INTO`, path-bearing `PRAGMA`s) at the backend boundary,
+        // whatever the engine underneath would do with them. Fixed-backend
+        // (single-tenant) sessions are not screened -- see the
+        // `tenant_screen` module docs for the contract.
+        let conn = litewire_backend::tenant_screen::screened(conn);
+
         let session = Session::with_cache(conn, Dialect::MySQL, Arc::clone(&auth.translate_cache));
         if self.session.set(session).is_err() {
             // Unreachable: `opensrv-mysql` runs the handshake once per

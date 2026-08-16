@@ -50,3 +50,15 @@ jobs:
       # mask a break that only shows with default features, and the default
       # run alone misses every optional backend (hrana-client, turso).
       - run: cargo test --workspace --all-features
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Advisory (RustSec), license, ban, and source audit. The ignore list
+      # in deny.toml documents every accepted advisory with the reason and
+      # the condition for dropping it -- never add an ID without a comment.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

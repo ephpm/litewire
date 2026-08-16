@@ -45,6 +45,15 @@
 //! exactly the mistake above. [`AuthRequest`] hands you the raw
 //! `mysql_native_password` challenge/response inputs; see its field docs for
 //! the exact bytes to check.
+//!
+//! # What the boundary buys, once established
+//!
+//! A session established through an authenticator is **tenant-scoped**: the
+//! MySQL frontend wraps it in [`crate::tenant_screen`], which refuses the
+//! statements that reach past the returned backend's own database file —
+//! `ATTACH`/`DETACH`, `VACUUM` with a target, and the path-bearing
+//! `PRAGMA`s — on every backend, whatever the engine underneath would do
+//! with them. Fixed-backend (single-tenant) sessions are not screened.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

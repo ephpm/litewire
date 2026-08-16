@@ -303,3 +303,162 @@ async fn handshake_with_an_empty_username_reads_nothing() {
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
+
+// ── Tenant sessions refuse the cross-database primitives ─────────────────────
+//
+// Every tenant database is opened by the same process under the same uid, so
+// `ATTACH DATABASE <other tenant file>` is the cross-tenant read/write
+// primitive -- and it passes MySQL-dialect translation verbatim, so before
+// the tenant screen it reached the rusqlite backend and executed. These
+// tests pin the screen at the wire level: the same statements a hostile
+// tenant would type, through a real client, against a real listener.
+
+/// File-backed variant of [`start`]: two tenants, each in its own database
+/// file, returning the path of tenant B\x27s file so a test can try to steal it.
+async fn start_file_backed(port: u16, dir: &std::path::Path) -> std::path::PathBuf {
+    let mut tenants = HashMap::new();
+    for (user, pass, marker) in [
+        ("site-a", "pw-for-a", "a-secret"),
+        ("site-b", "pw-for-b", "b-secret"),
+    ] {
+        let path = dir.join(format!("{user}.db"));
+        let backend: SharedBackend = Arc::new(Rusqlite::open(&path).unwrap());
+        let conn = backend.connect().await.unwrap();
+        conn.execute("CREATE TABLE secrets (owner TEXT)", &[])
+            .await
+            .unwrap();
+        conn.execute(
+            &format!("INSERT INTO secrets (owner) VALUES (\x27{marker}\x27)"),
+            &[],
+        )
+        .await
+        .unwrap();
+        tenants.insert(
+            user.as_bytes().to_vec(),
+            Tenant {
+                password_hash: native_password::password_hash(pass.as_bytes()),
+                backend,
+            },
+        );
+    }
+
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let server = litewire::LiteWire::with_authenticator(Arc::new(TenantDirectory(tenants)))
+        .mysql(&addr.to_string());
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    dir.join("site-b.db")
+}
+
+/// The attack the tenant screen exists for: an authenticated tenant attaches
+/// its neighbour\x27s database file. Refused with litewire\x27s own clean SQL error
+/// -- and the connection survives to keep serving legitimate statements.
+#[tokio::test]
+async fn tenant_attach_is_refused_and_the_connection_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let b_path = start_file_backed(port, dir.path()).await;
+
+    let mut a = connect(port, "site-a", "pw-for-a").await.expect("site-a");
+
+    let err = a
+        .query_drop(format!(
+            "ATTACH DATABASE \x27{}\x27 AS stolen",
+            b_path.display()
+        ))
+        .await
+        .expect_err("a tenant session must not ATTACH another database");
+    assert!(
+        err.to_string()
+            .contains("not permitted on a tenant session"),
+        "the refusal must be litewire\x27s own, not an engine accident: {err}"
+    );
+
+    // A statement-level refusal, not a dropped connection: the session keeps
+    // working, and it still sees only its own data.
+    assert_eq!(owner_of(&mut a).await, vec!["a-secret".to_string()]);
+    assert!(
+        a.query_drop("SELECT owner FROM stolen.secrets")
+            .await
+            .is_err(),
+        "nothing may have been attached"
+    );
+}
+
+/// The variations on the same primitive: `DETACH`, `VACUUM INTO <path>`, and
+/// the path-bearing / schema-reopening `PRAGMA`s -- including the qualified
+/// and `EXPLAIN`-wrapped spellings that slip past a naive first-keyword
+/// check. All must fail; none may reach the engine.
+#[tokio::test]
+async fn tenant_path_primitives_are_all_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let _b_path = start_file_backed(port, dir.path()).await;
+
+    let mut a = connect(port, "site-a", "pw-for-a").await.expect("site-a");
+
+    // These pass MySQL-dialect translation, so only the tenant screen stands
+    // between them and the engine; pin its message.
+    for sql in [
+        "PRAGMA data_store_directory = \x27/tmp\x27",
+        "PRAGMA main.writable_schema = 1",
+        "EXPLAIN ATTACH DATABASE \x27/tmp/x.db\x27 AS x",
+    ] {
+        let err = a.query_drop(sql).await.expect_err(sql);
+        assert!(
+            err.to_string()
+                .contains("not permitted on a tenant session"),
+            "expected the tenant screen\x27s refusal for {sql:?}, got: {err}"
+        );
+    }
+
+    // These are refused earlier today (the MySQL-dialect parser does not
+    // accept them), and by the screen if a parser bump ever starts to. Which
+    // layer answers is not pinned -- only that the statement fails and the
+    // session survives it.
+    for sql in ["DETACH DATABASE stolen", "VACUUM INTO \x27/tmp/copy.db\x27"] {
+        assert!(a.query_drop(sql).await.is_err(), "must be refused: {sql}");
+    }
+
+    assert_eq!(owner_of(&mut a).await, vec!["a-secret".to_string()]);
+}
+
+/// The other half of the contract: a single-tenant (fixed backend, no
+/// authenticator) deployment keeps full SQL freedom, `ATTACH` included. The
+/// screen keys off the session being tenant-scoped -- never off the
+/// statement alone.
+#[tokio::test]
+async fn single_tenant_attach_keeps_working_over_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("main.db");
+    let other_path = dir.path().join("other.db");
+
+    let other: SharedBackend = Arc::new(Rusqlite::open(&other_path).unwrap());
+    let conn = other.connect().await.unwrap();
+    conn.execute("CREATE TABLE t (v TEXT)", &[]).await.unwrap();
+    conn.execute("INSERT INTO t (v) VALUES (\x27from-other\x27)", &[])
+        .await
+        .unwrap();
+    drop(conn);
+    drop(other);
+
+    let port = free_port().await;
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let server =
+        litewire::LiteWire::new(Rusqlite::open(&main_path).unwrap()).mysql(&addr.to_string());
+    tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+
+    // The fixed path does not authenticate; any credentials connect.
+    let mut c = connect(port, "anyone", "").await.expect("connect");
+    c.query_drop(format!(
+        "ATTACH DATABASE \x27{}\x27 AS other",
+        other_path.display()
+    ))
+    .await
+    .expect("single-tenant ATTACH must keep working");
+    let rows: Vec<String> = c.query("SELECT v FROM other.t").await.unwrap();
+    assert_eq!(rows, vec!["from-other".to_string()]);
+}

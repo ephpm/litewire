@@ -1,0 +1,62 @@
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+    # rustls-webpki cert-verification vulns (name constraints, CRL handling).
+    # After `cargo update`, these match only the OLD copies still pulled in by
+    # pinned dependencies:
+    #   * 0.102.8 via opensrv-mysql 0.7.0 (latest) -> tokio-rustls 0.25 ->
+    #     rustls 0.22. opensrv-mysql uses rustls only for server-side MySQL
+    #     TLS, which does not exercise the name-constraint / CRL verification
+    #     paths these advisories concern.
+    #   * 0.101.7 via tiberius 0.12 -> rustls 0.21, a dev-dependency only
+    #     (the TDS e2e test client). Never shipped to users of the library.
+    # Drop once opensrv-mysql moves to rustls 0.23 and tiberius updates.
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    # rustls-pemfile 1.x unmaintained — dev-dependency only, via tiberius 0.12
+    # (TDS e2e test client). Awaiting a tiberius release on rustls-pemfile 2.
+    "RUSTSEC-2025-0134",
+    # proc-macro-error2 unmaintained — pulled transitively by
+    # mysql-common-derive -> mysql_common -> opensrv-mysql. Compile-time-only
+    # (proc macro), no runtime exposure. Awaiting upstream migration.
+    "RUSTSEC-2026-0173",
+    # time 0.3.45 stack-exhaustion DoS in parsing. The fixed release (0.3.47)
+    # requires a newer Rust than this workspace's MSRV (1.85), so the
+    # MSRV-aware resolver cannot take it. Reached via mysql_common (wire
+    # date/time types) and turso's tracing-appender. Drop when the MSRV moves.
+    "RUSTSEC-2026-0009",
+    # tokio-postgres 0.7.17 panic on a malformed DataRow (malicious-server
+    # DoS). Dev-dependency only — the Postgres e2e test client talking to our
+    # own frontend. The fixed release (0.7.18) is MSRV-blocked like `time`
+    # above. Drop when the MSRV moves.
+    "RUSTSEC-2026-0178",
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
