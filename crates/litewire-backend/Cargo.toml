@@ -25,6 +25,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 litewire-hrana = { workspace = true }
+tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }
 
