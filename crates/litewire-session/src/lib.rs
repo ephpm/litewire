@@ -252,7 +252,7 @@ impl Session {
     pub fn translate_sql(&self, query: &str) -> Result<(String, StatementKind), SessionError> {
         let translated = translate_cached(&self.cache, query, self.dialect)?;
 
-        let Some(result) = translated.into_iter().next() else {
+        let Some(result) = translated.first() else {
             return Ok((String::new(), StatementKind::Other));
         };
 
@@ -262,9 +262,12 @@ impl Session {
                 let sql = meta.to_sqlite_sql();
                 Ok((sql, StatementKind::Query))
             }
+            // The cached entry is shared, so this clones the one
+            // statement actually returned -- not every statement the
+            // input expanded to.
             TranslateResult::Sql(sql) => {
-                let kind = classify(&sql);
-                Ok((sql, kind))
+                let kind = classify(sql);
+                Ok((sql.clone(), kind))
             }
         }
     }
@@ -327,7 +330,7 @@ impl Session {
         // Empty input (zero statements) returns OK, as the wire path does.
         let mut last = SessionResult::Ok(self.ok(0, 0, true));
 
-        for result in translated {
+        for result in translated.iter() {
             last = self.dispatch(result, params).await?;
         }
 
@@ -511,9 +514,13 @@ impl Session {
     }
 
     /// Execute a single [`TranslateResult`].
+    ///
+    /// Takes the result by reference: it is borrowed straight out of the
+    /// shared [`TranslateCache`] entry, so nothing on this path copies the
+    /// translated SQL.
     async fn dispatch(
         &mut self,
-        result: TranslateResult,
+        result: &TranslateResult,
         params: &[Value],
     ) -> Result<SessionResult, SessionError> {
         match result {
@@ -525,8 +532,8 @@ impl Session {
                 self.run_translated(&sql, StatementKind::Query, &[]).await
             }
             TranslateResult::Sql(sql) => {
-                let kind = classify(&sql);
-                self.run_translated(&sql, kind, params).await
+                let kind = classify(sql);
+                self.run_translated(sql, kind, params).await
             }
         }
     }

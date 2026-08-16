@@ -48,6 +48,8 @@ pub(crate) use server_version;
 /// from `SELECT VERSION()`.
 pub const SERVER_VERSION: &str = server_version!();
 
+use std::sync::Arc;
+
 use sqlparser::ast::Statement;
 use sqlparser::dialect::{MsSqlDialect, MySqlDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
@@ -287,9 +289,11 @@ pub(crate) fn strip_mysql_select_hints(sql: &str) -> String {
 /// Translate a SQL string, using a bounded LRU cache in front of the
 /// parser + rewriter. See [`TranslateCache`].
 ///
-/// Cache hits are O(1); misses fall through to [`translate`] and populate
-/// the cache before returning. Errors are *not* cached -- a repeatedly-bad
-/// statement will re-parse each time.
+/// Cache hits are O(1) and allocation-free: the returned
+/// `Arc<[TranslateResult]>` is a shared handle on the cached entry, not a
+/// copy of it. Misses fall through to [`translate`] and populate the cache
+/// before returning. Errors are *not* cached -- a repeatedly-bad statement
+/// will re-parse each time.
 ///
 /// # Errors
 ///
@@ -299,12 +303,12 @@ pub fn translate_cached(
     cache: &TranslateCache,
     sql: &str,
     dialect: Dialect,
-) -> Result<Vec<TranslateResult>, TranslateError> {
+) -> Result<Arc<[TranslateResult]>, TranslateError> {
     if let Some(hit) = cache.get(dialect, sql) {
         return Ok(hit);
     }
-    let results = translate(sql, dialect)?;
-    cache.put(dialect, sql.to_string(), results.clone());
+    let results: Arc<[TranslateResult]> = translate(sql, dialect)?.into();
+    cache.put(dialect, sql, Arc::clone(&results));
     Ok(results)
 }
 
