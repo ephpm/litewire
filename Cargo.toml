@@ -90,7 +90,7 @@ base64 = "0.22"
 futures = "0.3"
 parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
-mysql_async = { version = "0.34", default-features = false, features = ["rustls-tls"] }
+mysql_async = { version = "0.37", default-features = false, features = ["rustls-tls"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 tiberius = { version = "0.12", default-features = false, features = ["rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
