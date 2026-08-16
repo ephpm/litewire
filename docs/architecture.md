@@ -1,6 +1,12 @@
 # litewire Architecture
 
-litewire is a protocol translation proxy: it accepts MySQL and PostgreSQL wire protocol connections, translates the SQL dialect to SQLite, executes against a pluggable backend, and returns results in the original wire format.
+litewire is a protocol translation proxy: it accepts MySQL, PostgreSQL, and TDS
+(SQL Server) wire-protocol connections plus Hrana HTTP requests, translates the
+SQL dialect to SQLite, executes against a pluggable backend, and returns
+results in the original wire format.
+
+Every claim in this document is backed by code in this repository; file paths
+are given throughout so it can be checked against the source.
 
 ## Overview
 
@@ -8,23 +14,24 @@ litewire is a protocol translation proxy: it accepts MySQL and PostgreSQL wire p
 graph LR
     subgraph clients["Clients"]
         mysql_client["MySQL clients\n(pdo_mysql, mysql CLI, ORMs)"]
-        pg_client["PG clients\n(pdo_pgsql, psql, ORMs)"]
-        tds_client["SQL Server clients\n(pdo_sqlsrv, sqlcmd, ORMs)"]
-        hrana_client["libsql SDK clients\n(Rust, JS, Python, Go)"]
+        pg_client["PG clients\n(pdo_pgsql, psql)"]
+        tds_client["SQL Server clients\n(experimental)"]
+        hrana_client["libsql SDK clients"]
     end
 
     subgraph litewire["litewire"]
         mysql_fe["MySQL Wire Frontend\n(opensrv-mysql)"]
         pg_fe["PG Wire Frontend\n(pgwire)"]
         tds_fe["TDS Wire Frontend\n(custom)"]
-        hrana_fe["Hrana HTTP Frontend\n(axum, sqld-compatible)"]
-        translator["SQL Translator\n(sqlparser-rs)"]
-        backend_trait["Backend Trait"]
+        hrana_fe["Hrana HTTP Frontend\n(axum, stateless)"]
+        session["Session layer\n(translate + tx state + error map)"]
+        backend_trait["Backend trait"]
     end
 
     subgraph backends["Backends"]
-        rusqlite["rusqlite\n(in-process)"]
-        libsql["libsql\n(HTTP/Hrana to sqld)"]
+        rusqlite["Rusqlite\n(in-process)"]
+        hrana_be["HranaClient\n(HTTP to sqld)"]
+        turso["Turso\n(experimental)"]
         custom["Custom\n(implement trait)"]
     end
 
@@ -32,17 +39,18 @@ graph LR
     pg_client --> pg_fe
     tds_client --> tds_fe
     hrana_client --> hrana_fe
-    mysql_fe --> translator
-    pg_fe --> translator
-    tds_fe --> translator
-    translator --> backend_trait
+    mysql_fe --> session
+    pg_fe --> session
+    tds_fe --> session
+    session --> backend_trait
     hrana_fe --> backend_trait
     backend_trait --> rusqlite
-    backend_trait --> libsql
+    backend_trait --> hrana_be
+    backend_trait --> turso
     backend_trait --> custom
 
     style litewire fill:#f5f5f5,stroke:#333
-    style translator fill:#e3f2fd,stroke:#1565c0
+    style session fill:#e3f2fd,stroke:#1565c0
     style mysql_fe fill:#fff3e0,stroke:#ef6c00
     style pg_fe fill:#e8f5e9,stroke:#388e3c
     style tds_fe fill:#f3e5f5,stroke:#7b1fa2
@@ -51,632 +59,336 @@ graph LR
 
 ## Crate Structure
 
+The workspace members, as declared in the root `Cargo.toml`:
+
 ```
 litewire/
-├── Cargo.toml              # workspace root
+├── Cargo.toml                  # workspace root
 ├── crates/
-│   ├── litewire/           # main crate (re-exports everything)
-│   │   ├── src/
-│   │   │   ├── lib.rs      # public API: LiteWire builder
-│   │   │   └── main.rs     # CLI binary
-│   │   └── Cargo.toml
-│   ├── litewire-translate/ # SQL dialect translation
-│   │   ├── src/
-│   │   │   ├── lib.rs
-│   │   │   ├── mysql.rs    # MySQL -> SQLite rewrites
-│   │   │   ├── postgres.rs # PG -> SQLite rewrites
-│   │   │   ├── tds.rs      # T-SQL -> SQLite rewrites
-│   │   │   ├── common.rs   # shared rewrites (types, functions)
-│   │   │   ├── metadata.rs # SHOW/DESCRIBE/INFORMATION_SCHEMA/sys.*
-│   │   │   └── emit.rs     # AST -> SQLite SQL string
-│   │   └── Cargo.toml
-│   ├── litewire-mysql/     # MySQL wire protocol frontend
-│   │   ├── src/
-│   │   │   ├── lib.rs
-│   │   │   ├── handler.rs  # opensrv-mysql shim implementation
-│   │   │   ├── types.rs    # MySQL type <-> SQLite affinity mapping
-│   │   │   └── resultset.rs# SQLite rows -> MySQL wire result packets
-│   │   └── Cargo.toml
-│   ├── litewire-postgres/  # PG wire protocol frontend
-│   │   ├── src/
-│   │   │   ├── lib.rs
-│   │   │   ├── handler.rs  # pgwire processor implementation
-│   │   │   ├── types.rs    # PG OID <-> SQLite affinity mapping
-│   │   │   └── resultset.rs# SQLite rows -> PG wire result packets
-│   │   └── Cargo.toml
-│   ├── litewire-tds/       # TDS (SQL Server) wire protocol frontend
-│   │   ├── src/
-│   │   │   ├── lib.rs
-│   │   │   ├── handler.rs  # TDS protocol handler (custom implementation)
-│   │   │   ├── types.rs    # SQL Server type <-> SQLite affinity mapping
-│   │   │   └── resultset.rs# SQLite rows -> TDS result tokens
-│   │   └── Cargo.toml
-│   ├── litewire-hrana/     # Hrana protocol frontend (sqld-compatible)
-│   │   ├── src/
-│   │   │   ├── lib.rs
-│   │   │   ├── http.rs     # Hrana 3 HTTP pipeline (/v2/pipeline)
-│   │   │   ├── types.rs    # Hrana request/response types
-│   │   │   └── baton.rs    # session/transaction continuity via baton tokens
-│   │   └── Cargo.toml
-│   └── litewire-backend/   # backend trait + implementations
-│       ├── src/
-│       │   ├── lib.rs      # Backend trait definition
-│       │   ├── rusqlite.rs # rusqlite backend
-│       │   └── libsql.rs   # libsql HTTP/Hrana backend
-│       └── Cargo.toml
-├── tests/
-│   ├── mysql_compat.rs     # MySQL client -> litewire -> SQLite roundtrip
-│   ├── pg_compat.rs        # PG client -> litewire -> SQLite roundtrip
-│   ├── tds_compat.rs       # SQL Server client -> litewire -> SQLite roundtrip
-│   ├── wordpress.rs        # WordPress SQL patterns
-│   └── laravel.rs          # Laravel SQL patterns
+│   ├── litewire/               # main crate: LiteWire builder + CLI binary
+│   │   ├── src/lib.rs          #   builder, feature-gated re-exports
+│   │   ├── src/main.rs         #   CLI binary (requires the `cli` feature)
+│   │   └── tests/              #   wire-level end-to-end tests (real clients:
+│   │                           #   mysql_async, tokio-postgres, tiberius)
+│   ├── litewire-backend/       # Backend trait + implementations
+│   │   ├── src/lib.rs          #   Backend / BackendConn traits, Value, ResultSet
+│   │   ├── src/auth.rs         #   ConnectionAuthenticator (per-connection backends)
+│   │   ├── src/conn_limit.rs   #   ConnectionLimiter (max_connections)
+│   │   ├── src/rusqlite_backend.rs  # in-process SQLite (feature `rusqlite`)
+│   │   ├── src/hrana_client.rs      # remote sqld client (feature `hrana-client`)
+│   │   └── src/write_admission.rs   # write admission control (feature `hrana-client`)
+│   ├── litewire-translate/     # SQL dialect translation
+│   │   ├── src/lib.rs          #   translate(), classify(), no-op/transaction pre-passes
+│   │   ├── src/common.rs       #   shared expression rewrites
+│   │   ├── src/mysql.rs        #   MySQL rewrites (DDL, upserts, LIKE, REGEXP, ...)
+│   │   ├── src/postgres.rs     #   PG type mappings
+│   │   ├── src/tds.rs          #   T-SQL rewrites (TOP, IDENTITY, types)
+│   │   ├── src/metadata.rs     #   SHOW/DESCRIBE/INFORMATION_SCHEMA/sys.* emulation
+│   │   ├── src/found_rows.rs   #   SQL_CALC_FOUND_ROWS / FOUND_ROWS() helpers
+│   │   ├── src/cache.rs        #   bounded LRU translate cache
+│   │   └── src/emit.rs         #   AST -> SQL string (sqlparser Display)
+│   ├── litewire-session/       # dialect-aware session layer
+│   │   ├── src/lib.rs          #   Session: translation + tx state + FOUND_ROWS
+│   │   └── src/error_map.rs    #   SQLite error text -> MySQL error codes
+│   ├── litewire-mysql/         # MySQL wire protocol frontend
+│   │   ├── src/lib.rs          #   listener, connection cap, TCP_NODELAY, buffering
+│   │   ├── src/handler.rs      #   opensrv-mysql AsyncMysqlShim implementation
+│   │   ├── src/command_filter.rs    # screens command packets opensrv mishandles
+│   │   ├── src/native_password.rs   # mysql_native_password verify helpers
+│   │   └── src/types.rs        #   SQLite affinity -> MySQL column types
+│   ├── litewire-postgres/      # PG wire protocol frontend (pgwire)
+│   ├── litewire-tds/           # TDS wire protocol frontend (custom, experimental)
+│   ├── litewire-hrana/         # Hrana HTTP frontend (stateless subset)
+│   └── litewire-turso/         # experimental Turso Database engine backend
 └── docs/
-    ├── architecture.md     # this file
-    └── sql-translation.md  # full translation reference
+    ├── architecture.md         # this file
+    └── sql-translation.md      # what SQL is translated, emulated, or rejected
 ```
+
+## Feature Flags
+
+Features of the `litewire` crate (`crates/litewire/Cargo.toml`):
+
+| Flag | Default | What it enables |
+|------|---------|----------------|
+| `mysql` | **yes** | MySQL wire protocol frontend |
+| `hrana` | **yes** | Hrana HTTP frontend (stateless subset of sqld's API) |
+| `backend-rusqlite` | **yes** | In-process SQLite via rusqlite |
+| `postgres` | no | PostgreSQL wire protocol frontend |
+| `tds` | no | TDS (SQL Server) wire protocol frontend — experimental |
+| `backend-hrana-client` | no | Remote sqld via HTTP/Hrana (`HranaClient` backend) |
+| `turso` | no | **Experimental** Turso Database engine backend |
+| `cli` | no | The `litewire` binary (pulls in clap + tracing-subscriber) |
+
+The binary is gated: `cargo build` without `--features cli` produces no
+`litewire` executable (`required-features = ["cli"]` on the `[[bin]]` target).
 
 ## Component Design
 
 ### Backend Trait
 
-The backend trait abstracts over how SQL gets executed. litewire doesn't care whether SQLite is in-process or remote.
+Defined in `crates/litewire-backend/src/lib.rs`. `Backend` is a **factory**:
+each wire connection gets its own `BackendConn` session via
+`Backend::connect()`, which is what makes transaction state per-client — one
+client's `BEGIN` cannot swallow another client's statements.
 
 ```rust
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
-    /// Execute a query and return rows.
-    async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet>;
+    /// Open a new session. Each BackendConn has its own transaction state.
+    async fn connect(&self) -> Result<Box<dyn BackendConn>, BackendError>;
 
-    /// Execute a statement and return affected row count.
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult>;
+    // Stateless conveniences (fresh throw-away session per call):
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> { ... }
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, BackendError> { ... }
+    async fn describe_columns(&self, sql: &str) -> Result<Vec<Column>, BackendError> { ... }
+}
 
-    /// Prepare a statement (optional, default falls back to query/execute).
-    async fn prepare(&self, sql: &str) -> Result<PreparedStatement> { ... }
+#[async_trait]
+pub trait BackendConn: Send + Sync {
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError>;
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, BackendError>;
+    /// Describe a prepared SELECT's columns without executing it.
+    /// Default impl falls back to a `LIMIT 0` probe; rusqlite overrides it.
+    async fn describe_columns(&self, sql: &str) -> Result<Vec<Column>, BackendError> { ... }
 }
 ```
 
-The `rusqlite` backend wraps queries in `spawn_blocking`. The `libsql` backend sends HTTP requests to sqld's Hrana API. Custom backends implement the trait for whatever storage they need.
+Three implementations ship:
+
+* **`Rusqlite`** (`rusqlite_backend.rs`, feature `rusqlite`) — in-process
+  SQLite. Each session owns a dedicated OS worker thread that owns its
+  `rusqlite::Connection` (SQLite calls never run on a tokio worker); WAL mode
+  is set once at open, each session sets `busy_timeout` (default 5000 ms) and
+  `synchronous=NORMAL`, and statements use `prepare_cached`. `Rusqlite::memory()`
+  is backed by a temp file (deleted on drop) so per-connection isolation and
+  WAL semantics hold. A `regexp()` scalar function backed by the `regex` crate
+  is registered so SQLite's `REGEXP` operator works.
+* **`HranaClient`** (`hrana_client.rs`, feature `backend-hrana-client`) —
+  forwards to a remote sqld over the Hrana 3 HTTP pipeline protocol. Each
+  session pins itself to one sqld stream via the Hrana baton, and a
+  write-admission semaphore (`write_admission.rs`) bounds concurrent writes so
+  sqld's single-writer lock is queued on this side instead of thrashed.
+* **`Turso`** (`crates/litewire-turso`, feature `turso`) — **experimental**
+  in-process backend on the Turso Database engine (the Rust rewrite of SQLite,
+  Beta upstream, pinned `=0.7.0`). Async-native (no `spawn_blocking`). Known
+  unsupported: `VACUUM`, `ATTACH`/`DETACH`, multi-process access to one file,
+  byte-exact non-UTF-8 `TEXT` round-trips. It also exposes an experimental CDC
+  tail/apply API (`crates/litewire-turso/src/cdc.rs`) for external replication
+  layers.
+
+### Session Layer
+
+`crates/litewire-session` — the protocol-independent core of a client
+connection, extracted from the MySQL handler so embedders can run SQL
+in-process with exactly the wire path's semantics. A `Session` owns one
+`BackendConn` and provides:
+
+* dialect translation (via `litewire-translate`, with a shared LRU cache),
+* explicit-transaction state tracking (`in_transaction`, reported in MySQL
+  status flags),
+* `SQL_CALC_FOUND_ROWS` / `SELECT FOUND_ROWS()` emulation — the hint triggers
+  a derived `COUNT(*)` round trip; a bare `SELECT FOUND_ROWS()` is answered
+  from session state without touching the backend,
+* error mapping (`error_map.rs`): SQLite error text → MySQL error triples.
+  Mapped codes: 1062 duplicate entry (with a MySQL-shaped message prefix,
+  because stock drivers match the text), 1146 no such table (42S02), 1205
+  lock wait timeout for `SQLITE_BUSY`, 1290 read-only, 1452 foreign key,
+  1064 parse/translate errors, 1105 fallback.
 
 ### SQL Translator
 
-The translator is the core of litewire. It uses `sqlparser-rs` to parse input SQL into an AST, rewrites dialect-specific nodes, then emits SQLite-compatible SQL.
+`crates/litewire-translate`. `translate(sql, dialect)` runs a fixed pipeline
+(see `lib.rs::translate`):
 
-```mermaid
-flowchart LR
-    A["Input SQL string\n(MySQL or PG dialect)"] --> B["sqlparser-rs\n(dialect-aware parser)"]
-    B --> C["AST"]
-    C --> D["Rewrite pass\n(visitor pattern)"]
-    D --> E["SQLite AST"]
-    E --> F["Emit"]
-    F --> G["SQLite SQL string"]
+1. **Metadata detection** (before parsing — some inputs are not valid SQL):
+   `SHOW ...`, `DESCRIBE`, `INFORMATION_SCHEMA.*`, `SELECT @@vars`,
+   `pg_catalog.*`, `sys.tables`/`sys.columns`, `sp_tables`/`sp_columns` are
+   answered by emulation queries against `sqlite_master` / `PRAGMA`.
+2. **Transaction statement rewrites** (textual): `START TRANSACTION [...]`,
+   `BEGIN WORK`, `BEGIN TRANSACTION [name]` → `BEGIN`; `COMMIT`/`ROLLBACK`
+   variants normalized; T-SQL savepoint rollbacks mapped to
+   `ROLLBACK TO SAVEPOINT`.
+3. **No-op detection**: `SET NAMES/CHARACTER SET/time_zone/sql_mode`,
+   `SET autocommit` (with a warning for `autocommit=0`, which is *not*
+   emulated), `SET [SESSION|GLOBAL] ...`, `SET TRANSACTION ISOLATION LEVEL`,
+   T-SQL `SET NOCOUNT/ANSI_NULLS/QUOTED_IDENTIFIER/XACT_ABORT`, and
+   `LOCK/UNLOCK TABLES` (warning: SQLite has file-level locking only).
+4. **MySQL pre-passes** (quote-aware text transforms for constructs sqlparser
+   cannot parse): strip display widths / index prefix lengths from DDL
+   (`bigint(20)`, `KEY k (col(191))`), strip SELECT hints
+   (`SQL_CALC_FOUND_ROWS`, `SQL_NO_CACHE`, ...).
+5. **Parse** with the dialect-matched sqlparser dialect, **rewrite** the AST
+   (`common.rs` then the per-dialect module), and **emit** via sqlparser's
+   `Display`. MySQL `ALTER TABLE ... ADD KEY/UNIQUE` expands into standalone
+   `CREATE INDEX` statements.
 
-    style D fill:#e3f2fd,stroke:#1565c0
-```
+`translate_cached` puts a bounded LRU (`cache.rs`) in front of this; the MySQL
+frontend shares one cache across all connections. Unparseable SQL returns
+`TranslateError::Parse`, surfaced to MySQL clients as `ER_PARSE_ERROR (1064)`.
 
-The rewrite pass is a visitor pattern over the AST:
-
-```rust
-pub fn translate(sql: &str, source_dialect: Dialect) -> Result<String> {
-    let ast = Parser::parse_sql(&source_dialect, sql)?;
-    let rewritten = rewrite_statements(ast)?;
-    Ok(emit_sqlite(&rewritten))
-}
-```
-
-Rewrite rules are organized by category:
-
-**Expressions** (`common.rs`):
-- `NOW()` -> `datetime('now')`
-- `CURDATE()` -> `date('now')`
-- `UNIX_TIMESTAMP()` -> `strftime('%s', 'now')`
-- `TRUE` / `FALSE` -> `1` / `0`
-- `IFNULL()` -> passed through (SQLite supports it)
-- `::type` casts -> `CAST(... AS ...)`
-- `$1`, `$2` params -> `?1`, `?2`
-
-**DDL** (`mysql.rs` / `postgres.rs`):
-- `AUTO_INCREMENT` -> `AUTOINCREMENT` (on `INTEGER PRIMARY KEY`)
-- `SERIAL` / `BIGSERIAL` -> `INTEGER PRIMARY KEY AUTOINCREMENT`
-- `VARCHAR(n)`, `CHAR(n)` -> `TEXT`
-- `INT`, `BIGINT`, `SMALLINT`, `TINYINT` -> `INTEGER`
-- `FLOAT`, `DOUBLE`, `DECIMAL` -> `REAL`
-- `BLOB`, `LONGBLOB`, `BYTEA` -> `BLOB`
-- `BOOLEAN` -> `INTEGER`
-- `DATETIME`, `TIMESTAMP` -> `TEXT`
-- `ENGINE=InnoDB` -> stripped
-- `DEFAULT CHARSET=...` -> stripped
-
-**MySQL expressions** (`mysql.rs`):
-- `YEAR(x)` / `MONTH(x)` / `DAYOFMONTH(x)` / `DAY(x)` ->
-  `CAST(strftime('%Y'|'%m'|'%d', x) AS INTEGER)` (the cast matters: MySQL
-  returns an integer, and `'03' = 3` is false in SQLite)
-- `x RLIKE p` -> `x REGEXP p` (SQLite knows only the `REGEXP` spelling)
-- `LIKE` without `ESCAPE` -> `LIKE ... ESCAPE '\'` (MySQL's implicit escape)
-
-SQLite parses `REGEXP` but ships no implementation of it: the operator
-resolves to a `regexp(pattern, subject)` function the host must supply. The
-rusqlite backend registers one backed by the Rust `regex` crate, and the
-Turso engine ships an equivalent built-in, so `REGEXP` behaves the same on
-both. It is case-sensitive on both, where MySQL follows the column
-collation.
-
-**DML** (`mysql.rs`):
-- `INSERT ... ON DUPLICATE KEY UPDATE` -> `INSERT ... ON CONFLICT DO UPDATE`
-- `REPLACE INTO` -> passed through (SQLite supports it)
-- `LIMIT x, y` -> `LIMIT y OFFSET x`
-
-**Metadata** (`metadata.rs`):
-- `SHOW TABLES` -> `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`
-- `SHOW DATABASES` -> synthetic single-row result
-- `SHOW COLUMNS FROM t` / `DESCRIBE t` -> `PRAGMA table_info(t)`
-- `SHOW CREATE TABLE t` -> reconstruct from `sqlite_master`
-- `SHOW INDEX FROM t` -> `PRAGMA index_list(t)` + `PRAGMA index_info(...)`
-- `SELECT ... FROM INFORMATION_SCHEMA.TABLES` -> `sqlite_master` query
-- `SELECT ... FROM INFORMATION_SCHEMA.COLUMNS` -> `PRAGMA table_info` for each table
-- `SELECT ... FROM pg_catalog.*` -> mapped to equivalent PRAGMAs
-
-**No-ops** (swallowed silently):
-- `SET NAMES ...`
-- `SET CHARACTER SET ...`
-- `SET SESSION ...` / `SET GLOBAL ...` (most)
-- `SET time_zone = ...`
-- `SET sql_mode = ...`
+The full translation reference — every rewrite, every emulated metadata query,
+and what is rejected — is in [sql-translation.md](sql-translation.md).
 
 ### MySQL Wire Frontend
 
-Built on `opensrv-mysql` (Databend's production MySQL protocol crate). Implements the `AsyncMysqlShim` trait:
+`crates/litewire-mysql`, built on `opensrv-mysql`. This is the most complete
+frontend — it is exercised end-to-end by real-client tests
+(`crates/litewire/tests/mysql_e2e.rs` and friends, driven via `mysql_async`)
+and has been validated against WordPress and Laravel traffic.
 
-```mermaid
-sequenceDiagram
-    participant PHP as PHP (pdo_mysql)
-    participant FE as MySQL Frontend
-    participant TX as Translator
-    participant BE as Backend
+Key implementation details, all in-source:
 
-    PHP->>FE: TCP connect
-    FE->>PHP: Handshake (greeting, auth OK)
+* **Auth**: with a fixed backend, any username/password is accepted
+  (`handler.rs::authenticate` returns `true` when no authenticator is
+  installed). With `LiteWire::with_authenticator`, the embedder-supplied
+  `ConnectionAuthenticator` decides per connection — see below.
+* **Server version**: the handshake, `SELECT VERSION()`, and `@@version` all
+  report the single constant `litewire_translate::SERVER_VERSION`
+  (`8.0.36-litewire`) so they cannot disagree.
+* **Command coverage**: `COM_QUERY`, `COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`,
+  `COM_INIT_DB`, `COM_FIELD_LIST`, `COM_PING`, `COM_QUIT` are handled by the
+  opensrv shim. A `CommandFilter` (`command_filter.rs`) screens every other
+  command byte: `COM_STMT_RESET`, `COM_RESET_CONNECTION`, and
+  `COM_CHANGE_USER` are rewritten to the OK-equivalent `COM_PING` (with a
+  lazy session reset), and unknown commands are answered with
+  `ER_UNKNOWN_COM_ERROR (1047)` instead of the stray OK packet that used to
+  desynchronize persistent PHP connections.
+* **Connection cap**: `max_connections` refuses over-limit clients immediately
+  with a pre-handshake `ER_CON_COUNT_ERROR (1040)` packet; accepts are never
+  queued.
+* **Latency**: `TCP_NODELAY` on accepted sockets plus a 64 KiB `BufWriter` so
+  a whole result set goes out as one write — without both, Nagle + delayed-ACK
+  cost ~40 ms per query against PHP's mysqlnd.
 
-    PHP->>FE: COM_QUERY "SELECT NOW()"
-    FE->>TX: translate("SELECT NOW()", MySQL)
-    TX->>FE: "SELECT datetime('now')"
-    FE->>BE: query("SELECT datetime('now')")
-    BE->>FE: ResultSet
-    FE->>PHP: MySQL result packets
+### Per-Connection Backends (Multi-Tenant)
 
-    PHP->>FE: COM_STMT_PREPARE "SELECT * FROM users WHERE id = ?"
-    FE->>TX: translate("SELECT * FROM users WHERE id = ?", MySQL)
-    TX->>FE: "SELECT * FROM users WHERE id = ?1"
-    FE->>BE: prepare(...)
-    BE->>FE: PreparedStatement
-    FE->>PHP: STMT_PREPARE OK
+`LiteWire::with_authenticator` (see `crates/litewire/src/lib.rs` and
+`crates/litewire-backend/src/auth.rs`) builds a server with **no** fixed
+backend: a `ConnectionAuthenticator` runs during the MySQL handshake and
+returns the backend that connection is bound to, or rejects it. A rejected
+connection never has a backend session opened.
 
-    PHP->>FE: COM_STMT_EXECUTE (stmt_id, params=[42])
-    FE->>BE: query("SELECT * FROM users WHERE id = ?1", [42])
-    BE->>FE: ResultSet
-    FE->>PHP: MySQL result packets
-```
-
-Key implementation details:
-- **Auth**: accepts any username/password (or configurable via callback)
-- **COM_QUERY**: simple text query protocol. Parse MySQL SQL, translate, execute, return results.
-- **COM_STMT_PREPARE / COM_STMT_EXECUTE**: prepared statement protocol. Required for `pdo_mysql` which uses prepared statements by default.
-- **COM_INIT_DB**: "USE database" -- no-op (SQLite has one database)
-- **COM_PING**: health check -- always OK
-- **COM_FIELD_LIST**: column metadata -- backed by PRAGMA
+This is MySQL-frontend-only by design: `serve()` refuses to start if Hrana,
+PostgreSQL, or TDS listeners are also configured under an authenticator,
+because those frontends would need one shared backend for every client —
+exactly the hole the authenticator exists to close. The security contract
+(why the handshake username is a claim, not an identity, and what to key on
+instead) is documented on the `auth` module; `native_password.rs` provides
+the `mysql_native_password` verification helpers an implementation needs.
 
 ### PostgreSQL Wire Frontend
 
-Built on `pgwire` crate. Implements the `SimpleQueryHandler` and `ExtendedQueryHandler` traits:
+`crates/litewire-postgres`, built on `pgwire`. Implements
+`SimpleQueryHandler` and `ExtendedQueryHandler` (`handler.rs`), with a no-op
+startup handler — **any credentials are accepted**. Wire-compatible for basic
+CRUD with `psql` and the extended-query flow drivers use; exercised by
+`crates/litewire/tests/postgres_e2e.rs` via `tokio-postgres`.
 
-- **Simple query protocol**: `Query` message -> translate PG SQL -> execute -> `RowDescription` + `DataRow` + `CommandComplete`
-- **Extended query protocol**: `Parse`/`Bind`/`Describe`/`Execute`/`Sync` -- required for `pdo_pgsql`
-- **Type OIDs**: SQLite affinities mapped to PG type OIDs in `RowDescription` messages so drivers handle types correctly
+### TDS (SQL Server) Wire Frontend — Experimental
 
-### TDS (SQL Server) Wire Frontend
+`crates/litewire-tds`. No Rust crate implements the server side of TDS
+(`tiberius` is client-only), so this is a custom implementation. It handles
+Pre-Login, Login7, and SQL Batch messages and answers with
+`COLMETADATA`/`ROW`/`DONE` token streams (`handler.rs`, `packet.rs`,
+`token.rs`).
 
-The TDS (Tabular Data Stream) protocol is used by SQL Server and Sybase. No Rust crate exists for the server side of TDS -- `tiberius` implements only the client. The litewire TDS frontend is a custom implementation of the TDS 7.x protocol.
+Its limitations are real and documented in the README: authentication is
+simplified, the encrypted (TLS) handshake is not implemented, and the type
+palette is a subset (BigInt / Float8 / NVARCHAR / VarBinary). Real SQL Server
+tooling that requires encryption will not connect. Exercised by
+`crates/litewire/tests/tds_e2e.rs` via `tiberius` (with encryption off).
 
-TDS is a token-based binary protocol. Key message types:
+### Hrana HTTP Frontend
 
-- **Pre-Login**: TLS negotiation and version exchange
-- **Login7**: authentication (SQL auth or NTLM)
-- **SQL Batch**: text query (equivalent to MySQL's `COM_QUERY`)
-- **RPC Request**: parameterized query / stored procedure call (equivalent to prepared statements)
-- **Response tokens**: `COLMETADATA` + `ROW` + `DONE` (equivalent to MySQL result set packets)
+`crates/litewire-hrana` serves a **stateless subset** of sqld's Hrana HTTP
+API — enough for pipelined execute-style access, not a full sqld replacement.
 
-T-SQL-specific translation rules (in addition to the shared rules):
+Endpoints (`http.rs::build_router`):
 
-| T-SQL | SQLite |
-|-------|--------|
-| `GETDATE()` | `datetime('now')` |
-| `GETUTCDATE()` | `datetime('now')` |
-| `NEWID()` | `lower(hex(randomblob(16)))` |
-| `ISNULL(a, b)` | `IFNULL(a, b)` |
-| `TOP n` | `LIMIT n` |
-| `IDENTITY(1,1)` | `INTEGER PRIMARY KEY AUTOINCREMENT` |
-| `NVARCHAR(n)` / `NCHAR(n)` | `TEXT` |
-| `BIT` | `INTEGER` |
-| `MONEY` / `SMALLMONEY` | `REAL` |
-| `UNIQUEIDENTIFIER` | `TEXT` |
-| `@@IDENTITY` | `last_insert_rowid()` |
-| `@@ROWCOUNT` | `changes()` |
-| `sys.tables` / `sys.columns` | `sqlite_master` + `PRAGMA` queries |
-| `sp_tables` / `sp_columns` | mapped to `sqlite_master` + `PRAGMA` |
-| `SET NOCOUNT ON` | no-op |
-| `BEGIN TRY ... END TRY` | stripped (SQLite has no structured error handling) |
-| `[bracketed identifiers]` | `"quoted identifiers"` |
+* `POST /v2/pipeline` — Hrana pipeline requests. Supported request types:
+  `execute` and `close` only.
+* `GET /health` — returns `ok`.
+* `GET /version` — returns `litewire/<crate version>`.
 
-Key implementation details:
-- **Auth**: accept any SQL auth credentials (or configurable callback). NTLM/Kerberos not supported.
-- **SQL Batch**: parse T-SQL, translate, execute, return `COLMETADATA` + `ROW` + `DONE` tokens.
-- **RPC Request**: handle `sp_executesql` (parameterized queries) and `sp_prepare`/`sp_execute`.
-- **`USE database`**: no-op (SQLite has one database).
-- **TDS version**: target TDS 7.4 (SQL Server 2012+). Older versions are out of scope.
+Statements are executed through the backend's stateless API; there is **no
+baton-based session continuity** — the response's `baton` is always `null`
+(`http.rs`: "Stateless for now"), so multi-request interactive transactions
+over Hrana are not supported. `batch`/`sequence`/`describe` request types are
+not implemented. There is **no authentication** on this frontend. SQL arrives
+as SQLite SQL and bypasses the translator entirely.
 
-PHP connects via `pdo_sqlsrv` or `pdo_dblib`. Laravel's `sqlsrv` driver works out of the box:
-
-```php
-// Laravel .env
-DB_CONNECTION=sqlsrv
-DB_HOST=127.0.0.1
-DB_PORT=1433
-DB_DATABASE=app
-```
-
-### Hrana Protocol Frontend (sqld-Compatible)
-
-litewire implements the server side of Turso's Hrana 3 HTTP protocol, making it a lightweight drop-in replacement for sqld. Apps using the `libsql` client SDK (Rust, JS, Python, Go) can point at litewire instead of sqld -- no replication server needed.
-
-This is the **key enabler for CI/CD and development workflows**. Instead of running sqld (which bundles the full replication engine, gRPC server, and WAL frame management), litewire serves the same HTTP API backed by plain rusqlite. Instant startup, zero configuration, disposable.
-
-**Endpoint:** `POST /v2/pipeline`
-
-**Request format:**
-```json
-{
-  "baton": null,
-  "requests": [
-    {"type": "execute", "stmt": {"sql": "SELECT * FROM users WHERE id = ?", "args": [{"type": "integer", "value": "42"}]}},
-    {"type": "close"}
-  ]
-}
-```
-
-**Response format:**
-```json
-{
-  "baton": "opaque-token",
-  "base_url": "http://localhost:8080",
-  "results": [{
-    "type": "ok",
-    "response": {
-      "type": "execute",
-      "result": {
-        "cols": [{"name": "id", "decltype": "INTEGER"}, {"name": "name", "decltype": "TEXT"}],
-        "rows": [[{"type": "integer", "value": "42"}, {"type": "text", "value": "Alice"}]],
-        "affected_row_count": 0,
-        "last_insert_rowid": null
-      }
-    }
-  }]
-}
-```
-
-Key implementation details:
-- **No SQL translation needed** -- Hrana clients send SQLite SQL natively. This frontend bypasses the translator entirely and goes straight to the backend.
-- **Baton-based sessions** -- the `baton` token links requests to a connection/transaction. litewire manages a pool of rusqlite connections, mapping batons to open transactions.
-- **Batch/sequence requests** -- multiple statements in a single HTTP request, with transactional semantics.
-- **Value types** -- `null`, `integer`, `float`, `text`, `blob` (base64). Direct mapping to SQLite types.
-- **No auth by default** -- same as sqld in development mode. Optional JWT validation for production.
-
-**CI/CD usage:**
-
-```yaml
-# GitHub Actions -- no sqld needed
-services:
-  db:
-    image: litewire:latest
-env:
-  LIBSQL_URL: http://db:8080
-```
-
-**ePHPm single-node / dev mode:**
-
-litewire with the Hrana frontend replaces sqld entirely for non-clustered deployments. ePHPm doesn't need to embed or spawn sqld -- it just starts litewire in library mode with rusqlite. The ephpm binary is smaller, startup is faster, and there's no child process to manage.
-
-```mermaid
-graph LR
-    subgraph single["ePHPm (single-node / CI)"]
-        php["PHP Runtime"]
-        mysql_fe["MySQL wire\nfrontend"]
-        hrana_fe["Hrana HTTP\nfrontend :8080"]
-        translate["SQL Translator"]
-        rusqlite["rusqlite\n(in-process)"]
-        db[("app.db")]
-
-        php -->|pdo_mysql :3306| mysql_fe
-        mysql_fe --> translate --> rusqlite
-        hrana_fe --> rusqlite
-        rusqlite --> db
-    end
-
-    ext["External tools\n(libsql SDK, Turso CLI)"] -->|HTTP/Hrana| hrana_fe
-
-    style single fill:#f5f5f5,stroke:#333
-    style hrana_fe fill:#e8f5e9,stroke:#388e3c
-    style mysql_fe fill:#fff3e0,stroke:#ef6c00
-```
-
-sqld is only needed when clustering/replication is enabled. The upgrade path is seamless -- apps using the Hrana API don't change anything, they just point at sqld instead of litewire when they scale up.
+Because it is stateless HTTP, the Hrana frontend is exempt from
+`max_connections` (it opens a throw-away backend session per statement rather
+than holding one per connection).
 
 ### Result Set Mapping
 
-SQLite returns untyped text values. The wire protocol frontends must map them to typed values:
+SQLite result values are dynamically typed. The wire frontends map them using
+the column's `decltype` when available (rusqlite exposes it via
+`Statement::columns()`; untyped expression columns fall back to typing by
+value):
 
 | SQLite affinity | MySQL type | PG type | TDS type |
 |----------------|------------|---------|----------|
-| `INTEGER` | `MYSQL_TYPE_LONGLONG` | `INT8` (OID 20) | `BIGINTTYPE` |
-| `REAL` | `MYSQL_TYPE_DOUBLE` | `FLOAT8` (OID 701) | `FLT8TYPE` |
-| `TEXT` | `MYSQL_TYPE_VAR_STRING` | `TEXT` (OID 25) | `NVARCHARTYPE` |
-| `BLOB` | `MYSQL_TYPE_BLOB` | `BYTEA` (OID 17) | `IMAGETYPE` |
-| `NULL` | `MYSQL_TYPE_NULL` | null indicator | null flag in `ROW` token |
+| `INTEGER` | `MYSQL_TYPE_LONGLONG` | `INT8` | `BigInt` |
+| `REAL` | `MYSQL_TYPE_DOUBLE` | `FLOAT8` | `Float8` |
+| `TEXT` | `MYSQL_TYPE_VAR_STRING` | `TEXT` | `NVARCHAR` |
+| `BLOB` | `MYSQL_TYPE_BLOB` | `BYTEA` | `VarBinary` |
+| `NULL` value | null flag in the row (column typed `VAR_STRING` when nothing better is known) | null indicator | null flag |
 
-Column type hints come from `decltype` in the SQLite result metadata (e.g., if the column was declared `INTEGER`, use integer type even if the value is text).
+(Exact mappings: `crates/litewire-mysql/src/types.rs`,
+`crates/litewire-postgres/src/types.rs`, `crates/litewire-tds/src/token.rs`.)
 
-## Dependencies
+## Use as a Library
 
-```toml
-# Wire protocol
-opensrv-mysql = "0.8"                    # MySQL server protocol
-pgwire = "0.28"                          # PG server protocol
-# TDS: no server-side crate exists -- custom implementation using tokio bytes/codec
+litewire is designed to be embedded. The builder API
+(`crates/litewire/src/lib.rs`):
 
-# SQL parsing and translation
-sqlparser = { version = "0.57", features = ["serde"] }
+```rust
+use litewire::{LiteWire, backend::Rusqlite};
 
-# Backends (feature-gated)
-rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
-libsql = { version = "0.7", optional = true, features = ["remote"] }
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let backend = Rusqlite::open("app.db")?;
 
-# Hrana protocol
-axum = "0.8"                             # HTTP server for Hrana endpoint
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-bytes = "1"                              # TDS packet framing
-tokio-util = { version = "0.7", features = ["codec"] }  # TDS codec
-
-# Error handling
-thiserror = "2"
-anyhow = "1"
-
-# Logging
-tracing = "0.1"
+    LiteWire::new(backend)
+        .mysql("127.0.0.1:3306")
+        .hrana("127.0.0.1:8080")
+        .max_connections(64)   // per wire frontend; 0 = unlimited (default)
+        .serve()
+        .await
+}
 ```
 
-## Feature Flags
+Embedders that execute SQL in-process rather than over a socket can use
+`litewire::Session` (re-exported from `litewire-session`) directly and get the
+same translation, transaction tracking, and error mapping the wire path has.
 
-| Flag | Default | What it enables |
-|------|---------|----------------|
-| `mysql` | yes | MySQL wire protocol frontend |
-| `postgres` | yes | PostgreSQL wire protocol frontend |
-| `tds` | yes | TDS (SQL Server) wire protocol frontend |
-| `hrana` | yes | Hrana HTTP frontend (sqld-compatible API) |
-| `backend-rusqlite` | yes | In-process SQLite via rusqlite |
-| `backend-libsql` | no | Remote sqld via HTTP/Hrana |
-| `cli` | no | `litewire` binary (pulls in clap) |
+[ePHPm](https://github.com/ephpm/ephpm) is one such consumer: it embeds
+litewire as a library to give PHP applications a MySQL-speaking endpoint
+backed by an embedded SQLite-family database. How ePHPm wires litewire into
+its deployment modes (single-node, per-site multi-tenant via
+`with_authenticator`, clustered replication) is ePHPm's concern and is
+documented in that repository — litewire itself is a standalone project with
+no ePHPm dependency, and nothing in this repo assumes ePHPm is the embedder.
 
-## Implementation Phases
+## Testing Conventions
 
-### Phase 1: Backend trait + rusqlite
-- Define `Backend` trait (`query`, `execute`, `prepare`)
-- Implement rusqlite backend with `spawn_blocking`
-- Connection pool with configurable size
-- Test: unit tests for direct query execution
-
-### Phase 2: Hrana HTTP frontend (sqld-compatible)
-- `POST /v2/pipeline` endpoint via axum
-- Handle `execute`, `batch`, `close` request types
-- Baton-based session management (map batons to open connections/transactions)
-- Value type serialization (`null`, `integer`, `float`, `text`, `blob`)
-- No SQL translation -- Hrana clients send SQLite SQL natively
-- Test: `libsql` Rust crate with `Builder::new_remote("http://localhost:8080", "")` connects and queries work
-- **This alone is a usable product** -- lightweight sqld replacement for CI/dev
-
-### Phase 3: MySQL wire + passthrough
-- `opensrv-mysql` accepts connections
-- No SQL translation yet -- forward raw SQL to rusqlite
-- Validates wire protocol plumbing end-to-end
-- Test: `mysql -h 127.0.0.1 -e "SELECT 1"` works
-
-### Phase 4: SQL translator core
-- `sqlparser-rs` parses MySQL dialect
-- Rewrite expressions: `NOW()`, `TRUE/FALSE`, type casts
-- Rewrite DML: `ON DUPLICATE KEY UPDATE`, `LIMIT offset, count`
-- Emit SQLite SQL from rewritten AST
-- Test: basic INSERT/SELECT/UPDATE/DELETE with MySQL syntax
-
-### Phase 5: DDL translation
-- `CREATE TABLE` with MySQL types -> SQLite affinities
-- `ALTER TABLE` (limited -- SQLite's ALTER is restricted)
-- `AUTO_INCREMENT` -> `AUTOINCREMENT`
-- Strip MySQL-specific clauses (`ENGINE=`, `CHARSET=`, etc.)
-- Test: `php artisan migrate` completes
-
-### Phase 6: Metadata queries
-- `SHOW TABLES`, `SHOW COLUMNS`, `DESCRIBE` -> `sqlite_master` / `PRAGMA`
-- `INFORMATION_SCHEMA.TABLES` / `COLUMNS` -> synthetic results
-- `SHOW CREATE TABLE` -> reconstructed DDL
-- Test: `php artisan migrate:status` works, Doctrine schema introspection passes
-
-### Phase 7: Prepared statements
-- `COM_STMT_PREPARE` / `COM_STMT_EXECUTE` for MySQL
-- Parameter binding: MySQL `?` -> SQLite `?` (positional, same)
-- Required for `pdo_mysql` which uses prepared statements by default
-- Test: Laravel ORM CRUD operations
-
-### Phase 8: PostgreSQL wire frontend
-- `pgwire` simple query + extended query protocol
-- PG-specific rewrites: `$1`->`?1`, `SERIAL`, `::type` casts
-- Shares the same translator core as MySQL
-- Test: `psql` connects, Laravel with `pdo_pgsql` works
-
-### Phase 9: TDS (SQL Server) wire frontend
-- Custom TDS 7.4 protocol implementation (Pre-Login, Login7, SQL Batch, RPC Request)
-- T-SQL-specific rewrites: `GETDATE()`, `TOP n`, `ISNULL()`, `IDENTITY`, `[brackets]`
-- `sys.tables` / `sys.columns` / `sp_tables` / `sp_columns` -> `sqlite_master` + `PRAGMA`
-- `sp_executesql` handling for parameterized queries
-- Test: `sqlcmd` connects, Laravel with `pdo_sqlsrv` works
-
-### Phase 10: libsql backend
-- `Backend` implementation using `libsql` crate with `remote` feature
-- Connects to sqld via HTTP/Hrana (for when litewire is used as a protocol frontend for a sqld cluster)
-- Test: litewire -> sqld -> SQLite roundtrip
-
-### Phase 11: WordPress + Laravel test suites
-- Run WordPress test suite through litewire (MySQL frontend)
-- Run Laravel test suite through litewire (MySQL, PG, and SQL Server frontends)
-- Document unsupported SQL constructs per dialect
-- Fix translation gaps discovered by real-world usage
+Wire-level end-to-end tests live in `crates/litewire/tests/` and drive real
+client libraries against an in-process server: `mysql_async` (MySQL),
+`tokio-postgres` (PG), `tiberius` (TDS). The project's convention is that a
+wire-visible bugfix lands with a wire-level regression test reproducing the
+client-observed failure (see e.g. `mysql_server_version.rs`,
+`mysql_housekeeping.rs`, `mysql_error_codes.rs`, `max_connections.rs`,
+`mysql_multi_tenant.rs`). Unit tests live next to the code they cover.
 
 ## Prior Art
 
-| Project | Language | What it does | Status |
-|---------|----------|-------------|--------|
-| **Marmot** (2.8k stars) | Go | MySQL wire -> SQLite, distributed. Runs WordPress. | Active |
-| **WP sqlite-database-integration** | PHP | Intercepts MySQL queries in PHP, rewrites to SQLite | Active, official WP project |
-| **Postlite** (1.2k stars) | Go | PG wire -> SQLite | Archived |
-| **opensrv-mysql** | Rust | MySQL wire protocol server (no SQL translation) | Active |
-| **pgwire** (734 stars) | Rust | PG wire protocol server (no SQL translation) | Active |
-
-The Rust building blocks exist but nobody has assembled them into a complete translation proxy. litewire is the first Rust project to combine wire protocol frontends, SQL dialect translation, and SQLite backends into a single package.
-
-## Use as a Library (ePHPm Example)
-
-litewire is designed to be embedded in other projects. [ePHPm](https://github.com/ephpm/ephpm) uses litewire as a library in two modes depending on deployment:
-
-### Single-Node / CI / Development
-
-No sqld needed. litewire runs entirely in-process with the rusqlite backend. PHP connects via the MySQL wire frontend, external tools connect via the Hrana HTTP frontend. The ephpm binary is smaller and starts instantly.
-
-```mermaid
-graph TD
-    subgraph ephpm["ePHPm (single-node)"]
-        http["HTTP Server"]
-        php["PHP Runtime"]
-        mysql_fe["litewire\nMySQL wire :3306"]
-        hrana_fe["litewire\nHrana HTTP :8080"]
-        translate["SQL Translator"]
-        rusqlite["rusqlite\n(in-process)"]
-        db[("app.db")]
-
-        http --> php
-        php -->|pdo_mysql| mysql_fe
-        mysql_fe --> translate
-        translate --> rusqlite
-        hrana_fe --> rusqlite
-        rusqlite --> db
-    end
-
-    ext["External tools\n(libsql SDK, Turso CLI)"] -->|HTTP/Hrana| hrana_fe
-
-    style ephpm fill:#f5f5f5,stroke:#333
-    style mysql_fe fill:#fff3e0,stroke:#ef6c00
-    style hrana_fe fill:#e8f5e9,stroke:#388e3c
-    style rusqlite fill:#e3f2fd,stroke:#1565c0
-```
-
-### Clustered (3-Node HA)
-
-sqld is spawned as a child process for replication. litewire's MySQL wire frontend still handles PHP connections, but the backend switches to the libsql HTTP client talking to the local sqld instance. The Hrana frontend is not needed here -- sqld serves that role.
-
-```mermaid
-graph TD
-    subgraph ephpm["ePHPm (clustered node)"]
-        http["HTTP Server"]
-        php["PHP Runtime"]
-        mysql_fe2["litewire\nMySQL wire :3306"]
-        translate2["SQL Translator"]
-        libsql_be["libsql backend\n(HTTP/Hrana client)"]
-        sqld_mgr["sqld Manager"]
-    end
-
-    subgraph sqld["sqld (child process)"]
-        hrana["Hrana HTTP :8081"]
-        engine["libSQL Engine"]
-        db[("app.db")]
-        hrana --> engine --> db
-    end
-
-    http --> php
-    php -->|pdo_mysql| mysql_fe2
-    mysql_fe2 --> translate2
-    translate2 --> libsql_be
-    libsql_be -->|HTTP/Hrana| hrana
-    sqld_mgr -.->|spawn/monitor| sqld
-
-    style ephpm fill:#f5f5f5,stroke:#333
-    style mysql_fe2 fill:#fff3e0,stroke:#ef6c00
-    style libsql_be fill:#e3f2fd,stroke:#1565c0
-    style sqld fill:#e8f5e9,stroke:#388e3c
-```
-
-ePHPm handles: mode selection (single-node vs clustered), sqld lifecycle, primary election via gossip, replication configuration.
-litewire handles: wire protocol, SQL translation, query execution against whichever backend is configured.
-
-## Future Plans
-
-Beyond the core MySQL, PostgreSQL, and TDS wire protocol frontends, litewire could grow to support additional protocols that map naturally to SQLite.
-
-### etcd-Compatible API
-
-etcd uses a gRPC API for key/value storage, watches, leases, and transactions. The mapping to SQLite is natural:
-
-```
-etcd operation              SQLite equivalent
-───────────────────────────────────────────────────────
-PUT key value            -> INSERT OR REPLACE INTO kv (key, value, ...) VALUES (?, ?, ...)
-GET key                  -> SELECT value FROM kv WHERE key = ?
-GET --prefix "/app/"     -> SELECT * FROM kv WHERE key LIKE '/app/%'
-DELETE key               -> DELETE FROM kv WHERE key = ?
-TXN (compare-and-swap)   -> BEGIN; SELECT; UPDATE; COMMIT (conditional)
-WATCH key                -> poll or trigger-based change notification
-LEASE (TTL)              -> expiry column + background reaper
-```
-
-This would let apps that depend on etcd for configuration, service discovery, or leader election drop the etcd cluster entirely and use SQLite. For small deployments, etcd requires a 3-node Raft cluster just to run -- litewire could replace that with a single SQLite file.
-
-Implementation would use `tonic` for the gRPC server, implementing etcd's protobuf service definitions. Key challenges:
-- **WATCH** (streaming changes) is core to etcd's value -- needs SQLite triggers or WAL tailing for change detection
-- **Leases/TTL** need a background reaper task
-- **Multi-version concurrency** -- etcd stores revision history, requiring a `revisions` table
-- **Linearizable reads** -- etcd guarantees these; SQLite WAL serializable isolation is actually stronger for single-node
-
-### Redis RESP Protocol
-
-SQLite tables could be exposed as Redis-compatible data structures via the RESP protocol:
-
-```
-GET key              -> SELECT value FROM kv WHERE key = ?
-SET key value        -> INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)
-HGET hash field      -> SELECT value FROM hash_kv WHERE hash = ? AND field = ?
-LPUSH list value     -> INSERT INTO list_kv (list, pos, value) VALUES (?, ?, ?)
-EXPIRE key seconds   -> UPDATE kv SET expiry = datetime('now', '+N seconds') WHERE key = ?
-```
-
-This is a stretch from litewire's SQL-translation core but fits the "make SQLite speak other protocols" umbrella. The `mini-redis` crate or raw RESP parsing could provide the protocol layer.
-
-### MongoDB Wire Protocol
-
-MongoDB's wire protocol sends BSON documents over TCP. Mapping documents to relational SQLite is a harder problem than SQL dialect translation -- it requires a query language translation (MQL -> SQL) and a storage model decision (JSON columns? normalized tables?).
-
-SQLite's JSON1 extension makes this more feasible than it sounds:
-
-```
-db.users.find({age: {$gt: 25}})  ->  SELECT json(doc) FROM users WHERE json_extract(doc, '$.age') > 25
-db.users.insertOne({...})        ->  INSERT INTO users (doc) VALUES (json(?))
-```
-
-This is a larger undertaking than the SQL protocol frontends and would likely be its own sub-project. Prior art: `FerretDB` (Go) does exactly this, translating MongoDB wire protocol to PostgreSQL or SQLite.
+| Project | Language | What it does |
+|---------|----------|-------------|
+| **Marmot** | Go | MySQL wire → SQLite, distributed |
+| **WP sqlite-database-integration** | PHP | Rewrites MySQL queries to SQLite inside WordPress |
+| **Postlite** | Go | PG wire → SQLite (archived) |
+| **opensrv-mysql** | Rust | MySQL wire protocol server library (used here) |
+| **pgwire** | Rust | PG wire protocol server library (used here) |
