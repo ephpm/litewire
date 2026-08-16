@@ -219,7 +219,7 @@ fn parse_login7_database(payload: &[u8]) -> Option<String> {
 
 /// Decode a UTF-16LE byte slice to a Rust String.
 fn decode_utf16le(data: &[u8]) -> Option<String> {
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         return None;
     }
     let chars: Vec<u16> = data

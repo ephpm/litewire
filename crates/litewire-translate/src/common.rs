@@ -334,10 +334,10 @@ fn rewrite_value(val: &mut Value) {
             *val = Value::Number(if *b { "1".into() } else { "0".into() }, false);
         }
         Value::Placeholder(p) => {
-            if let Some(rest) = p.strip_prefix('$') {
-                if rest.chars().all(|c| c.is_ascii_digit()) {
-                    *p = format!("?{rest}");
-                }
+            if let Some(rest) = p.strip_prefix('$')
+                && rest.chars().all(|c| c.is_ascii_digit())
+            {
+                *p = format!("?{rest}");
             }
         }
         _ => {}

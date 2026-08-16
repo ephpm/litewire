@@ -1007,10 +1007,10 @@ impl Drop for RusqliteConn {
 #[async_trait::async_trait]
 impl Backend for Rusqlite {
     async fn connect(&self) -> Result<Box<dyn BackendConn>, BackendError> {
-        if let Some(pool) = self.pool.as_ref() {
-            if let Some(tx) = pool.take() {
-                return Ok(Box::new(RusqliteConn { tx, pooled: true }));
-            }
+        if let Some(pool) = self.pool.as_ref()
+            && let Some(tx) = pool.take()
+        {
+            return Ok(Box::new(RusqliteConn { tx, pooled: true }));
         }
         let tx = self.spawn_session().await?;
         Ok(Box::new(RusqliteConn {
