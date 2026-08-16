@@ -61,7 +61,7 @@ impl PostgresHandler {
             litewire_translate::translate_cached(&self.translate_cache, query, Dialect::PostgreSQL)
                 .map_err(|e| e.to_string())?;
 
-        let Some(result) = translated.into_iter().next() else {
+        let Some(result) = translated.first() else {
             return Ok((String::new(), StatementKind::Other));
         };
 
@@ -72,8 +72,8 @@ impl PostgresHandler {
                 Ok((sql, StatementKind::Query))
             }
             TranslateResult::Sql(sql) => {
-                let kind = classify(&sql);
-                Ok((sql, kind))
+                let kind = classify(sql);
+                Ok((sql.clone(), kind))
             }
         }
     }
@@ -422,7 +422,7 @@ impl SimpleQueryHandler for PostgresHandler {
 
         let mut responses = Vec::new();
 
-        for result in translated {
+        for result in translated.iter() {
             let resp = match result {
                 TranslateResult::Noop => Response::Execution(Tag::new("SET")),
                 TranslateResult::Metadata(meta) => {
@@ -434,7 +434,7 @@ impl SimpleQueryHandler for PostgresHandler {
                     if sqlite_sql.is_empty() {
                         Response::Execution(Tag::new("OK"))
                     } else {
-                        self.exec_query(&sqlite_sql, &[], &Format::UnifiedText)
+                        self.exec_query(sqlite_sql, &[], &Format::UnifiedText)
                             .await?
                     }
                 }
