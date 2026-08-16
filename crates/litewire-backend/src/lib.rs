@@ -24,6 +24,7 @@
 
 pub mod auth;
 pub mod conn_limit;
+pub mod tenant_screen;
 
 #[cfg(feature = "rusqlite")]
 pub mod rusqlite_backend;
@@ -202,6 +203,7 @@ pub type SharedBackend = Arc<dyn Backend>;
 pub use async_trait::async_trait;
 pub use auth::{AuthRequest, ConnectionAuthenticator, SharedAuthenticator};
 pub use conn_limit::{ConnectionLimiter, ConnectionSlot};
+pub use tenant_screen::TenantScreened;
 
 #[cfg(feature = "rusqlite")]
 pub use rusqlite_backend::Rusqlite;

@@ -42,6 +42,7 @@ cli = ["dep:clap", "dep:tracing-subscriber"]
 
 [dev-dependencies]
 mysql_async = { workspace = true }
+tempfile = "3"
 tokio-postgres = { workspace = true }
 tiberius = { workspace = true }
 tokio-util = { workspace = true }

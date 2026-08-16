@@ -134,6 +134,25 @@ MySQL is the only frontend that can resolve a backend per connection;
 `serve()` refuses to start if Hrana, PostgreSQL, or TDS is also configured
 under an authenticator, rather than quietly serving them one shared database.
 
+**Tenant sessions cannot reach past their own database file.** Every tenant's
+database is opened by the same process under the same uid, so nothing at the
+filesystem level stops a session from `ATTACH`ing its neighbour's file — which
+would make the authenticator's boundary a suggestion. litewire therefore
+screens every authenticator-established session at the backend boundary:
+`ATTACH`, `DETACH`, `VACUUM` with a target (`VACUUM INTO '<path>'`), and the
+path-bearing or schema-reopening `PRAGMA`s (`data_store_directory`,
+`temp_store_directory`, `writable_schema`) are refused with a clean SQL error,
+on every backend, regardless of what the engine underneath would do with them.
+The screen sees through `EXPLAIN` wrappers, schema-qualified and quoted
+`PRAGMA` spellings, and statements hidden behind a `;`. Everything else —
+including bare `VACUUM` and ordinary tuning pragmas — passes through
+untouched.
+
+Single-tenant deployments (a fixed backend, no authenticator) are deliberately
+**not** screened: `ATTACH` is legitimate and useful in a single-user embedded
+setup. The screen keys off the session being tenant-scoped, never off the
+statement alone. See `litewire_backend::tenant_screen` for the full contract.
+
 ## SQL Translation
 
 litewire translates MySQL and PostgreSQL SQL dialects to SQLite on the fly:
