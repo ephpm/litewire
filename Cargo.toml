@@ -62,9 +62,16 @@ sqlparser = { version = "0.57", features = ["serde", "visitor"] }
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype", "functions"] }
 # Turso Database — the ground-up Rust rewrite of SQLite
 # (github.com/tursodatabase/turso). Pinned exactly: the engine is Beta and
-# API/behavior move between releases. 0.7.0 is the first non-pre release on
-# the 0.7 line (July 2026). Bump deliberately, never via `cargo update`.
-turso = { version = "=0.7.0", default-features = false }
+# API/behavior move between releases. 0.7.2 is the latest stable release on
+# the 0.7 line (July 2026); 0.8.x is pre-release only and deliberately not
+# taken. Bump deliberately, never via `cargo update`.
+#
+# 0.7.0 -> 0.7.2 picks up tursodatabase/turso#7855 ("close vtab cursors
+# before transaction finalization", merged 2026-07-16, first released in
+# 0.7.2): a vdbe fix for pragma-backed table-valued functions where a vtab
+# cursor left open across transaction finalization could misbehave. 0.7.0
+# predates it.
+turso = { version = "=0.7.2", default-features = false }
 
 # HTTP (Hrana)
 axum = "0.8"
