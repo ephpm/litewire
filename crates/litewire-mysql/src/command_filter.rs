@@ -56,6 +56,28 @@
 //! untouched, which also covers the continuation packets of a payload larger
 //! than 16 MiB.
 //!
+//! # One packet per `poll_read`
+//!
+//! The filter must hand a command packet to `opensrv-mysql` **whole** —
+//! header and body in the same `poll_read` — even though it has to inspect
+//! the header before it can decide what to do with the body.
+//!
+//! `PacketReader::next_async` loops until a complete packet parses, and its
+//! scratch buffer escalates from `PACKET_BUFFER_SIZE` (4 KiB) to
+//! `PACKET_LARGE_BUFFER_SIZE` (1 MiB) on the *second* iteration. So a reader
+//! that returns the five header bytes on their own guarantees that second
+//! iteration, and with it a `Vec::resize(1_048_576, 0)` whose zeroing memset
+//! runs for every single command. The first shipped version of this filter
+//! did exactly that: it cost ~15% of MySQL wire throughput and showed up as
+//! ~13% of cycles in `__memset_avx2_unaligned_erms` (ephpm#322).
+//!
+//! `poll_read` therefore falls through from `Emit` into `Pass` inside one
+//! call. The corollary is that it may never answer `Pending` once it has
+//! written into the caller's buffer — those bytes would be stranded until a
+//! wakeup that a half-duplex peer, waiting on the reply, will never trigger.
+//! `poll_io!` enforces that: on `Pending` with bytes in hand it returns them
+//! instead. Both halves are pinned by tests.
+//!
 //! # Session state
 //!
 //! `COM_RESET_CONNECTION` and `COM_CHANGE_USER` are defined to reset session
@@ -354,6 +376,35 @@ where
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        // How much of `out` the caller had already filled when this call
+        // began. Everything written past this point is ours, and must not
+        // be stranded by a later `Pending` (see `poll_io!`).
+        let started = out.filled().len();
+
+        // Poll an inner I/O future, but never park while holding bytes.
+        //
+        // `AsyncRead` may only answer `Pending` when it has produced
+        // nothing: the caller keeps the `ReadBuf`, so returning `Pending`
+        // after writing into it strands those bytes until the next wakeup —
+        // and for a half-duplex protocol whose peer is waiting on the reply
+        // to what we just withheld, that wakeup never comes. So hand back
+        // what we have and let the caller poll again.
+        macro_rules! poll_io {
+            ($poll:expr) => {
+                match $poll {
+                    Poll::Ready(Ok(v)) => v,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {
+                        return if out.filled().len() > started {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        };
+                    }
+                }
+            };
+        }
+
         loop {
             match &mut this.state {
                 // A filled length of zero is how `AsyncRead` spells EOF.
@@ -445,15 +496,28 @@ where
                     let n = (*len - *pos).min(out.remaining());
                     out.put_slice(&buf[*pos..*pos + n]);
                     *pos += n;
-                    if *pos == *len {
-                        let body = *body;
-                        this.state = if body == 0 {
-                            State::head()
-                        } else {
-                            State::Pass { remaining: body }
-                        };
+                    if *pos < *len {
+                        // `out` filled mid-header; the rest goes next call.
+                        return Poll::Ready(Ok(()));
                     }
-                    return Poll::Ready(Ok(()));
+                    let body = *body;
+                    if body == 0 {
+                        this.state = State::head();
+                        return Poll::Ready(Ok(()));
+                    }
+                    // PERF: fall through to `Pass` *within this same call*
+                    // rather than returning the five header bytes on their
+                    // own. `opensrv-mysql`'s `PacketReader::next_async`
+                    // re-reads until a whole packet parses, and escalates
+                    // its scratch buffer from 4 KiB to 1 MiB on the second
+                    // iteration -- a `Vec::resize(1_048_576, 0)` whose
+                    // zeroing memset then runs for every command packet.
+                    // Handing back a header with no body guarantees that
+                    // second iteration, which cost ~15% of MySQL wire
+                    // throughput (ephpm#322). Delivering header and body
+                    // together keeps the reader on its first iteration,
+                    // exactly as an unfiltered socket did.
+                    this.state = State::Pass { remaining: body };
                 }
 
                 State::Pass { remaining } => {
@@ -468,11 +532,15 @@ where
                     // without `unsafe`; it is a no-op for the callers that
                     // matter, which pass an already-initialized buffer.
                     out.initialize_unfilled_to(cap);
-                    let n = {
+                    let read = {
                         let mut sub = out.take(cap);
-                        ready!(Pin::new(&mut this.reader).poll_read(cx, &mut sub))?;
-                        sub.filled().len()
+                        match Pin::new(&mut this.reader).poll_read(cx, &mut sub) {
+                            Poll::Ready(Ok(())) => Poll::Ready(Ok(sub.filled().len())),
+                            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                            Poll::Pending => Poll::Pending,
+                        }
                     };
+                    let n = poll_io!(read);
                     if n == 0 {
                         this.state = State::Eof;
                         return Poll::Ready(Ok(()));
@@ -574,6 +642,97 @@ mod tests {
         client_read.read_to_end(&mut replied).await.unwrap();
 
         (forwarded, replied, reset.load(Ordering::Relaxed))
+    }
+
+    /// Drive one `poll_read` over a filter fed from `chunks`, returning what
+    /// that single call produced.
+    async fn one_poll(
+        filter: &mut CommandFilter<tokio::io::ReadHalf<tokio::io::DuplexStream>, W>,
+        buf: &mut [u8],
+    ) -> Vec<u8> {
+        let mut rb = ReadBuf::new(buf);
+        std::future::poll_fn(|cx| Pin::new(&mut *filter).poll_read(cx, &mut rb))
+            .await
+            .unwrap();
+        rb.filled().to_vec()
+    }
+
+    type W = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+
+    /// PERFORMANCE REGRESSION GUARD (ephpm#322).
+    ///
+    /// A command packet must reach the reader **whole** in a single
+    /// `poll_read`. `opensrv-mysql`'s `PacketReader::next_async` loops until
+    /// a packet parses and escalates its scratch buffer from 4 KiB to 1 MiB
+    /// on the second iteration, so a filter that hands back the five-byte
+    /// header on its own forces a `Vec::resize(1_048_576, 0)` -- a 1 MiB
+    /// zeroing memset -- for *every* command. That cost ~15% of MySQL wire
+    /// throughput before it was found.
+    #[tokio::test]
+    async fn one_poll_read_yields_the_whole_packet() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (_client_read, mut client_write) = tokio::io::split(client);
+        let input = packet(0, COM_QUERY, b"SELECT id, val FROM bench WHERE id = 1");
+        client_write.write_all(&input).await.unwrap();
+
+        let (server_read, server_write) = tokio::io::split(server);
+        let mut filter = CommandFilter::new(
+            server_read,
+            server_write,
+            Arc::new(AtomicBool::new(false)),
+            true,
+        );
+
+        let mut buf = [0u8; 4096];
+        assert_eq!(
+            one_poll(&mut filter, &mut buf).await,
+            input,
+            "header and body must arrive in the SAME poll_read; splitting \
+             them re-triggers opensrv-mysql's 1 MiB buffer escalation"
+        );
+    }
+
+    /// The corollary of the guard above: when the body has not arrived yet,
+    /// the filter must still hand back the header bytes it already produced
+    /// rather than parking on `Pending`. Parking would strand them in the
+    /// caller's buffer with the client waiting on a reply that can never be
+    /// computed -- a deadlock, not a slowdown.
+    #[tokio::test]
+    async fn partial_packet_returns_what_it_has_instead_of_parking() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (_client_read, mut client_write) = tokio::io::split(client);
+        let input = packet(0, COM_QUERY, b"SELECT 1");
+
+        // Only the header + command byte so far.
+        client_write
+            .write_all(&input[..HEADER_AND_COMMAND])
+            .await
+            .unwrap();
+
+        let (server_read, server_write) = tokio::io::split(server);
+        let mut filter = CommandFilter::new(
+            server_read,
+            server_write,
+            Arc::new(AtomicBool::new(false)),
+            true,
+        );
+
+        let mut buf = [0u8; 4096];
+        assert_eq!(
+            one_poll(&mut filter, &mut buf).await,
+            input[..HEADER_AND_COMMAND],
+            "a poll that produced bytes must return them, not Pending"
+        );
+
+        client_write
+            .write_all(&input[HEADER_AND_COMMAND..])
+            .await
+            .unwrap();
+        assert_eq!(
+            one_poll(&mut filter, &mut buf).await,
+            input[HEADER_AND_COMMAND..],
+            "the rest of the body follows on the next poll"
+        );
     }
 
     #[tokio::test]
