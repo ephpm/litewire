@@ -106,7 +106,7 @@ and `.tds("127.0.0.1:1433")` add those frontends to the same builder.
 |---------|-------------|----------|
 | `Rusqlite` | `backend-rusqlite` | Direct in-process SQLite |
 | `HranaClient` | `backend-hrana-client` | Remote SQLite via the Hrana HTTP protocol (sqld / Turso) |
-| `Turso` | `turso` | **Experimental** — [Turso Database](https://github.com/tursodatabase/turso) engine (Rust rewrite of SQLite, Beta upstream; pinned `=0.7.0`). See `crates/litewire-turso` docs for limitations (no `VACUUM`, no multi-process access) |
+| `Turso` | `turso` | **Experimental** — [Turso Database](https://github.com/tursodatabase/turso) engine (Rust rewrite of SQLite, Beta upstream; pinned `=0.7.2`). See `crates/litewire-turso` docs for limitations (no `VACUUM`, no multi-process access) |
 | Custom | implement `Backend` trait | Bring your own |
 
 The `HranaClient` backend connects to [sqld](https://github.com/tursodatabase/libsql) via HTTP (per-session Hrana streams plus write admission control), so litewire's wire frontends can sit in front of a sqld server.
