@@ -1,0 +1,149 @@
+name: Turso Pin Watch
+
+# Opens a pin-bump PR when crates.io publishes a newer stable `turso` than the
+# exact pin in litewire's workspace Cargo.toml. Auto-PR ONLY — merge is manual.
+#
+# litewire OWNS the turso version for the whole ePHPm stack: ePHPm pins the same
+# `turso = "=X.Y.Z"` only so it resolves to the one crate instance litewire
+# compiles in, and ePHPm cannot bump it until litewire has. This watcher is the
+# ORIGIN of a turso bump — once its PR merges, ephpm/ephpm's own turso-pin-watch
+# sees litewire is ahead and opens the matching (litewire rev + turso pin) PR
+# there.
+#
+# Why review is never skipped: turso is Beta upstream and API/behavior move
+# between releases; the PR body flags the CDC / vtab / pragma surfaces litewire
+# depends on, and hands the hand-written pin comment to a human.
+#
+# Idempotent: one marker branch per target version (`bump/turso-<ver>`). Same
+# shape as ephpm/ephpm's sdk-bump.yml / watch-vivacity.yml.
+#
+# Token note: PRs opened with the default GITHUB_TOKEN do NOT trigger CI
+# (GitHub's recursion guard) — close/reopen or push to get a run, or set a
+# PAT/App-token secret and swap it in below.
+
+on:
+  schedule:
+    # Daily, 06:13 UTC.
+    - cron: "13 6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact turso version to bump to (e.g. 0.8.0). Empty = latest stable on crates.io."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: watch-turso
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump the turso pin when crates.io is ahead
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPLICIT_VERSION: ${{ inputs.version || '' }}
+          UA: "litewire-turso-pin-watch (+https://github.com/ephpm/litewire)"
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          # ── 1. Target version: explicit input, or latest stable ──────────
+          if [ -n "$EXPLICIT_VERSION" ]; then
+            latest="$EXPLICIT_VERSION"
+          else
+            api=$(curl -fsSL --retry 3 --retry-delay 5 -H "User-Agent: $UA" \
+                    https://crates.io/api/v1/crates/turso) \
+              || fail "crates.io query failed"
+            latest=$(jq -r '.crate.max_stable_version // empty' <<<"$api")
+          fi
+          [ -n "$latest" ] || fail "no target version resolved"
+          grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$latest" \
+            || fail "target version is not a plain semver: '$latest'"
+
+          # ── 2. Current exact pin in the workspace Cargo.toml ─────────────
+          # `turso = { version = "=X.Y.Z"` at line start — NOT the litewire-turso
+          # path crate (different name, no version field).
+          current=$(sed -nE \
+            's/^[[:space:]]*turso[[:space:]]*=[[:space:]]*\{[^}]*version[[:space:]]*=[[:space:]]*"=?([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' \
+            Cargo.toml | head -1)
+          [ -n "$current" ] || fail "could not parse the turso pin from Cargo.toml"
+          echo "pinned=$current latest=$latest"
+
+          # ── 3. Newer? (`sort -V`; never downgrade) ───────────────────────
+          if [ "$current" = "$latest" ] \
+             || [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)" != "$latest" ]; then
+            echo "turso pin $current is up to date (target: $latest)"; exit 0
+          fi
+          echo "::notice::turso $latest is newer than the pinned $current"
+
+          # ── 4. Marker-branch idempotency ─────────────────────────────────
+          branch="bump/turso-${latest}"
+          if [ "$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq length)" != "0" ]; then
+            echo "open PR from ${branch} already exists — nothing to do"; exit 0
+          fi
+          if git ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null 2>&1; then
+            echo "branch ${branch} already exists on origin — nothing to do"; exit 0
+          fi
+
+          # ── 5. Bump the pin + refresh the lock ───────────────────────────
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch" origin/HEAD
+
+          sed -i -E \
+            's/^([[:space:]]*turso[[:space:]]*=[[:space:]]*\{[^}]*version[[:space:]]*=[[:space:]]*")=?[0-9]+\.[0-9]+\.[0-9]+(".*)/\1='"${latest}"'\2/' \
+            Cargo.toml
+          grep -q "\"=${latest}\"" Cargo.toml || fail "sed did not update the pin to =${latest}"
+
+          delta=$(cargo update -p turso 2>&1) || fail "cargo update -p turso failed"
+          echo "$delta"
+
+          git add Cargo.toml Cargo.lock
+          git commit -q -m "deps: bump turso ${current} -> ${latest}" \
+            || fail "nothing to commit — pin already at ${latest}?"
+          git push origin "$branch" || fail "pushing ${branch} failed"
+
+          # ── 6. Open the review PR ────────────────────────────────────────
+          body_file=$(mktemp)
+          {
+            echo "Automated pin bump: **turso \`${current}\` → \`${latest}\`**."
+            echo
+            echo "- Changelog: https://github.com/tursodatabase/turso/releases/tag/v${latest}"
+            echo
+            echo "\`cargo update -p turso\` delta:"
+            echo '```'
+            echo "$delta"
+            echo '```'
+            echo
+            echo "### Review before merge — turso is Beta, API/behavior moves"
+            echo "- [ ] Changelog checked for changes to the **CDC**, **vtab/TVF**, and"
+            echo "      **PRAGMA** surfaces litewire's backend and screening depend on."
+            echo "- [ ] Hand-written pin-rationale comment above \`turso =\` in \`Cargo.toml\`"
+            echo "      updated for this version."
+            echo "- [ ] CI green."
+            echo
+            echo "Once merged, ephpm/ephpm's \`turso-pin-watch\` will automatically open the"
+            echo "matching (litewire rev + turso pin) bump PR there."
+            echo
+            echo "<sub>Opened by \`.github/workflows/watch-turso.yml\`. Auto-PR only. PRs"
+            echo "opened with the default GITHUB_TOKEN do not trigger CI; close/reopen or"
+            echo "push to the branch to get a run.</sub>"
+          } > "$body_file"
+
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_REF_NAME:-main}" --head "$branch" \
+            --title "deps: bump turso ${current} -> ${latest}" \
+            --body-file "$body_file" \
+            || fail "opening PR for ${branch} failed"
+          echo "::notice::opened bump PR for turso ${latest}"
