@@ -111,6 +111,10 @@ pub struct AuthRequest<'a> {
 ///
 /// See the [module docs](self) for the security contract — in particular, why
 /// returning a backend chosen from `username` alone is not isolation.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait emits a bare #[must_use] on methods returning a boxed Future (already must_use); clippy 1.99"
+)]
 #[async_trait::async_trait]
 pub trait ConnectionAuthenticator: Send + Sync + 'static {
     /// Verify `req` and return the backend this connection may use.
