@@ -1,0 +1,11 @@
+# Pinned to a stable minor rather than floating on `stable`: a new stable
+# ships new clippy lints, and with `-D warnings` that turned main red the day
+# Rust 1.99 released (#43). Patch releases (1.99.x) still float in.
+#
+# Bump deliberately in its own PR: change the version, run
+# `cargo clippy --workspace --all-targets --all-features -- -D warnings`, fix
+# the new lints. The MSRV job runs `cargo +1.88` explicitly, so this file does
+# not override it.
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]
