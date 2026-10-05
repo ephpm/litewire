@@ -109,6 +109,10 @@ pub enum BackendError {
 /// Implementations must be `Send + Sync` because wire frontends move them
 /// across `.await` points and (in some frontends) hand them to spawned
 /// tasks.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait emits a bare #[must_use] on methods returning a boxed Future (already must_use); clippy 1.99"
+)]
 #[async_trait::async_trait]
 pub trait BackendConn: Send + Sync {
     /// Execute a query that returns rows.
@@ -145,6 +149,10 @@ pub trait BackendConn: Send + Sync {
 /// for callers that do not need transactions (metrics wrappers, one-off
 /// probes). They open a fresh `BackendConn` per call and drop it -- do **not**
 /// use them for BEGIN/COMMIT sequences.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait emits a bare #[must_use] on methods returning a boxed Future (already must_use); clippy 1.99"
+)]
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync + 'static {
     /// Open a new session against the underlying storage.
