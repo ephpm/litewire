@@ -114,3 +114,19 @@ mysql_async = { version = "0.37", default-features = false, features = ["rustls-
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 tiberius = { version = "0.12", default-features = false, features = ["rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+
+# SECURITY (RUSTSEC-2026-0285): opensrv-mysql 0.7.0 (crates.io, latest) pulls
+# tokio-rustls 0.25 -> rustls 0.22, which is affected. There is no fixed
+# crates.io release. Redirect opensrv-mysql at the ePHPm fork of 0.7.0, whose
+# only change is tokio-rustls 0.25 -> 0.26 (rustls >= 0.23.45) pinned to the
+# aws-lc-rs crypto provider (never `ring`). The `tls` feature and its
+# auth-load-bearing `init_after_ssl` re-parse (#32) are byte-for-byte upstream.
+#
+# NOTE: this [patch] is honoured for litewire's OWN builds only. A patch does
+# not propagate through a git dependency, so a downstream consumer (ePHPm)
+# must declare the SAME patch in its own root Cargo.toml.
+#
+# Retire this patch when a fixed opensrv-mysql is published to crates.io, or
+# when litewire migrates off opensrv-mysql.
+[patch.crates-io]
+opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "42efd446ba867066c94bcf13d31b3b3fec53ec61" }
