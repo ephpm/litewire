@@ -20,7 +20,21 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal crates
-litewire-backend = { path = "crates/litewire-backend" }
+#
+# `default-features = false` is load-bearing. litewire-backend's default
+# feature is `rusqlite`, which compiles rusqlite's *bundled* SQLite C library
+# (and its exported `sqlite3_*` symbols) into the final binary. Inherited with
+# defaults, every sibling crate below would switch that feature back on, so a
+# downstream `default-features = false, features = ["turso"]` build still
+# linked a whole second SQLite. An embedder that links its own SQLite (ePHPm
+# links PHP's pdo_sqlite against the PHP SDK's libsqlite3) then had its
+# `sqlite3_*` calls resolved against rusqlite's copy instead: different
+# version, different compile options (ENABLE_MEMORY_MANAGEMENT forces one
+# process-wide page-cache mutex; DEFAULT_FOREIGN_KEYS=1 changes semantics).
+# The rusqlite backend is now opt-in only: through `litewire`'s
+# `backend-rusqlite` feature (still on by default for the standalone crate)
+# or an explicit `features = ["rusqlite"]` (the dev-dependencies do this).
+litewire-backend = { path = "crates/litewire-backend", default-features = false }
 litewire-translate = { path = "crates/litewire-translate" }
 litewire-session = { path = "crates/litewire-session" }
 litewire-mysql = { path = "crates/litewire-mysql" }
