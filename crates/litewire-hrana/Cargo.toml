@@ -17,4 +17,6 @@ thiserror = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
+# The unit tests run against an in-memory rusqlite backend.
+litewire-backend = { workspace = true, features = ["rusqlite"] }
 tower = { version = "0.5", features = ["util"] }
