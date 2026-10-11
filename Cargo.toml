@@ -76,16 +76,29 @@ sqlparser = { version = "0.57", features = ["serde", "visitor"] }
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype", "functions"] }
 # Turso Database — the ground-up Rust rewrite of SQLite
 # (github.com/tursodatabase/turso). Pinned exactly: the engine is Beta and
-# API/behavior move between releases. 0.7.2 is the latest stable release on
-# the 0.7 line (July 2026); 0.8.x is pre-release only and deliberately not
-# taken. Bump deliberately, never via `cargo update`.
+# API/behavior move between releases. Bump deliberately, never via
+# `cargo update`.
 #
-# 0.7.0 -> 0.7.2 picks up tursodatabase/turso#7855 ("close vtab cursors
-# before transaction finalization", merged 2026-07-16, first released in
-# 0.7.2): a vdbe fix for pragma-backed table-valued functions where a vtab
-# cursor left open across transaction finalization could misbehave. 0.7.0
-# predates it.
-turso = { version = "=0.7.2", default-features = false }
+# 0.7.0 -> 0.7.2 picked up tursodatabase/turso#7855 ("close vtab cursors
+# before transaction finalization").
+#
+# 0.7.2 -> 0.8.2 (ephpm#535; 0.8.2 is the latest stable, October 2026).
+# Changes that reach litewire or its embedders:
+# - `PRAGMA journal_mode` changes are refused on a connection with CDC
+#   capture on (0.7.2 accepted them and capture stopped silently); pinned by
+#   tests/cdc_replication.rs.
+# - The Rust binding gates each connection: `Connection::execute_batch` (and
+#   the new `batch`/`transactional_batch`) need exclusive use and fail with
+#   "connection is busy with another operation" while a `Rows` from the same
+#   connection (or a clone of it) is still being read; a `query`/`execute`
+#   started during a batch fails with "connection is busy executing a
+#   batch". It errors rather than waits. litewire calls none of these.
+# - `TransactionBehavior` gained a `Concurrent` variant; `Builder::with_io`
+#   takes `impl Into<IoBackend>`.
+# - File format and the CDC log schema (`turso_cdc`, version "v2") are
+#   unchanged: 0.7.2 files, including an uncheckpointed WAL, open under
+#   0.8.2 and 0.8.2 files open under 0.7.2 (checked with a two-binary probe).
+turso = { version = "=0.8.2", default-features = false }
 
 # HTTP (Hrana)
 axum = "0.8"

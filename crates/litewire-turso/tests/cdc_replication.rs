@@ -621,3 +621,57 @@ async fn apply_batch_reports_an_empty_batch_instead_of_panicking() {
         .expect_err("an empty batch is malformed, not a silent no-op");
     assert!(err.to_string().contains("empty batch"), "got: {err}");
 }
+
+/// A `journal_mode` change on a capturing connection must fail loudly, and
+/// capture must still be on afterwards.
+///
+/// Turso supports only `wal` and `mvcc`; any other mode is a silent no-op,
+/// so `mvcc` is the one real change. Turso 0.7.2 accepted WAL -> MVCC on a
+/// capturing connection (this test fails there), and upstream documents
+/// that capture then stops silently while `capture_data_changes_conn` still
+/// reports it on — later writes commit without reaching `turso_cdc`, so they
+/// never replicate. 0.8.0 rejects the change instead (upstream "core: reject
+/// journal_mode changes while CDC capture is active"). This pins that: a
+/// regression would be an unreplicated write, which nothing else notices.
+#[tokio::test]
+async fn journal_mode_change_on_a_capturing_connection_is_refused() {
+    let (primary, _p) = temp_factory().await;
+    let p_conn = primary.raw_connection().unwrap();
+    enable_cdc(&p_conn).await.unwrap();
+    p_conn
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())
+        .await
+        .unwrap();
+
+    // `query`, not `execute`: the pragma returns the resulting mode as a
+    // row, which `execute` reports as "unexpected row" on any engine.
+    let attempt = async {
+        let mut rows = p_conn.query("PRAGMA journal_mode = mvcc", ()).await?;
+        while rows.next().await?.is_some() {}
+        Ok::<_, turso::Error>(())
+    };
+    let err = attempt
+        .await
+        .expect_err("changing journal_mode while capturing must be refused");
+    assert!(
+        err.to_string().contains("CDC capture is active"),
+        "unexpected error: {err}"
+    );
+
+    // Capture is still live: the next write reaches the log.
+    p_conn
+        .execute("INSERT INTO t VALUES (1, 'after')", ())
+        .await
+        .unwrap();
+    let mut tailer = CdcTailer::new(&primary, 0);
+    let rows: Vec<CdcRow> = drain_batches(&mut tailer)
+        .await
+        .into_iter()
+        .flat_map(|b| b.rows)
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|r| r.table_name.as_deref() == Some("t") && r.change_type == 1),
+        "the INSERT after the refused PRAGMA must be captured; got {rows:?}"
+    );
+}
