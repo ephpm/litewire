@@ -38,7 +38,10 @@ backend-hrana-client = ["litewire-backend/hrana-client"]
 # EXPERIMENTAL: Turso Database engine backend (Beta upstream). Off by
 # default; see crates/litewire-turso for status and limitations.
 turso = ["dep:litewire-turso"]
-cli = ["dep:clap", "dep:tracing-subscriber"]
+# The CLI binary opens its database with the rusqlite backend and always
+# wires the MySQL and Hrana frontends, so it needs those even in a
+# `--no-default-features` build.
+cli = ["dep:clap", "dep:tracing-subscriber", "backend-rusqlite", "mysql", "hrana"]
 
 [dev-dependencies]
 mysql_async = { workspace = true }
