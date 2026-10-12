@@ -10,6 +10,14 @@ the commit that merges this changelog.
 
 ### Changed
 
+- Turso engine bumped `=0.7.2` → `=0.8.2` (ephpm#535). No litewire API
+  change. Database files are compatible in both directions (0.7.2 files,
+  including one with an uncheckpointed WAL, open under 0.8.2 and the reverse;
+  the `turso_cdc` log schema stays "v2"). Behaviour changes from upstream:
+  `PRAGMA journal_mode` changes are now refused on a connection with CDC
+  capture on (previously accepted, after which capture silently stopped), and
+  the `turso` binding's `execute_batch` now fails instead of running while a
+  result set from the same connection is still open.
 - Declared MSRV corrected from 1.85 to **1.88** and now verified by a CI job.
   1.85 was never true with the locked dependency graph: the Turso engine's
   `aristo` dependency requires rustc 1.88.
