@@ -78,5 +78,5 @@ in CI.
   implemented.
 - Dependencies are added deliberately, with a comment in the workspace
   `Cargo.toml` explaining why that crate (see the existing entries). The
-  `turso` crate is pinned exactly (`=0.8.2`) — never bump it via
+  `turso` crate is pinned exactly (`=0.8.3`) — never bump it via
   `cargo update`.
