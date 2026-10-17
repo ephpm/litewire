@@ -675,3 +675,56 @@ async fn journal_mode_change_on_a_capturing_connection_is_refused() {
         "the INSERT after the refused PRAGMA must be captured; got {rows:?}"
     );
 }
+
+/// A transaction that changes more rows than one `poll_batch` read window
+/// (1024 rows) must still be tailed, shipped and applied as one batch.
+///
+/// Before the fix, `poll_batch` read `LIMIT 1024` rows, found no COMMIT in
+/// them, and returned `Ok(None)` — the same answer as "nothing to ship" — on
+/// every poll from then on. Replication stopped at that transaction forever,
+/// with no error anywhere: the cursor never moved, so no later transaction was
+/// shipped either. One bulk INSERT, a WordPress import or a framework
+/// migration was enough.
+#[tokio::test]
+async fn transaction_larger_than_one_poll_window_replicates() {
+    const ROWS: i64 = 3000;
+    let (primary, _p) = temp_factory().await;
+    let (replica, _r) = temp_factory().await;
+
+    let p_conn = primary.raw_connection().unwrap();
+    enable_cdc(&p_conn).await.unwrap();
+    p_conn
+        .execute("CREATE TABLE big (id INTEGER PRIMARY KEY, v TEXT)", ())
+        .await
+        .unwrap();
+    p_conn.execute("BEGIN", ()).await.unwrap();
+    for i in 1..=ROWS {
+        p_conn
+            .execute("INSERT INTO big VALUES (?, 'x')", (i,))
+            .await
+            .unwrap();
+    }
+    p_conn.execute("COMMIT", ()).await.unwrap();
+    // A small transaction after the big one must not be stuck behind it.
+    p_conn
+        .execute("INSERT INTO big VALUES (?, 'after')", (ROWS + 1,))
+        .await
+        .unwrap();
+
+    let mut tailer = CdcTailer::new(&primary, 0);
+    let batches = drain_batches(&mut tailer).await;
+    assert!(
+        batches.iter().any(|b| b.rows.len() > 1024),
+        "the {ROWS}-row transaction must arrive as one batch; got batch sizes {:?}",
+        batches.iter().map(|b| b.rows.len()).collect::<Vec<_>>()
+    );
+
+    let r_conn = replica.raw_connection().unwrap();
+    apply_all(&r_conn, &batches).await;
+    assert_eq!(count_rows(&replica, "big").await, ROWS + 1);
+    assert_eq!(
+        read_watermark(&r_conn).await.unwrap(),
+        tailer.cursor(),
+        "the replica must be caught up to the primary's last COMMIT"
+    );
+}
