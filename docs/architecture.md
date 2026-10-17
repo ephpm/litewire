@@ -171,7 +171,7 @@ Three implementations ship:
   sqld's single-writer lock is queued on this side instead of thrashed.
 * **`Turso`** (`crates/litewire-turso`, feature `turso`) — **experimental**
   in-process backend on the Turso Database engine (the Rust rewrite of SQLite,
-  Beta upstream, pinned `=0.8.2`). Async-native (no `spawn_blocking`). Known
+  Beta upstream, pinned `=0.8.3`). Async-native (no `spawn_blocking`). Known
   unsupported: `VACUUM`, `ATTACH`/`DETACH`, multi-process access to one file,
   byte-exact non-UTF-8 `TEXT` round-trips. It also exposes an experimental CDC
   tail/apply API (`crates/litewire-turso/src/cdc.rs`) for external replication

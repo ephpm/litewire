@@ -10,6 +10,13 @@ the commit that merges this changelog.
 
 ### Changed
 
+- Turso engine bumped `=0.8.2` → `=0.8.3` (ephpm#573). No litewire API
+  change; file format and the `turso_cdc` log schema are unchanged. 0.8.3
+  refuses `PRAGMA journal_mode = 'mvcc'` inside a transaction. 0.8.2 accepted
+  it, and once the transaction ended the database file could not be opened
+  again ("Missing MVCC metadata table while logical log state exists"), so
+  four statements from a client lost the whole database. Pinned by
+  `crates/litewire-turso/tests/journal_mode_switch.rs`.
 - Turso engine bumped `=0.7.2` → `=0.8.2` (ephpm#535). No litewire API
   change. Database files are compatible in both directions (0.7.2 files,
   including one with an uncheckpointed WAL, open under 0.8.2 and the reverse;

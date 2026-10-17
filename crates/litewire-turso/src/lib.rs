@@ -5,7 +5,7 @@
 //!
 //! # Status
 //!
-//! The Turso engine is **Beta** (pinned here at `turso = "=0.8.2"`,
+//! The Turso engine is **Beta** (pinned here at `turso = "=0.8.3"`,
 //! October 2026; see the workspace `Cargo.toml` for what each bump
 //! changed). Upstream does not
 //! yet position it as a production SQLite replacement. This backend exists
@@ -41,7 +41,7 @@
 //! same data. (No temp-file workaround is needed here, unlike the rusqlite
 //! backend, because connections derive from a single engine instance.)
 //!
-//! # Known-unsupported operations (Turso 0.7.0, unchanged through 0.8.2)
+//! # Known-unsupported operations (Turso 0.7.0, unchanged through 0.8.3)
 //!
 //! Returned as clear [`BackendError`]s rather than silent misbehavior:
 //!

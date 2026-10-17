@@ -98,7 +98,18 @@ rusqlite = { version = "0.32", features = ["bundled", "column_decltype", "functi
 # - File format and the CDC log schema (`turso_cdc`, version "v2") are
 #   unchanged: 0.7.2 files, including an uncheckpointed WAL, open under
 #   0.8.2 and 0.8.2 files open under 0.7.2 (checked with a two-binary probe).
-turso = { version = "=0.8.2", default-features = false }
+#
+# 0.8.2 -> 0.8.3 (ephpm#573). A fix release; the binding API, file format and
+# CDC log schema are unchanged. The fix that reaches litewire: 0.8.2 accepted
+# `PRAGMA journal_mode = 'mvcc'` inside a transaction, and after the
+# transaction ended the file could not be opened again ("Missing MVCC
+# metadata table while logical log state exists") -- the whole database was
+# lost. That is four ordinary statements an application can send over the
+# wire. 0.8.3 refuses the switch inside a transaction; pinned by
+# crates/litewire-turso/tests/journal_mode_switch.rs. The other 0.8.3 fixes
+# are in the MVCC engine (only reached after a database is switched to MVCC)
+# and in the sync engine (not used here).
+turso = { version = "=0.8.3", default-features = false }
 
 # HTTP (Hrana)
 axum = "0.8"

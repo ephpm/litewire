@@ -14,6 +14,13 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+    # rustls client advisories (Debug impls leak session secrets; ServerHello
+    # downgrade). Patched only in rustls >= 0.23.46, which the shipped graph
+    # uses. They match ONLY rustls 0.21.12 via tiberius 0.12 (dev-dependency,
+    # TDS e2e test client); there is no patched 0.21.x. Drop once tiberius
+    # updates.
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
     # rustls-pemfile 1.x unmaintained — dev-dependency only, via tiberius 0.12
     # (TDS e2e test client). Awaiting a tiberius release on rustls-pemfile 2.
     "RUSTSEC-2025-0134",
