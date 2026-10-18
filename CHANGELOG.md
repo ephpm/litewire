@@ -56,6 +56,13 @@ the commit that merges this changelog.
 
 ### Fixed
 
+- `CdcTailer::poll_batch` now ships a transaction that changes more rows than
+  one 1024-row read window. Before, a full window with no COMMIT returned
+  `Ok(None)` ("nothing pending") on every poll, so CDC replication stopped
+  for good at the first transaction with 1024+ row changes, with no error and
+  no cursor movement. Found by ePHPm's clustered stress run (a 3000-row seed
+  INSERT froze every replica at change_id 12 while the primary reached
+  705k).
 - MySQL command packets `opensrv-mysql` cannot parse are no longer answered
   with a stray OK packet: `COM_STMT_RESET`/`COM_RESET_CONNECTION`/
   `COM_CHANGE_USER` get correct OK-shaped replies, everything else gets

@@ -232,8 +232,12 @@ impl<'a> CdcTailer<'a> {
     /// [`BackendError::Other`] — Phase 2 pins turso exactly, so this
     /// should only fire on a schema change we haven't caught up to.
     pub async fn poll_batch(&mut self) -> Result<Option<TxnBatch>, BackendError> {
-        // Read up to a bounded window of rows so a single batch cannot
-        // starve the tailer if the primary is committing very fast.
+        // Rows are read in windows of this size. A transaction larger than
+        // one window is read across several windows: the batch is complete
+        // only at its COMMIT row, however far that is. (Returning `None` for
+        // a full window with no COMMIT — what this did before — reported a
+        // large committed transaction as "nothing pending" on every poll, so
+        // replication stopped there for good without an error.)
         const WINDOW: i64 = 1024;
 
         let conn = self.factory.db.connect().map_err(map_turso_err)?;
@@ -255,38 +259,37 @@ impl<'a> CdcTailer<'a> {
             Err(e) if is_missing_cdc_log(&e) => return Ok(None),
             Err(e) => return Err(map_turso_err(e)),
         };
-        let mut rows = stmt
-            .query((self.last_seen_change_id, WINDOW))
-            .await
-            .map_err(map_turso_err)?;
-
+        // Rows up to and including the *first* COMMIT; rows after it are not
+        // read (the next poll starts from the advanced cursor).
         let mut buffered: Vec<CdcRow> = Vec::new();
-        // Find the *first* COMMIT and cut the batch there; drop trailing
-        // rows on the floor (the next poll will re-read them starting from
-        // the advanced cursor).
-        let mut commit_idx: Option<usize> = None;
+        // Where the next window starts: after the last row read so far.
+        let mut window_after = self.last_seen_change_id;
 
-        let mut idx = 0usize;
-        while let Some(row) = rows.next().await.map_err(map_turso_err)? {
-            let cdc_row = decode_cdc_row(&row)?;
-            let is_commit = cdc_row.change_type == change_type::COMMIT;
-            buffered.push(cdc_row);
-            if is_commit {
-                commit_idx = Some(idx);
-                break;
+        let commit_change_id = 'windows: loop {
+            let mut rows = stmt
+                .query((window_after, WINDOW))
+                .await
+                .map_err(map_turso_err)?;
+            let mut read_in_window: i64 = 0;
+            while let Some(row) = rows.next().await.map_err(map_turso_err)? {
+                let cdc_row = decode_cdc_row(&row)?;
+                read_in_window += 1;
+                window_after = cdc_row.change_id;
+                let commit =
+                    (cdc_row.change_type == change_type::COMMIT).then_some(cdc_row.change_id);
+                buffered.push(cdc_row);
+                if let Some(commit_change_id) = commit {
+                    break 'windows commit_change_id;
+                }
             }
-            idx += 1;
-        }
-
-        // No COMMIT in the window → no complete batch yet.
-        let Some(commit_idx) = commit_idx else {
-            return Ok(None);
+            // A short window means the log ended before a COMMIT: the newest
+            // transaction is still being written. Nothing complete yet.
+            if read_in_window < WINDOW {
+                return Ok(None);
+            }
+            // A full window with no COMMIT is one large transaction. Read on.
         };
 
-        buffered.truncate(commit_idx + 1);
-        // Read the cursor off the COMMIT row before the vec moves into the
-        // batch, so this path needs no unwrap on the now-`Option` accessor.
-        let commit_change_id = buffered[commit_idx].change_id;
         let batch = TxnBatch { rows: buffered };
         self.last_seen_change_id = commit_change_id;
         Ok(Some(batch))
