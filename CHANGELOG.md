@@ -31,6 +31,26 @@ the commit that merges this changelog.
 
 ### Added
 
+- WAL checkpoint gate for the Turso backend
+  (`TursoBuilder::wal_checkpoint_gate`, module `litewire_turso::wal_gate`;
+  off by default). Under constant read load the engine never rewinds its
+  write-ahead log: the passive auto-checkpoint backfills frames, but a
+  `RESTART`/`TRUNCATE` checkpoint needs every read-mark slot free and Turso
+  0.8.3 reports `busy` the instant one is held instead of waiting, so some
+  reader always wins and the `-wal` file grows by a frame per write — 1.3 GB
+  in eight minutes on a 0.7 MB database, multi-GB on a clustered owner whose
+  CDC tailers are continuous readers (ephpm WAL-growth stress runs). The gate
+  gives every session statement, and every `CdcTailer` poll, the shared side
+  of a per-file lock; once the file crosses a threshold (default 64 MiB) a
+  maintenance task takes the exclusive side with a bounded wait (default
+  250 ms, new statements queue behind it) and runs
+  `PRAGMA wal_checkpoint(TRUNCATE)`. An open transaction holds the shared
+  side until it ends, so the attempt times out and retries with backoff
+  rather than blocking it; the exclusive window is the checkpoint itself
+  (milliseconds on a backfilled log). One gate per canonical path, so several
+  factories on one file share it; the task holds the engine weakly and stops
+  when its factory drops. `Turso::wal_gate_stats` exposes counters and
+  `Turso::wal_gate_permit` lets raw-connection callers opt in.
 - Per-connection backend selection for multi-tenant embedders: a
   `ConnectionAuthenticator` runs during the MySQL handshake and binds each
   connection to its own backend (or rejects it); `serve()` refuses to start

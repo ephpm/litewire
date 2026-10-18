@@ -240,6 +240,14 @@ impl<'a> CdcTailer<'a> {
         // replication stopped there for good without an error.)
         const WINDOW: i64 = 1024;
 
+        // A poll is a reader for as long as it runs. Holding the WAL gate's
+        // shared side here is what lets a database with continuous tailers
+        // (one per replica) still reach the reader-free instant the
+        // truncating checkpoint needs; see `crate::wal_gate`.
+        let _permit = match &self.factory.wal_gate {
+            Some(gate) => Some(gate.permit().await),
+            None => None,
+        };
         let conn = self.factory.db.connect().map_err(map_turso_err)?;
         let prepared = conn
             .prepare(
