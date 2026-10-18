@@ -514,6 +514,14 @@ impl Backend for Turso {
             }
             pool.misses.fetch_add(1, Ordering::Relaxed);
         }
+        // Session setup runs pragmas on the new connection; under the gate
+        // those are statements like any other and must not land inside the
+        // exclusive window (where they would see the engine's `Busy` with
+        // no gate to queue on).
+        let _permit = match &self.wal_gate {
+            Some(gate) => Some(gate.permit().await),
+            None => None,
+        };
         let conn = self.fresh_connection().await?;
         // Fresh connection: last_insert_rowid() is 0, so the baseline is a
         // no-op and reporting matches the pre-reuse behaviour exactly.

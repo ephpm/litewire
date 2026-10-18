@@ -42,9 +42,10 @@ the commit that merges this changelog.
   CDC tailers are continuous readers (ephpm WAL-growth stress runs). The gate
   gives every session statement, and every `CdcTailer` poll, the shared side
   of a per-file lock; once the file crosses a threshold (default 64 MiB) a
-  maintenance task takes the exclusive side with a bounded wait (default
-  250 ms, new statements queue behind it) and runs
-  `PRAGMA wal_checkpoint(TRUNCATE)`. An open transaction holds the shared
+  maintenance task backfills the log with `PRAGMA wal_checkpoint(PASSIVE)`
+  rounds (outside the lock; blocks nobody), then takes the exclusive side
+  with a bounded wait (default 250 ms, new statements queue behind it) and
+  runs `PRAGMA wal_checkpoint(TRUNCATE)`. An open transaction holds the shared
   side until it ends, so the attempt times out and retries with backoff
   rather than blocking it; the exclusive window is the checkpoint itself
   (milliseconds on a backfilled log). One gate per canonical path, so several

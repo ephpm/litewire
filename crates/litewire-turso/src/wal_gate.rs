@@ -23,11 +23,14 @@
 //! side of a per-database [`tokio::sync::RwLock`] and holds it until the
 //! statement finishes, or, if the statement opened or continued an explicit
 //! transaction, until the session is back in autocommit. A maintenance task
-//! watches the `-wal` file size and, once it exceeds a threshold, takes the
-//! *exclusive* side — bounded by a short timeout — and runs
+//! watches the `-wal` file size and, once it exceeds a threshold, first
+//! backfills the log with `PRAGMA wal_checkpoint(PASSIVE)` rounds — which
+//! block nobody and reach as far as the oldest live snapshot — and then
+//! takes the *exclusive* side, bounded by a short timeout, and runs
 //! `PRAGMA wal_checkpoint(TRUNCATE)` while it holds it. With no statement in
-//! flight the engine's read-mark locks are free, the checkpoint succeeds and
-//! the file is truncated to zero bytes; the next write starts a fresh log.
+//! flight the engine's read-mark locks are free, the checkpoint only has the
+//! frames written since the last passive round to copy, and the file is
+//! truncated to zero bytes; the next write starts a fresh log.
 //!
 //! The lock is write-preferring, so a statement arriving while the task is
 //! *waiting* queues behind it: that is what lets the task drain a busy
@@ -38,10 +41,14 @@
 //! The gate therefore never deadlocks and never stalls a long transaction;
 //! it only ever delays *new* statements by at most `max_wait` per attempt.
 //!
-//! The exclusive window itself is the checkpoint's own duration — a few
-//! milliseconds when the log is already backfilled (the common case: the
-//! engine's passive auto-checkpoint keeps up, and `TRUNCATE` only has to
-//! copy the last partial window, fsync and truncate). See
+//! The exclusive window itself is the truncating checkpoint's own duration
+//! — a few milliseconds once the passive phase has done the copying. The
+//! passive phase is not optional: under permanently pinned readers the
+//! engine's own auto-checkpoint lags the head by however old the oldest
+//! snapshot is, and a `TRUNCATE` that has to copy and fsync a 64 MiB backlog
+//! inside the exclusive window stalls every queued statement for seconds
+//! (measured on a 3-node cluster owner). See
+//! [`WalGateStats::max_backfill_micros`] versus
 //! [`WalGateStats::max_exclusive_micros`].
 //!
 //! # What participates
@@ -142,6 +149,14 @@ pub struct WalGateStats {
     /// Bytes the `-wal` file held just before each successful truncate,
     /// summed.
     pub bytes_truncated: u64,
+    /// Frames moved into the main file by the passive backfill phase that
+    /// runs *outside* the gate before each exclusive attempt, summed.
+    pub frames_backfilled: u64,
+    /// Duration of the most recent passive backfill phase (outside the
+    /// gate; blocks nobody), in microseconds.
+    pub last_backfill_micros: u64,
+    /// Longest passive backfill phase seen, in microseconds.
+    pub max_backfill_micros: u64,
     /// Duration of the most recent exclusive window, in microseconds.
     pub last_exclusive_micros: u64,
     /// Longest exclusive window seen, in microseconds.
@@ -168,6 +183,9 @@ struct Counters {
     skipped_journal_mode: AtomicU64,
     errors: AtomicU64,
     bytes_truncated: AtomicU64,
+    frames_backfilled: AtomicU64,
+    last_backfill_micros: AtomicU64,
+    max_backfill_micros: AtomicU64,
     last_exclusive_micros: AtomicU64,
     max_exclusive_micros: AtomicU64,
 }
@@ -207,6 +225,9 @@ impl Gate {
             skipped_journal_mode: c.skipped_journal_mode.load(Ordering::Relaxed),
             errors: c.errors.load(Ordering::Relaxed),
             bytes_truncated: c.bytes_truncated.load(Ordering::Relaxed),
+            frames_backfilled: c.frames_backfilled.load(Ordering::Relaxed),
+            last_backfill_micros: c.last_backfill_micros.load(Ordering::Relaxed),
+            max_backfill_micros: c.max_backfill_micros.load(Ordering::Relaxed),
             last_exclusive_micros: c.last_exclusive_micros.load(Ordering::Relaxed),
             max_exclusive_micros: c.max_exclusive_micros.load(Ordering::Relaxed),
         }
@@ -335,6 +356,12 @@ fn wal_size(wal_path: &Path) -> u64 {
     std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// Upper bound on passive backfill rounds per attempt. Each round copies
+/// every frame up to the oldest live reader's snapshot; under short
+/// statements the second round is already near the head, so this is a
+/// guard against a pathological loop, not a tuning knob.
+const MAX_BACKFILL_ROUNDS: u32 = 8;
+
 async fn attempt(
     db: &turso::Database,
     gate: &Gate,
@@ -344,6 +371,58 @@ async fn attempt(
     let c = &gate.counters;
     c.attempts.fetch_add(1, Ordering::Relaxed);
 
+    let conn = match db.connect() {
+        Ok(conn) => conn,
+        Err(e) => {
+            c.errors.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("wal gate: cannot open a checkpoint connection: {e}");
+            return Attempt::Error;
+        }
+    };
+    match journal_mode_is_wal(&conn, gate).await {
+        Ok(true) => {}
+        Ok(false) => {
+            c.skipped_journal_mode.fetch_add(1, Ordering::Relaxed);
+            return Attempt::SkippedJournalMode;
+        }
+        Err(e) => {
+            c.errors.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("wal gate: cannot read the journal mode: {e}");
+            return Attempt::Error;
+        }
+    }
+
+    // Phase 1, outside the gate: move the bulk of the log into the main
+    // file with PASSIVE checkpoints, which never block a reader or a
+    // writer. Under permanently pinned readers the engine's own
+    // auto-checkpoint lags the head by however far the oldest snapshot is,
+    // and a TRUNCATE has to copy (and fsync) every un-backfilled frame
+    // while it holds the locks: measured at seconds for a 64 MiB log under
+    // a 3-node cluster owner, which is exactly the stall the gate must not
+    // cause. After this phase the exclusive window only has the frames
+    // written during the last round to copy.
+    let backfill_started = Instant::now();
+    let frames = passive_backfill(&conn).await;
+    let backfill_micros = u64::try_from(backfill_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    c.last_backfill_micros
+        .store(backfill_micros, Ordering::Relaxed);
+    c.max_backfill_micros
+        .fetch_max(backfill_micros, Ordering::Relaxed);
+    match frames {
+        Ok(n) => {
+            c.frames_backfilled.fetch_add(n, Ordering::Relaxed);
+        }
+        Err(e) => {
+            c.errors.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                wal_bytes = size_before,
+                "wal gate: passive backfill failed: {e}"
+            );
+            return Attempt::Error;
+        }
+    }
+
+    // Phase 2, inside the gate: drain statements and truncate.
     let Some(guard) = gate.exclusive(config.max_wait).await else {
         c.timed_out.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
@@ -354,7 +433,7 @@ async fn attempt(
         return Attempt::TimedOut;
     };
     let started = Instant::now();
-    let outcome = checkpoint_truncate(db, gate).await;
+    let outcome = checkpoint(&conn, "TRUNCATE").await;
     let window = started.elapsed();
     drop(guard);
 
@@ -362,17 +441,18 @@ async fn attempt(
     c.last_exclusive_micros.store(micros, Ordering::Relaxed);
     c.max_exclusive_micros.fetch_max(micros, Ordering::Relaxed);
     match outcome {
-        Ok(Attempt::Truncated) => {
+        Ok(CheckpointRow { busy: false, .. }) => {
             c.truncated.fetch_add(1, Ordering::Relaxed);
             c.bytes_truncated.fetch_add(size_before, Ordering::Relaxed);
             tracing::debug!(
                 wal_bytes = size_before,
+                backfill_micros,
                 exclusive_micros = micros,
                 "wal gate: truncated the write-ahead log"
             );
             Attempt::Truncated
         }
-        Ok(Attempt::Busy) => {
+        Ok(CheckpointRow { busy: true, .. }) => {
             c.busy.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 wal_bytes = size_before,
@@ -381,11 +461,6 @@ async fn attempt(
             );
             Attempt::Busy
         }
-        Ok(Attempt::SkippedJournalMode) => {
-            c.skipped_journal_mode.fetch_add(1, Ordering::Relaxed);
-            Attempt::SkippedJournalMode
-        }
-        Ok(other) => other,
         Err(e) => {
             c.errors.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(wal_bytes = size_before, "wal gate: checkpoint failed: {e}");
@@ -394,33 +469,85 @@ async fn attempt(
     }
 }
 
-/// Run the truncating checkpoint on a fresh connection and report whether
-/// the engine did it. Must be called with the exclusive side held.
-async fn checkpoint_truncate(db: &turso::Database, gate: &Gate) -> turso::Result<Attempt> {
-    let conn = db.connect()?;
-    let mode = first_text(&conn, "PRAGMA journal_mode").await?;
-    if !mode.eq_ignore_ascii_case("wal") {
-        if !gate.journal_mode_warned.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                journal_mode = %mode,
-                "wal gate: database is not in WAL journal mode; the gate will not checkpoint it"
-            );
-        }
-        return Ok(Attempt::SkippedJournalMode);
+/// `true` when the database is in WAL journal mode; logs once otherwise.
+async fn journal_mode_is_wal(conn: &turso::Connection, gate: &Gate) -> turso::Result<bool> {
+    let mode = first_text(conn, "PRAGMA journal_mode").await?;
+    if mode.eq_ignore_ascii_case("wal") {
+        return Ok(true);
     }
-    // Result row is (busy, log, checkpointed), as in SQLite. The engine
-    // reports a lock it could not take as `busy = 1` rather than an error.
-    let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
-    let busy = match rows.next().await? {
-        Some(row) => matches!(row.get_value(0)?, turso::Value::Integer(1)),
-        None => false,
+    if !gate.journal_mode_warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            journal_mode = %mode,
+            "wal gate: database is not in WAL journal mode; the gate will not checkpoint it"
+        );
+    }
+    Ok(false)
+}
+
+/// Passive-checkpoint until the log is fully backfilled, another
+/// checkpointer is running, or a round makes no progress (the oldest
+/// reader's snapshot is the ceiling). Returns the number of frames
+/// backfilled across rounds.
+async fn passive_backfill(conn: &turso::Connection) -> turso::Result<u64> {
+    let mut total = 0u64;
+    let mut last_checkpointed: Option<i64> = None;
+    for _ in 0..MAX_BACKFILL_ROUNDS {
+        let row = checkpoint(conn, "PASSIVE").await?;
+        if row.busy {
+            break;
+        }
+        let progressed = last_checkpointed.is_none_or(|prev| row.checkpointed > prev);
+        if let Some(prev) = last_checkpointed {
+            total += u64::try_from(row.checkpointed - prev).unwrap_or(0);
+        } else {
+            total += u64::try_from(row.checkpointed).unwrap_or(0);
+        }
+        last_checkpointed = Some(row.checkpointed);
+        if !progressed || row.checkpointed >= row.log {
+            break;
+        }
+        // Let readers that were pinning the old snapshot finish before the
+        // next round so it can reach further.
+        tokio::task::yield_now().await;
+    }
+    Ok(total)
+}
+
+/// The `(busy, log, checkpointed)` row `PRAGMA wal_checkpoint` returns, as
+/// in SQLite: `busy` is set when a lock could not be taken (the engine
+/// reports that as a row, not an error), `log` is the WAL's frame count
+/// and `checkpointed` how many of those are in the main file.
+struct CheckpointRow {
+    busy: bool,
+    log: i64,
+    checkpointed: i64,
+}
+
+async fn checkpoint(conn: &turso::Connection, mode: &str) -> turso::Result<CheckpointRow> {
+    let mut rows = conn
+        .query(format!("PRAGMA wal_checkpoint({mode})"), ())
+        .await?;
+    let row = match rows.next().await? {
+        Some(row) => CheckpointRow {
+            busy: matches!(row.get_value(0)?, turso::Value::Integer(1)),
+            log: int_or_zero(row.get_value(1)?),
+            checkpointed: int_or_zero(row.get_value(2)?),
+        },
+        None => CheckpointRow {
+            busy: false,
+            log: 0,
+            checkpointed: 0,
+        },
     };
     drop(rows);
-    Ok(if busy {
-        Attempt::Busy
-    } else {
-        Attempt::Truncated
-    })
+    Ok(row)
+}
+
+fn int_or_zero(v: turso::Value) -> i64 {
+    match v {
+        turso::Value::Integer(i) => i,
+        _ => 0,
+    }
 }
 
 async fn first_text(conn: &turso::Connection, sql: &str) -> turso::Result<String> {
