@@ -74,12 +74,14 @@
 //! CR 2014 "Commands out of sync".
 
 pub mod cdc;
+pub mod wal_gate;
 
 /// Re-export of the underlying [`turso::Connection`] type. External
 /// callers (e.g. ePHPm's Phase 2 CDC replication layer) need this to
 /// type their apply-side function signatures without taking a direct
 /// `turso` dependency.
 pub use turso::Connection as TursoConnection;
+pub use wal_gate::{WalGateConfig, WalGatePermit, WalGateStats};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -128,9 +130,22 @@ pub struct TursoBuilder {
     enable_cdc_on_connect: bool,
     max_idle: usize,
     idle_max_age: Duration,
+    wal_gate: Option<WalGateConfig>,
 }
 
 impl TursoBuilder {
+    /// Enable the WAL checkpoint gate, which keeps the database's `-wal`
+    /// file bounded under constant read load by periodically draining
+    /// statements and running a truncating checkpoint. Off by default. See
+    /// [`wal_gate`] for the mechanism, the guarantees, and what it costs.
+    ///
+    /// Ignored for `:memory:` databases, which have no WAL file.
+    #[must_use]
+    pub fn wal_checkpoint_gate(mut self, config: WalGateConfig) -> Self {
+        self.wal_gate = Some(config);
+        self
+    }
+
     /// Set the busy timeout (milliseconds) applied to every per-session
     /// connection. Mirrors the rusqlite backend's `busy_timeout` PRAGMA
     /// (default 5000 ms).
@@ -204,10 +219,25 @@ impl TursoBuilder {
     /// Returns [`BackendError::Sqlite`] if the database cannot be opened
     /// (bad path, corrupt file, unsupported format).
     pub async fn build(self) -> Result<Turso, BackendError> {
-        let db = turso::Builder::new_local(&self.path)
-            .build()
-            .await
-            .map_err(map_turso_err)?;
+        let db = Arc::new(
+            turso::Builder::new_local(&self.path)
+                .build()
+                .await
+                .map_err(map_turso_err)?,
+        );
+        let (wal_gate, wal_gate_task) = match self.wal_gate {
+            Some(config) if self.path != ":memory:" => {
+                let gate = wal_gate::gate_for(&self.path);
+                let task = wal_gate::spawn_task(
+                    Arc::downgrade(&db),
+                    Arc::clone(&gate),
+                    &self.path,
+                    config,
+                );
+                (Some(gate), Some(task))
+            }
+            _ => (None, None),
+        };
         let reuse = if self.max_idle > 0 && !self.enable_cdc_on_connect {
             Some(Arc::new(ReusePool::new(self.max_idle, self.idle_max_age)))
         } else {
@@ -226,6 +256,8 @@ impl TursoBuilder {
             synchronous: self.synchronous,
             enable_cdc_on_connect: self.enable_cdc_on_connect,
             reuse,
+            wal_gate,
+            wal_gate_task,
         })
     }
 }
@@ -236,7 +268,9 @@ impl TursoBuilder {
 /// every wire-protocol session via [`Backend::connect`]. See the module
 /// docs for status and limitations.
 pub struct Turso {
-    pub(crate) db: turso::Database,
+    /// Shared with the WAL-gate maintenance task weakly, so the task can
+    /// never outlive the factory's hold on the engine.
+    pub(crate) db: Arc<turso::Database>,
     busy_timeout_ms: u32,
     synchronous: Synchronous,
     /// If set, [`Backend::connect`] enables full CDC capture on every
@@ -245,6 +279,19 @@ pub struct Turso {
     /// Idle-connection reuse pool, present iff enabled via
     /// [`TursoBuilder::handle_reuse`]. See the reuse-pool section below.
     reuse: Option<Arc<ReusePool>>,
+    /// WAL checkpoint gate, present iff enabled via
+    /// [`TursoBuilder::wal_checkpoint_gate`] on a file-backed database.
+    pub(crate) wal_gate: Option<Arc<wal_gate::Gate>>,
+    /// The gate's maintenance task; stopped on drop.
+    wal_gate_task: Option<wal_gate::TaskHandle>,
+}
+
+impl Drop for Turso {
+    fn drop(&mut self) {
+        if let Some(task) = &self.wal_gate_task {
+            task.stop();
+        }
+    }
 }
 
 impl Turso {
@@ -295,6 +342,7 @@ impl Turso {
             enable_cdc_on_connect: false,
             max_idle: 0,
             idle_max_age: Duration::from_secs(60),
+            wal_gate: None,
         }
     }
 
@@ -303,6 +351,44 @@ impl Turso {
     #[must_use]
     pub fn reuse_stats(&self) -> Option<ReuseStats> {
         self.reuse.as_ref().map(|p| p.stats())
+    }
+
+    /// Snapshot the WAL checkpoint gate's counters, or `None` if the gate
+    /// is not enabled on this factory. The counters are shared by every
+    /// factory on the same database file. See [`wal_gate`].
+    #[must_use]
+    pub fn wal_gate_stats(&self) -> Option<WalGateStats> {
+        self.wal_gate.as_ref().map(|g| g.stats())
+    }
+
+    /// Take the gate's shared side for work done on a
+    /// [`raw_connection`](Self::raw_connection), so a truncating checkpoint
+    /// cannot run while the permit is held. Sessions from
+    /// [`Backend::connect`] and [`cdc::CdcTailer`] take one automatically;
+    /// this is for callers that run statements on raw connections and want
+    /// to rule out an engine `Busy` from colliding with the checkpoint.
+    /// Resolves immediately with `None` when the gate is not enabled.
+    ///
+    /// Queues behind a pending checkpoint attempt for at most
+    /// [`WalGateConfig::max_wait`]; never hold one across an `.await` that
+    /// waits on another permit holder.
+    pub async fn wal_gate_permit(&self) -> Option<WalGatePermit> {
+        match &self.wal_gate {
+            Some(gate) => Some(gate.permit().await),
+            None => None,
+        }
+    }
+
+    /// A watch that becomes `true` once the gate's maintenance task has
+    /// exited (it does so promptly after the factory is dropped), or `None`
+    /// if the gate is not enabled. Lets an embedder's tests prove no task
+    /// outlives an evicted database. Waiting on it after the task's sender
+    /// is gone returns an error, which reads the same way.
+    #[must_use]
+    pub fn wal_gate_task_finished(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.wal_gate_task
+            .as_ref()
+            .map(wal_gate::TaskHandle::finished)
     }
 
     /// Open a fresh per-session connection with the standard session
@@ -317,13 +403,26 @@ impl Turso {
     }
 }
 
+/// The connection plus the state only the statement currently holding the
+/// session mutex may touch.
+struct SessionState {
+    conn: turso::Connection,
+    /// WAL-gate permit held across an explicit transaction. Taken at the
+    /// first statement, dropped once the connection is back in autocommit.
+    /// Always `None` when the gate is not enabled.
+    permit: Option<WalGatePermit>,
+}
+
 /// Per-session Turso handle.
 ///
 /// Owns exactly one [`turso::Connection`]. A [`tokio::sync::Mutex`]
 /// serializes statements on the same session (held across `.await`, which
 /// is why this is the tokio mutex and not a std/parking_lot one).
 pub struct TursoConn {
-    conn: Mutex<turso::Connection>,
+    conn: Mutex<SessionState>,
+    /// The database's WAL checkpoint gate, if enabled. Every statement
+    /// holds its shared side; see [`wal_gate`].
+    gate: Option<Arc<wal_gate::Gate>>,
     /// Pool to park this connection back into on drop, if reuse is
     /// enabled. `None` disables parking (and is what a discarded checkout
     /// candidate carries, so it cannot re-park itself).
@@ -340,12 +439,53 @@ pub struct TursoConn {
 }
 
 impl TursoConn {
+    fn new(
+        conn: turso::Connection,
+        gate: Option<Arc<wal_gate::Gate>>,
+        reuse: Option<Arc<ReusePool>>,
+        baseline_rowid: i64,
+    ) -> Self {
+        Self {
+            conn: Mutex::new(SessionState { conn, permit: None }),
+            gate,
+            reuse,
+            baseline_rowid,
+            dirty: AtomicBool::new(false),
+        }
+    }
+
     /// Flag the connection dirty if `sql` leaves connection-scoped state
     /// behind, so [`Drop`] will not park it. A cheap keyword scan, and a
     /// no-op when reuse is disabled (the default).
     fn mark_dirty_if_needed(&self, sql: &str) {
         if self.reuse.is_some() && statement_dirties_connection(sql) {
             self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Hold the WAL gate's shared side for the statement about to run.
+    /// A permit carried over from an open transaction is kept; otherwise
+    /// one is taken now (queueing behind a pending checkpoint attempt for
+    /// at most [`WalGateConfig::max_wait`]). No-op without a gate.
+    async fn enter_gate(&self, state: &mut SessionState) {
+        if let Some(gate) = &self.gate
+            && state.permit.is_none()
+        {
+            state.permit = Some(gate.permit().await);
+        }
+    }
+
+    /// Release the permit unless the statement left (or kept) the
+    /// connection inside an explicit transaction, in which case it stays
+    /// held until the transaction ends — a checkpoint cannot run against
+    /// an open read snapshot anyway, and holding it is what makes the
+    /// gate's exclusive attempt time out instead of spinning on `busy`.
+    /// The engine is the authority on the transaction state; an error
+    /// from it is treated as "not in a transaction" so a permit is never
+    /// kept by mistake.
+    fn settle_gate(state: &mut SessionState) {
+        if state.permit.is_some() && !matches!(state.conn.is_autocommit(), Ok(false)) {
+            state.permit = None;
         }
     }
 }
@@ -360,12 +500,12 @@ impl Backend for Turso {
                 if ReusePool::reusable_at_checkout(&conn) {
                     pool.hits.fetch_add(1, Ordering::Relaxed);
                     let baseline_rowid = conn.last_insert_rowid();
-                    return Ok(Box::new(TursoConn {
-                        conn: Mutex::new(conn),
-                        reuse: Some(Arc::clone(pool)),
+                    return Ok(Box::new(TursoConn::new(
+                        conn,
+                        self.wal_gate.clone(),
+                        Some(Arc::clone(pool)),
                         baseline_rowid,
-                        dirty: AtomicBool::new(false),
-                    }));
+                    )));
                 }
                 // Defensive: not in autocommit (engine's lazy dangling-tx
                 // handling). Drop it (its `reuse` is None, so no re-park)
@@ -374,16 +514,24 @@ impl Backend for Turso {
             }
             pool.misses.fetch_add(1, Ordering::Relaxed);
         }
+        // Session setup runs pragmas on the new connection; under the gate
+        // those are statements like any other and must not land inside the
+        // exclusive window (where they would see the engine's `Busy` with
+        // no gate to queue on).
+        let _permit = match &self.wal_gate {
+            Some(gate) => Some(gate.permit().await),
+            None => None,
+        };
         let conn = self.fresh_connection().await?;
         // Fresh connection: last_insert_rowid() is 0, so the baseline is a
         // no-op and reporting matches the pre-reuse behaviour exactly.
         let baseline_rowid = conn.last_insert_rowid();
-        Ok(Box::new(TursoConn {
-            conn: Mutex::new(conn),
-            reuse: self.reuse.clone(),
+        Ok(Box::new(TursoConn::new(
+            conn,
+            self.wal_gate.clone(),
+            self.reuse.clone(),
             baseline_rowid,
-            dirty: AtomicBool::new(false),
-        }))
+        )))
     }
 }
 
@@ -604,89 +752,122 @@ fn check_param_count(sql: &str, got: usize) -> Result<(), BackendError> {
     Ok(())
 }
 
+/// Run `SELECT`-shaped `sql` on `conn` and collect the rows.
+async fn query_on(
+    conn: &turso::Connection,
+    sql: &str,
+    params: &[Value],
+) -> Result<ResultSet, BackendError> {
+    // `prepare_cached` interns the parsed statement in the engine's
+    // per-connection cache, mirroring the rusqlite backend.
+    let mut stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
+    // Engine parse errors surface first (prepare above); then enforce
+    // the bind count like rusqlite does — the engine itself would
+    // silently run with unbound parameters as NULL.
+    check_param_count(sql, params.len())?;
+
+    let columns = to_columns(&stmt.columns());
+    let col_count = columns.len();
+
+    let mut rows = stmt.query(to_params(params)).await.map_err(map_turso_err)?;
+    let mut result_rows = Vec::new();
+    while let Some(row) = rows.next().await.map_err(map_turso_err)? {
+        let mut values = Vec::with_capacity(col_count);
+        for i in 0..col_count {
+            values.push(from_turso(row.get_value(i).map_err(map_turso_err)?));
+        }
+        result_rows.push(values);
+    }
+
+    // WORKAROUND (turso 0.7.0): a SELECT from a pragma table-valued
+    // function (e.g. `pragma_table_info(...)`) leaves the connection in
+    // a phantom-transaction state: every subsequent write is accepted
+    // and visible to this session but never committed — silently lost
+    // on close. `COMMIT` then reports "no transaction is active", yet
+    // an explicit `BEGIN; COMMIT;` pair restores normal autocommit —
+    // but only once the poisoning statement handle has been dropped.
+    // Verified empirically (see ePHPm docs/turso-gate5-results.md);
+    // upstream issue to be filed. Without this, WordPress is unusable
+    // (dbDelta's DESCRIBE poisons the session before any writes).
+    if sql_uses_pragma_tvf(sql) {
+        drop(rows);
+        drop(stmt);
+        conn.execute("BEGIN", ()).await.map_err(map_turso_err)?;
+        conn.execute("COMMIT", ()).await.map_err(map_turso_err)?;
+    }
+
+    Ok(ResultSet {
+        columns,
+        rows: result_rows,
+    })
+}
+
+/// Run a mutating `sql` on `conn`. `baseline_rowid` is the session's
+/// checkout-time `last_insert_rowid()` (see [`TursoConn::baseline_rowid`]).
+async fn execute_on(
+    conn: &turso::Connection,
+    sql: &str,
+    params: &[Value],
+    baseline_rowid: i64,
+) -> Result<ExecuteResult, BackendError> {
+    let mut stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
+    // Same bind-count parity check as `query` (see `check_param_count`).
+    check_param_count(sql, params.len())?;
+    let affected = stmt
+        .execute(to_params(params))
+        .await
+        .map_err(map_turso_err)?;
+    let last_id = conn.last_insert_rowid();
+
+    Ok(ExecuteResult {
+        affected_rows: affected,
+        // Suppress the inherited rowid a reused connection carries from
+        // the prior session (baseline); report only this session's own
+        // inserts. For a fresh connection baseline is 0, so this is
+        // identical to the previous `last_id != 0` check.
+        last_insert_rowid: if last_id != 0 && last_id != baseline_rowid {
+            Some(last_id)
+        } else {
+            None
+        },
+    })
+}
+
 #[async_trait::async_trait]
 impl BackendConn for TursoConn {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> {
         reject_unsupported(sql)?;
         self.mark_dirty_if_needed(sql);
-        let conn = self.conn.lock().await;
-        // `prepare_cached` interns the parsed statement in the engine's
-        // per-connection cache, mirroring the rusqlite backend.
-        let mut stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
-        // Engine parse errors surface first (prepare above); then enforce
-        // the bind count like rusqlite does — the engine itself would
-        // silently run with unbound parameters as NULL.
-        check_param_count(sql, params.len())?;
-
-        let columns = to_columns(&stmt.columns());
-        let col_count = columns.len();
-
-        let mut rows = stmt.query(to_params(params)).await.map_err(map_turso_err)?;
-        let mut result_rows = Vec::new();
-        while let Some(row) = rows.next().await.map_err(map_turso_err)? {
-            let mut values = Vec::with_capacity(col_count);
-            for i in 0..col_count {
-                values.push(from_turso(row.get_value(i).map_err(map_turso_err)?));
-            }
-            result_rows.push(values);
-        }
-
-        // WORKAROUND (turso 0.7.0): a SELECT from a pragma table-valued
-        // function (e.g. `pragma_table_info(...)`) leaves the connection in
-        // a phantom-transaction state: every subsequent write is accepted
-        // and visible to this session but never committed — silently lost
-        // on close. `COMMIT` then reports "no transaction is active", yet
-        // an explicit `BEGIN; COMMIT;` pair restores normal autocommit —
-        // but only once the poisoning statement handle has been dropped.
-        // Verified empirically (see ePHPm docs/turso-gate5-results.md);
-        // upstream issue to be filed. Without this, WordPress is unusable
-        // (dbDelta's DESCRIBE poisons the session before any writes).
-        if sql_uses_pragma_tvf(sql) {
-            drop(rows);
-            drop(stmt);
-            conn.execute("BEGIN", ()).await.map_err(map_turso_err)?;
-            conn.execute("COMMIT", ()).await.map_err(map_turso_err)?;
-        }
-
-        Ok(ResultSet {
-            columns,
-            rows: result_rows,
-        })
+        let mut state = self.conn.lock().await;
+        self.enter_gate(&mut state).await;
+        let result = query_on(&state.conn, sql, params).await;
+        Self::settle_gate(&mut state);
+        result
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, BackendError> {
         reject_unsupported(sql)?;
         self.mark_dirty_if_needed(sql);
-        let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
-        // Same bind-count parity check as `query` (see `check_param_count`).
-        check_param_count(sql, params.len())?;
-        let affected = stmt
-            .execute(to_params(params))
-            .await
-            .map_err(map_turso_err)?;
-        let last_id = conn.last_insert_rowid();
-
-        Ok(ExecuteResult {
-            affected_rows: affected,
-            // Suppress the inherited rowid a reused connection carries from
-            // the prior session (baseline); report only this session's own
-            // inserts. For a fresh connection baseline is 0, so this is
-            // identical to the previous `last_id != 0` check.
-            last_insert_rowid: if last_id != 0 && last_id != self.baseline_rowid {
-                Some(last_id)
-            } else {
-                None
-            },
-        })
+        let mut state = self.conn.lock().await;
+        self.enter_gate(&mut state).await;
+        let result = execute_on(&state.conn, sql, params, self.baseline_rowid).await;
+        Self::settle_gate(&mut state);
+        result
     }
 
     async fn describe_columns(&self, sql: &str) -> Result<Vec<Column>, BackendError> {
-        let conn = self.conn.lock().await;
+        let mut state = self.conn.lock().await;
+        self.enter_gate(&mut state).await;
         // Prepare without executing -- same trick as the rusqlite backend,
         // no LIMIT-0 probe needed.
-        let stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
-        Ok(to_columns(&stmt.columns()))
+        let result = state
+            .conn
+            .prepare_cached(sql)
+            .await
+            .map(|stmt| to_columns(&stmt.columns()))
+            .map_err(map_turso_err);
+        Self::settle_gate(&mut state);
+        result
     }
 }
 
@@ -902,7 +1083,7 @@ impl Drop for TursoConn {
         }
         // `get_mut` needs no lock: we hold `&mut self`, so no other task
         // can be mid-statement on this connection.
-        let conn = self.conn.get_mut();
+        let conn = &self.conn.get_mut().conn;
         // Never park a connection with an open transaction: a reused
         // session must start in autocommit. `is_autocommit` is a cheap sync
         // call. Cloning shares the inner `Arc<TursoConnection>`, so the
