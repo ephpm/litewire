@@ -81,7 +81,7 @@ pub mod wal_gate;
 /// type their apply-side function signatures without taking a direct
 /// `turso` dependency.
 pub use turso::Connection as TursoConnection;
-pub use wal_gate::{WalGateConfig, WalGatePermit, WalGateStats};
+pub use wal_gate::{ESCALATION_THRESHOLD_MULTIPLE, WalGateConfig, WalGatePermit, WalGateStats};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex};
@@ -370,7 +370,9 @@ impl Turso {
     /// Resolves immediately with `None` when the gate is not enabled.
     ///
     /// Queues behind a pending checkpoint attempt for at most
-    /// [`WalGateConfig::max_wait`]; never hold one across an `.await` that
+    /// [`WalGateConfig::max_wait`], or [`WalGateConfig::max_escalated_wait`]
+    /// while the log is far over its threshold (see [`wal_gate`]); never
+    /// hold one across an `.await` that
     /// waits on another permit holder.
     pub async fn wal_gate_permit(&self) -> Option<WalGatePermit> {
         match &self.wal_gate {
@@ -466,7 +468,9 @@ impl TursoConn {
     /// Hold the WAL gate's shared side for the statement about to run.
     /// A permit carried over from an open transaction is kept; otherwise
     /// one is taken now (queueing behind a pending checkpoint attempt for
-    /// at most [`WalGateConfig::max_wait`]). No-op without a gate.
+    /// at most the attempt's wait: [`WalGateConfig::max_wait`], or up to
+    /// [`WalGateConfig::max_escalated_wait`] when escalated). No-op without
+    /// a gate.
     async fn enter_gate(&self, state: &mut SessionState) {
         if let Some(gate) = &self.gate
             && state.permit.is_none()
