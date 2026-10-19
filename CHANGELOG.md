@@ -52,6 +52,24 @@ the commit that merges this changelog.
   factories on one file share it; the task holds the engine weakly and stops
   when its factory drops. `Turso::wal_gate_stats` exposes counters and
   `Turso::wal_gate_permit` lets raw-connection callers opt in.
+- WAL checkpoint gate escalation: statements that routinely outlast
+  `max_wait` no longer starve the checkpoint. Under 48 clients running
+  `COUNT`/`GROUP BY`/join reads that took longer than 250 ms, every exclusive
+  attempt timed out, the backoff stretched attempts to about one a minute,
+  truncations stopped, the `-wal` file reached 1.2 GiB and p99 latency went
+  from 241 ms to 1,045 ms (ephpm WAL-gate stress run). Once the file is at
+  least `ESCALATION_THRESHOLD_MULTIPLE` (4) × `threshold_bytes`, a timed-out
+  attempt retries on the next tick with double the wait, up to the new
+  `WalGateConfig::max_escalated_wait` (default 2 s), and only backs off
+  once a wait at that ceiling times out. The escalation resets after a
+  truncate or when the file drops back under 4× the threshold; below that
+  point the schedule is unchanged. New statements queue for as long as an
+  escalated attempt waits, so the ceiling is the worst-case stall it adds.
+  Setting `max_escalated_wait` to `max_wait` or lower disables escalation.
+  `WalGateStats` gains `escalation_level`, `consecutive_timeouts` and
+  `next_wait_micros`. `WalGateConfig` has a new public field, so code that
+  builds it with a struct literal must add the field or use
+  `..WalGateConfig::default()`.
 - Per-connection backend selection for multi-tenant embedders: a
   `ConnectionAuthenticator` runs during the MySQL handshake and binds each
   connection to its own backend (or rejects it); `serve()` refuses to start

@@ -19,7 +19,8 @@ turso = { workspace = true }
 # rusqlite backend enabled for tests/examples only: the Phase 1 gate
 # harness (examples/phase1_gates.rs) compares both engines side by side.
 litewire-backend = { workspace = true, features = ["rusqlite"] }
-tokio = { workspace = true, features = ["full"] }
+# test-util: the WAL-gate schedule tests drive a paused clock.
+tokio = { workspace = true, features = ["full", "test-util"] }
 # Temp files for CDC replication tests that need two independent
 # file-backed databases (Turso's shared-memory `:memory:` isn't
 # suitable for primary/replica pairs).

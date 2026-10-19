@@ -27,6 +27,7 @@ fn gate_config(threshold_bytes: u64) -> WalGateConfig {
         interval: Duration::from_millis(50),
         max_wait: Duration::from_millis(200),
         max_backoff: Duration::from_millis(400),
+        max_escalated_wait: Duration::from_millis(800),
     }
 }
 
