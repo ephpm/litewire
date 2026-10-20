@@ -23,7 +23,7 @@ pub use litewire_backend as backend;
 /// for the security contract before implementing
 /// [`ConnectionAuthenticator`](backend::ConnectionAuthenticator).
 pub use litewire_backend::{
-    AuthRequest, ConnectionAuthenticator, SharedAuthenticator, async_trait,
+    AuthOutcome, AuthRequest, ConnectionAuthenticator, SharedAuthenticator, async_trait,
 };
 pub use litewire_session as session;
 /// The dialect-aware session layer -- translation, transaction-state

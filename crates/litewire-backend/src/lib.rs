@@ -209,7 +209,7 @@ pub type SharedBackend = Arc<dyn Backend>;
 /// `async-trait` to their own manifest and keep its version in step with
 /// litewire's.
 pub use async_trait::async_trait;
-pub use auth::{AuthRequest, ConnectionAuthenticator, SharedAuthenticator};
+pub use auth::{AuthOutcome, AuthRequest, ConnectionAuthenticator, SharedAuthenticator};
 pub use conn_limit::{ConnectionLimiter, ConnectionSlot};
 pub use tenant_screen::TenantScreened;
 

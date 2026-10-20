@@ -11,7 +11,9 @@
 //! a connection bound to exactly one of them. [`ConnectionAuthenticator`] is
 //! the hook for that. It runs **during** the handshake, before any backend
 //! session exists, and it returns the backend the connection is bound to for
-//! its whole lifetime — or `None`, which rejects the connection.
+//! its whole lifetime — or [`AuthOutcome::Denied`], which rejects the
+//! connection, or [`AuthOutcome::Unavailable`], which accepts the credential
+//! but reports that its database cannot be reached.
 //!
 //! # The security contract (read this before implementing the trait)
 //!
@@ -106,6 +108,55 @@ pub struct AuthRequest<'a> {
     pub peer_addr: SocketAddr,
 }
 
+/// What a [`ConnectionAuthenticator`] decided about a connection.
+///
+/// Three outcomes rather than "a backend or nothing", because "you are not who
+/// you say you are" and "you are, but your database cannot be reached right
+/// now" call for different answers on the wire. Reporting the second as an
+/// access-denied error makes a busy or briefly unreachable database look like
+/// a wrong password to whoever is reading the client's logs.
+pub enum AuthOutcome {
+    /// The credential verified; the connection is bound to this backend for
+    /// its whole lifetime.
+    Granted(SharedBackend),
+    /// The connection is refused as unauthenticated: MySQL access-denied
+    /// (`1698`, SQLSTATE `28000`) at the handshake, and no backend.
+    Denied,
+    /// The credential **verified**, but the backend it entitles the
+    /// connection to cannot be reached right now (it could not be opened, or
+    /// it is busy). The string says why.
+    ///
+    /// The connection still gets no backend — every command on it fails —
+    /// but it fails with a non-authentication error classified from the
+    /// reason exactly as a statement error would be (a busy database is
+    /// `1205`, lock wait timeout; anything unrecognised is `1105`), so the
+    /// operator sees the database's problem instead of a credential problem.
+    ///
+    /// Only return this **after** the credential has been verified. Returning
+    /// it for an unverified caller would let anyone probe which tenants exist
+    /// (or are busy) by watching for a non-auth error.
+    Unavailable(String),
+}
+
+impl From<Option<SharedBackend>> for AuthOutcome {
+    /// `Some(backend)` is [`AuthOutcome::Granted`], `None` is
+    /// [`AuthOutcome::Denied`] — the two outcomes the trait had before
+    /// [`AuthOutcome::Unavailable`] existed.
+    fn from(backend: Option<SharedBackend>) -> Self {
+        backend.map_or(Self::Denied, Self::Granted)
+    }
+}
+
+impl std::fmt::Debug for AuthOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Granted(_) => f.write_str("Granted(..)"),
+            Self::Denied => f.write_str("Denied"),
+            Self::Unavailable(reason) => f.debug_tuple("Unavailable").field(reason).finish(),
+        }
+    }
+}
+
 /// Chooses the backend a freshly-accepted connection is bound to, from its
 /// authenticated identity.
 ///
@@ -117,14 +168,19 @@ pub struct AuthRequest<'a> {
 )]
 #[async_trait::async_trait]
 pub trait ConnectionAuthenticator: Send + Sync + 'static {
-    /// Verify `req` and return the backend this connection may use.
+    /// Verify `req` and decide what this connection may use.
     ///
-    /// Returning `None` rejects the connection: the frontend replies with a
-    /// MySQL access-denied error and closes it. **No backend session is opened
-    /// for a rejected connection** — a connection that never authenticates has
-    /// no backend at all, so there is nothing to fall back to and nothing to
-    /// leak. Failing closed is the frontend's job, not yours; just return
-    /// `None`.
+    /// Returning [`AuthOutcome::Denied`] rejects the connection: the frontend
+    /// replies with a MySQL access-denied error and closes it. **No backend
+    /// session is opened for a rejected connection** — a connection that never
+    /// authenticates has no backend at all, so there is nothing to fall back
+    /// to and nothing to leak. Failing closed is the frontend's job, not
+    /// yours; just return `Denied`.
+    ///
+    /// Return [`AuthOutcome::Unavailable`] when the credential verified but
+    /// the backend cannot be produced (its database failed to open, its
+    /// owner is unreachable). The connection is still refused a backend; only
+    /// the error the client sees changes.
     ///
     /// Async because a multi-tenant implementation usually has to *find* the
     /// backend — open a database file on first use, consult a registry, hit a
@@ -135,7 +191,7 @@ pub trait ConnectionAuthenticator: Send + Sync + 'static {
     /// Verify the credential **before** doing that work. Resolving a backend
     /// for a caller that has not proved anything turns an unauthenticated
     /// handshake into a way to make the server open files.
-    async fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend>;
+    async fn authenticate(&self, req: &AuthRequest<'_>) -> AuthOutcome;
 }
 
 /// A shared [`ConnectionAuthenticator`], as the frontends hold it.
@@ -151,8 +207,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ConnectionAuthenticator for ByListener {
-        async fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend> {
-            (req.local_addr == self.0).then(|| Arc::clone(&self.1))
+        async fn authenticate(&self, req: &AuthRequest<'_>) -> AuthOutcome {
+            (req.local_addr == self.0)
+                .then(|| Arc::clone(&self.1))
+                .into()
         }
     }
 
@@ -172,7 +230,10 @@ mod tests {
         let mine: SocketAddr = "127.0.0.1:3306".parse().unwrap();
         let backend: SharedBackend = Arc::new(crate::Rusqlite::memory().unwrap());
         let auth = ByListener(mine, backend);
-        assert!(auth.authenticate(&request(mine)).await.is_some());
+        assert!(matches!(
+            auth.authenticate(&request(mine)).await,
+            AuthOutcome::Granted(_)
+        ));
     }
 
     /// The same claimed username on a *different* listener gets nothing —
@@ -183,6 +244,9 @@ mod tests {
         let other: SocketAddr = "127.0.0.1:3307".parse().unwrap();
         let backend: SharedBackend = Arc::new(crate::Rusqlite::memory().unwrap());
         let auth = ByListener(mine, backend);
-        assert!(auth.authenticate(&request(other)).await.is_none());
+        assert!(matches!(
+            auth.authenticate(&request(other)).await,
+            AuthOutcome::Denied
+        ));
     }
 }
