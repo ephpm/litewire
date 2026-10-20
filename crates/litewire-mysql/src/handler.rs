@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use litewire_backend::{
-    AuthRequest, BackendError, ResultSet, SharedAuthenticator, SharedBackend, Value,
+    AuthOutcome, AuthRequest, BackendError, ResultSet, SharedAuthenticator, SharedBackend, Value,
 };
 use litewire_session::{Prepared, Session, SessionError, SessionResult};
 use litewire_translate::{Dialect, StatementKind, TranslateCache};
@@ -73,6 +73,21 @@ struct ConnAuth {
     scramble: [u8; SCRAMBLE_SIZE],
 }
 
+/// Why a connection whose credential **verified** still has no session.
+///
+/// Only [`AsyncMysqlShim::authenticate`] sets this, and only after the
+/// authenticator accepted the credential, so its presence is itself proof of
+/// authentication. It never grants anything by itself: commands on the
+/// connection keep failing until a session actually opens.
+enum Unopened {
+    /// The authenticator granted this backend, but opening a session on it
+    /// failed (e.g. its database was busy). Retried before each command.
+    Retry(SharedBackend),
+    /// The authenticator verified the credential but could not produce a
+    /// backend; the reason is reported to every command.
+    Unavailable(String),
+}
+
 /// Handler for a single MySQL client connection.
 ///
 /// A thin wire codec over [`Session`], which owns the per-session
@@ -126,6 +141,9 @@ pub struct LiteWireHandler {
     session: OnceLock<Session>,
     /// `Some` on the authenticating path only.
     auth: Option<ConnAuth>,
+    /// Set by `authenticate()` when the credential verified but no session
+    /// could be opened. Empty on every other connection. See [`Unopened`].
+    unopened: OnceLock<Unopened>,
     /// Prepared statements keyed by the statement ID assigned during `on_prepare`.
     stmts: HashMap<u32, Prepared>,
     /// Next statement ID to assign.
@@ -159,6 +177,7 @@ impl LiteWireHandler {
         Ok(Self {
             session,
             auth: None,
+            unopened: OnceLock::new(),
             stmts: HashMap::new(),
             next_stmt_id: 1,
             reset_pending: Arc::new(AtomicBool::new(false)),
@@ -186,6 +205,7 @@ impl LiteWireHandler {
                 peer_addr,
                 scramble: random_scramble(),
             }),
+            unopened: OnceLock::new(),
             stmts: HashMap::new(),
             next_stmt_id: 1,
             reset_pending: Arc::new(AtomicBool::new(false)),
@@ -228,6 +248,7 @@ impl LiteWireHandler {
     }
 
     /// This connection's session, or `None` if it never authenticated.
+    #[cfg(test)]
     pub(crate) fn session(&self) -> Option<&Session> {
         self.session.get()
     }
@@ -239,6 +260,73 @@ impl LiteWireHandler {
     fn session_mut(&mut self) -> Option<&mut Session> {
         self.session.get_mut()
     }
+
+    /// Make sure this connection has a session before a command runs, or say
+    /// why it cannot have one.
+    ///
+    /// A connection that never authenticated is refused with
+    /// `ER_ACCESS_DENIED_ERROR`, exactly as before. A connection whose
+    /// credential verified but whose session could not be opened (see
+    /// [`Unopened`]) gets the database's own error instead, classified like a
+    /// statement error — so a busy database reads as `1205` lock wait
+    /// timeout, not as a bad password — and a granted backend is retried, so
+    /// the connection recovers once the database is free.
+    async fn ensure_session(&mut self) -> Result<(), error_map::MysqlError> {
+        if self.session.get().is_some() {
+            return Ok(());
+        }
+        let failure = match (self.unopened.get(), &self.auth) {
+            (Some(Unopened::Retry(backend)), Some(auth)) => {
+                match open_tenant_session(backend, &auth.translate_cache).await {
+                    Ok(session) => {
+                        // Cannot already be set: checked above, and `&mut self`.
+                        let _ = self.session.set(session);
+                        let _ = self.unopened.take();
+                        return Ok(());
+                    }
+                    Err(e) => session_open_failure(&e),
+                }
+            }
+            (Some(Unopened::Unavailable(reason)), _) => reason.clone(),
+            _ => {
+                return Err(error_map::MysqlError {
+                    code: ErrorKind::ER_ACCESS_DENIED_ERROR,
+                    sqlstate: *b"28000",
+                    message: NOT_AUTHENTICATED.to_string(),
+                });
+            }
+        };
+        Err(error_map::classify(&failure))
+    }
+}
+
+/// Open a tenant-scoped session on `backend`.
+///
+/// A session the authenticator establishes is tenant-scoped: the backend it
+/// returned is the whole world this connection may touch. Screen out the
+/// statements that reach past it (`ATTACH`/`DETACH`, `VACUUM INTO`,
+/// path-bearing `PRAGMA`s) at the backend boundary, whatever the engine
+/// underneath would do with them. Fixed-backend (single-tenant) sessions are
+/// not screened -- see the `tenant_screen` module docs for the contract.
+async fn open_tenant_session(
+    backend: &SharedBackend,
+    translate_cache: &Arc<TranslateCache>,
+) -> Result<Session, BackendError> {
+    let conn = backend.connect().await?;
+    let conn = litewire_backend::tenant_screen::screened(conn);
+    Ok(Session::with_cache(
+        conn,
+        Dialect::MySQL,
+        Arc::clone(translate_cache),
+    ))
+}
+
+/// The client-facing text for an authenticated connection whose session
+/// could not be opened. Keeps the backend's own words, which is what
+/// [`error_map::classify`] keys on (a busy database must still say "database
+/// is locked" to map to `1205`).
+fn session_open_failure(e: &BackendError) -> String {
+    format!("authenticated, but could not open a session on this connection's database: {e}")
 }
 
 /// Error text for a command issued on a connection that never authenticated.
@@ -425,9 +513,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
     /// default does.
     ///
     /// On the authenticating path this is the *only* place a backend is ever
-    /// installed. The embedder's authenticator decides; `None` means the
+    /// installed. The embedder's authenticator decides; `Denied` means the
     /// connection is refused and — because the session stays empty — can reach
     /// nothing even if the client keeps talking.
+    ///
+    /// Returning `true` does not by itself give the connection a backend. When
+    /// the credential verified but no session could be opened, this returns
+    /// `true` (so the client is not told its password is wrong) with the
+    /// session still empty; every command then fails with the database's
+    /// error until a session opens (see `ensure_session`).
     async fn authenticate(
         &self,
         auth_plugin: &str,
@@ -448,39 +542,53 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
             peer_addr: auth.peer_addr,
         };
 
-        let Some(backend) = auth.authenticator.authenticate(&request).await else {
-            warn!(
-                user = %String::from_utf8_lossy(username),
-                peer = %auth.peer_addr,
-                "MySQL authentication rejected by authenticator"
-            );
-            return false;
+        let backend = match auth.authenticator.authenticate(&request).await {
+            AuthOutcome::Granted(backend) => backend,
+            AuthOutcome::Denied => {
+                warn!(
+                    user = %String::from_utf8_lossy(username),
+                    peer = %auth.peer_addr,
+                    "MySQL authentication rejected by authenticator"
+                );
+                return false;
+            }
+            // The credential verified, so this is not an authentication
+            // failure and must not be reported as one (`1698` reads as a bad
+            // password). Accept the handshake with no session: the client
+            // gets the database's own error, classified like a statement
+            // error, at `COM_INIT_DB` (a database named in the handshake) or
+            // on its first command -- see `ensure_session`.
+            AuthOutcome::Unavailable(reason) => {
+                warn!(
+                    user = %String::from_utf8_lossy(username),
+                    peer = %auth.peer_addr,
+                    "MySQL: credential verified, but the connection's database is unavailable: \
+                     {reason}"
+                );
+                let _ = self.unopened.set(Unopened::Unavailable(format!(
+                    "authenticated, but this connection's database is unavailable: {reason}"
+                )));
+                return true;
+            }
         };
 
         // Open the session now rather than lazily on first query, so a backend
-        // that cannot be opened is reported as a failed *connection* instead of
-        // a confusing error on an arbitrary later statement.
-        let conn = match backend.connect().await {
-            Ok(conn) => conn,
+        // that cannot be opened is reported at connect time. When it cannot be
+        // opened (a busy database, say) the credential still verified: accept
+        // the handshake, report the database's error rather than an
+        // access-denied one, and retry the open before each command.
+        let session = match open_tenant_session(&backend, &auth.translate_cache).await {
+            Ok(session) => session,
             Err(e) => {
                 warn!(
                     user = %String::from_utf8_lossy(username),
                     "MySQL: authenticated but failed to open backend session: {e}"
                 );
-                return false;
+                let _ = self.unopened.set(Unopened::Retry(backend));
+                return true;
             }
         };
 
-        // A session the authenticator establishes is tenant-scoped: the
-        // backend it returned is the whole world this connection may touch.
-        // Screen out the statements that reach past it (`ATTACH`/`DETACH`,
-        // `VACUUM INTO`, path-bearing `PRAGMA`s) at the backend boundary,
-        // whatever the engine underneath would do with them. Fixed-backend
-        // (single-tenant) sessions are not screened -- see the
-        // `tenant_screen` module docs for the contract.
-        let conn = litewire_backend::tenant_screen::screened(conn);
-
-        let session = Session::with_cache(conn, Dialect::MySQL, Arc::clone(&auth.translate_cache));
         if self.session.set(session).is_err() {
             // Unreachable: `opensrv-mysql` runs the handshake once per
             // connection. Refuse rather than risk serving a connection whose
@@ -502,6 +610,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         // Fail closed: no session means the handshake never authenticated
         // (including the no-username handshake `opensrv-mysql` lets past
         // `authenticate()` entirely). There is no backend to fall back to.
+        // An authenticated connection whose database could not be opened gets
+        // that database's error instead (see `ensure_session`).
+        if let Err(e) = self.ensure_session().await {
+            return info.error(e.code, e.message.as_bytes()).await;
+        }
         let Some(session) = self.session_mut() else {
             return info
                 .error(
@@ -598,13 +711,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         // Fail closed -- see `on_prepare`. (Unreachable in practice, since
         // `on_prepare` refuses first and the statement id would be unknown,
         // but the guard is what makes the property structural.)
-        if self.session().is_none() {
-            return results
-                .error(
-                    ErrorKind::ER_ACCESS_DENIED_ERROR,
-                    NOT_AUTHENTICATED.as_bytes(),
-                )
-                .await;
+        if let Err(e) = self.ensure_session().await {
+            return results.error(e.code, e.message.as_bytes()).await;
         }
 
         let Some(stmt) = self.stmts.get(&id) else {
@@ -663,6 +771,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
 
         // Fail closed -- see `on_prepare`. This is the guard that stops a
         // no-username handshake from running SQL.
+        if let Err(e) = self.ensure_session().await {
+            return results.error(e.code, e.message.as_bytes()).await;
+        }
         let Some(session) = self.session_mut() else {
             return results
                 .error(
@@ -707,13 +818,14 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
         // report success to a connection that has no backend, or a client
         // learns nothing until its first real query. More importantly, the
         // schema name is client-asserted and never selects anything.
-        if self.session().is_none() {
-            return writer
-                .error(
-                    ErrorKind::ER_ACCESS_DENIED_ERROR,
-                    NOT_AUTHENTICATED.as_bytes(),
-                )
-                .await;
+        //
+        // This is also where a client that named a database in its handshake
+        // learns, at connect time, that its credential verified but its
+        // database could not be opened: `opensrv-mysql` calls this right after
+        // a successful `authenticate()`, so the error below is the handshake's
+        // answer (e.g. `[1205] ... database is locked`), not `1698`.
+        if let Err(e) = self.ensure_session().await {
+            return writer.error(e.code, e.message.as_bytes()).await;
         }
         writer.ok().await
     }
@@ -753,11 +865,8 @@ mod tests {
 
         #[async_trait::async_trait]
         impl litewire_backend::ConnectionAuthenticator for NeverAuthenticates {
-            async fn authenticate(
-                &self,
-                _req: &litewire_backend::AuthRequest<'_>,
-            ) -> Option<SharedBackend> {
-                None
+            async fn authenticate(&self, _req: &litewire_backend::AuthRequest<'_>) -> AuthOutcome {
+                AuthOutcome::Denied
             }
         }
 

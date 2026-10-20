@@ -14,7 +14,7 @@ use std::sync::Arc;
 use litewire::backend::Rusqlite;
 use litewire::backend::SharedBackend;
 use litewire::litewire_mysql::native_password;
-use litewire::{AuthRequest, ConnectionAuthenticator};
+use litewire::{AuthOutcome, AuthRequest, ConnectionAuthenticator};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder};
 use tokio::net::TcpListener;
@@ -34,10 +34,13 @@ struct TenantDirectory(HashMap<Vec<u8>, Tenant>);
 
 #[litewire::async_trait]
 impl ConnectionAuthenticator for TenantDirectory {
-    async fn authenticate(&self, req: &AuthRequest<'_>) -> Option<SharedBackend> {
-        let tenant = self.0.get(req.username)?;
+    async fn authenticate(&self, req: &AuthRequest<'_>) -> AuthOutcome {
+        let Some(tenant) = self.0.get(req.username) else {
+            return AuthOutcome::Denied;
+        };
         native_password::verify(&tenant.password_hash, req.salt, req.auth_response)
             .then(|| Arc::clone(&tenant.backend))
+            .into()
     }
 }
 

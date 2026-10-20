@@ -165,10 +165,25 @@ impl TursoBuilder {
     }
 
     /// **Experimental** — when true, every session opened via
-    /// [`Backend::connect`] auto-enables full CDC capture via
-    /// [`cdc::enable_cdc`]. Used by ePHPm's Phase 2 CDC-native
+    /// [`Backend::connect`] captures its writes into the CDC log (full
+    /// mode, via [`cdc::enable_cdc`]). Used by ePHPm's Phase 2 CDC-native
     /// replication on the primary so writes coming in via the wire
     /// frontends are captured for replay by replicas.
+    ///
+    /// Capture is switched on **before the session's first statement that
+    /// is not a plain `SELECT`**, not when the session opens. The engine runs
+    /// `PRAGMA capture_data_changes_conn` as a *write* transaction, so turning
+    /// it on at connect time made opening a session wait on the database's
+    /// write lock: while another connection held a long write transaction,
+    /// every new session — including ones that only read — queued behind it
+    /// and failed with "database is locked" once the busy timeout ran out. A
+    /// plain `SELECT` cannot write, so a session that only reads never needs
+    /// capture and never touches the write lock; every other statement
+    /// (including `BEGIN`, so a transaction never starts without capture) is
+    /// preceded by the switch. If the switch itself cannot get the write lock
+    /// within the busy timeout, that statement fails with a "database is
+    /// locked (SQLITE_BUSY)" error naming the cause, and the next statement
+    /// retries it.
     ///
     /// Default: `false`. Enabling CDC has a modest write-amp cost
     /// (`full` mode doubles the write path: pre-image + post-image
@@ -394,13 +409,15 @@ impl Turso {
     }
 
     /// Open a fresh per-session connection with the standard session
-    /// setup (busy timeout, `synchronous`, optional CDC capture).
+    /// setup (busy timeout, `synchronous`).
+    ///
+    /// Deliberately does **not** turn CDC capture on: that pragma is a write
+    /// transaction, and session setup must never wait on the write lock. See
+    /// [`TursoBuilder::enable_cdc_on_connect`] and
+    /// [`TursoConn::ensure_capture`].
     async fn fresh_connection(&self) -> Result<turso::Connection, BackendError> {
         let conn = self.db.connect().map_err(map_turso_err)?;
         apply_session_setup(&conn, self.busy_timeout_ms, self.synchronous).await?;
-        if self.enable_cdc_on_connect {
-            cdc::enable_cdc(&conn).await?;
-        }
         Ok(conn)
     }
 }
@@ -413,6 +430,10 @@ struct SessionState {
     /// first statement, dropped once the connection is back in autocommit.
     /// Always `None` when the gate is not enabled.
     permit: Option<WalGatePermit>,
+    /// The factory asked for CDC capture and it is not on yet. Cleared by
+    /// [`TursoConn::ensure_capture`] before the first statement that can
+    /// write. Always `false` when capture was not requested.
+    capture_pending: bool,
 }
 
 /// Per-session Turso handle.
@@ -438,6 +459,9 @@ pub struct TursoConn {
     /// scoped state behind (see [`statement_dirties_connection`]); a dirty
     /// connection is never parked. Always `false` when reuse is disabled.
     dirty: AtomicBool,
+    /// The factory's busy timeout, for the error text when turning capture
+    /// on times out (see [`TursoConn::ensure_capture`]).
+    busy_timeout_ms: u32,
 }
 
 impl TursoConn {
@@ -446,14 +470,55 @@ impl TursoConn {
         gate: Option<Arc<wal_gate::Gate>>,
         reuse: Option<Arc<ReusePool>>,
         baseline_rowid: i64,
+        capture_pending: bool,
+        busy_timeout_ms: u32,
     ) -> Self {
         Self {
-            conn: Mutex::new(SessionState { conn, permit: None }),
+            conn: Mutex::new(SessionState {
+                conn,
+                permit: None,
+                capture_pending,
+            }),
             gate,
             reuse,
             baseline_rowid,
             dirty: AtomicBool::new(false),
+            busy_timeout_ms,
         }
+    }
+
+    /// Turn CDC capture on before `sql` runs, unless it is already on, was
+    /// never requested, or `sql` cannot write (see
+    /// [`statement_is_plain_read`]).
+    ///
+    /// This is where the capture pragma runs instead of at connect time: it
+    /// is a write transaction, and running it during session setup made
+    /// every new session — readers included — wait on another connection's
+    /// write lock (see [`TursoBuilder::enable_cdc_on_connect`]). Here it runs
+    /// only ahead of a statement that would need the write lock anyway.
+    ///
+    /// Always reached in autocommit: the first statement that is not a plain
+    /// `SELECT` — `BEGIN` included — turns capture on first, so no
+    /// transaction is ever opened on a session whose capture is pending.
+    async fn ensure_capture(
+        &self,
+        state: &mut SessionState,
+        sql: &str,
+    ) -> Result<(), BackendError> {
+        if !state.capture_pending || statement_is_plain_read(sql) {
+            return Ok(());
+        }
+        cdc::enable_cdc(&state.conn).await.map_err(|e| match e {
+            BackendError::Sqlite(m) if is_busy_message(&m) => BackendError::Sqlite(format!(
+                "{m} (another connection held the write lock for the whole {} ms busy \
+                 timeout while this session was turning on change capture before its first \
+                 write; nothing was executed, retry the statement)",
+                self.busy_timeout_ms
+            )),
+            other => other,
+        })?;
+        state.capture_pending = false;
+        Ok(())
     }
 
     /// Flag the connection dirty if `sql` leaves connection-scoped state
@@ -504,11 +569,16 @@ impl Backend for Turso {
                 if ReusePool::reusable_at_checkout(&conn) {
                     pool.hits.fetch_add(1, Ordering::Relaxed);
                     let baseline_rowid = conn.last_insert_rowid();
+                    // Reuse is never enabled together with CDC capture
+                    // (see `TursoBuilder::handle_reuse`), so a parked
+                    // connection has nothing pending.
                     return Ok(Box::new(TursoConn::new(
                         conn,
                         self.wal_gate.clone(),
                         Some(Arc::clone(pool)),
                         baseline_rowid,
+                        false,
+                        self.busy_timeout_ms,
                     )));
                 }
                 // Defensive: not in autocommit (engine's lazy dangling-tx
@@ -535,8 +605,16 @@ impl Backend for Turso {
             self.wal_gate.clone(),
             self.reuse.clone(),
             baseline_rowid,
+            self.enable_cdc_on_connect,
+            self.busy_timeout_ms,
         )))
     }
+}
+
+/// Whether a backend error message is the engine's busy/locked condition, as
+/// [`map_turso_err`] spells it.
+fn is_busy_message(message: &str) -> bool {
+    message.contains("(SQLITE_BUSY)")
 }
 
 /// Map a [`turso::Error`] into litewire's stringly-typed [`BackendError`].
@@ -844,7 +922,10 @@ impl BackendConn for TursoConn {
         self.mark_dirty_if_needed(sql);
         let mut state = self.conn.lock().await;
         self.enter_gate(&mut state).await;
-        let result = query_on(&state.conn, sql, params).await;
+        let result = match self.ensure_capture(&mut state, sql).await {
+            Ok(()) => query_on(&state.conn, sql, params).await,
+            Err(e) => Err(e),
+        };
         Self::settle_gate(&mut state);
         result
     }
@@ -854,7 +935,10 @@ impl BackendConn for TursoConn {
         self.mark_dirty_if_needed(sql);
         let mut state = self.conn.lock().await;
         self.enter_gate(&mut state).await;
-        let result = execute_on(&state.conn, sql, params, self.baseline_rowid).await;
+        let result = match self.ensure_capture(&mut state, sql).await {
+            Ok(()) => execute_on(&state.conn, sql, params, self.baseline_rowid).await,
+            Err(e) => Err(e),
+        };
         Self::settle_gate(&mut state);
         result
     }
@@ -940,6 +1024,23 @@ fn statement_dirties_connection(sql: &str) -> bool {
         return w2.eq_ignore_ascii_case("TEMP") || w2.eq_ignore_ascii_case("TEMPORARY");
     }
     false
+}
+
+/// Can `sql` run on a session whose CDC capture is still off, because it
+/// cannot write? See [`TursoConn::ensure_capture`].
+///
+/// A fail-safe allowlist: only a single plain `SELECT` qualifies. Everything
+/// else — `WITH` (which can front an `INSERT`/`UPDATE`/`DELETE`), `PRAGMA`,
+/// `BEGIN`, DDL, DML — turns capture on first. A false negative costs one
+/// capture switch (a short write transaction); a false positive would be an
+/// unreplicated write, so anything with a second statement after a `;` is
+/// refused too, even when the `;` is inside a string literal.
+fn statement_is_plain_read(sql: &str) -> bool {
+    let s = strip_leading_trivia(sql);
+    if !leading_word(s).eq_ignore_ascii_case("SELECT") {
+        return false;
+    }
+    !s.trim_end().trim_end_matches(';').contains(';')
 }
 
 /// Skip leading whitespace and SQL comments (`-- …`, `/* … */`) so the
@@ -1392,6 +1493,44 @@ mod tests {
         assert_eq!(cols[1].decltype.as_deref(), Some("TEXT"));
         assert_eq!(cols[2].name, "tags");
         assert_eq!(cols[2].decltype.as_deref(), Some("BLOB"));
+    }
+
+    // -- Deferred CDC capture: which statements may skip it ---------------
+
+    #[test]
+    fn only_a_single_plain_select_skips_capture() {
+        for sql in [
+            "SELECT 1",
+            "select * from t where id = ?",
+            "  /* hint */ SELECT 1;",
+            "-- leading comment\nSELECT v FROM t ;  ",
+            "SELECT pragma_table_info.name FROM pragma_table_info('t')",
+        ] {
+            assert!(
+                statement_is_plain_read(sql),
+                "{sql:?} should not need capture"
+            );
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET v = 1",
+            "DELETE FROM t",
+            "BEGIN",
+            "SAVEPOINT a",
+            "CREATE TABLE t (id INTEGER)",
+            "WITH x AS (SELECT 1) DELETE FROM t",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "PRAGMA user_version = 3",
+            "REPLACE INTO t VALUES (1)",
+            "SELECT 1; DELETE FROM t",
+            "SELECT ';'",
+            "",
+        ] {
+            assert!(
+                !statement_is_plain_read(sql),
+                "{sql:?} must turn capture on first"
+            );
+        }
     }
 
     // -- Bind-count parity (mysql CLI `select $$` probe regression) -------
