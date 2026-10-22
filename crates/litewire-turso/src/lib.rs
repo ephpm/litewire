@@ -12,15 +12,20 @@
 //! to gather evidence (benchmarks, file-format round-trips, crash-recovery
 //! smokes) behind an explicit opt-in — it is not a default anywhere.
 //!
-//! # Async-native
+//! # Async in name only
 //!
-//! Unlike the `rusqlite` backend, which wraps every call in
-//! [`tokio::task::spawn_blocking`], the Turso engine is natively async:
-//! `query`/`execute` futures are polled on the calling task with no
-//! thread-pool hop. A per-session [`tokio::sync::Mutex`] serializes
-//! statements on the *same* [`TursoConn`] (one wire client cannot issue
-//! two overlapping statements anyway), matching the rusqlite backend's
-//! per-session semantics.
+//! The Turso engine's API is `async`, but its futures do all of their work
+//! — including blocking file I/O and the commit `fsync` — synchronously
+//! inside `poll`. Awaiting them directly on a tokio worker blocks that
+//! worker, and enough blocked workers stall the whole runtime's I/O and
+//! timer drivers. Every engine call this crate makes therefore goes
+//! through [`offload::engine`], which runs it under
+//! [`tokio::task::block_in_place`] on a multi-thread runtime (and in place
+//! elsewhere); embedders that run statements on a
+//! [`Turso::raw_connection`] should do the same. A per-session
+//! [`tokio::sync::Mutex`] serializes statements on the *same*
+//! [`TursoConn`] (one wire client cannot issue two overlapping statements
+//! anyway), matching the rusqlite backend's per-session semantics.
 //!
 //! # Per-connection isolation
 //!
@@ -74,6 +79,7 @@
 //! CR 2014 "Commands out of sync".
 
 pub mod cdc;
+pub mod offload;
 pub mod wal_gate;
 
 /// Re-export of the underlying [`turso::Connection`] type. External
@@ -234,9 +240,10 @@ impl TursoBuilder {
     /// Returns [`BackendError::Sqlite`] if the database cannot be opened
     /// (bad path, corrupt file, unsupported format).
     pub async fn build(self) -> Result<Turso, BackendError> {
+        // Opening reads the header and recovers any WAL left behind: engine
+        // I/O like any statement.
         let db = Arc::new(
-            turso::Builder::new_local(&self.path)
-                .build()
+            offload::engine(turso::Builder::new_local(&self.path).build())
                 .await
                 .map_err(map_turso_err)?,
         );
@@ -416,9 +423,12 @@ impl Turso {
     /// [`TursoBuilder::enable_cdc_on_connect`] and
     /// [`TursoConn::ensure_capture`].
     async fn fresh_connection(&self) -> Result<turso::Connection, BackendError> {
-        let conn = self.db.connect().map_err(map_turso_err)?;
-        apply_session_setup(&conn, self.busy_timeout_ms, self.synchronous).await?;
-        Ok(conn)
+        offload::engine(async {
+            let conn = self.db.connect().map_err(map_turso_err)?;
+            apply_session_setup(&conn, self.busy_timeout_ms, self.synchronous).await?;
+            Ok(conn)
+        })
+        .await
     }
 }
 
@@ -508,15 +518,18 @@ impl TursoConn {
         if !state.capture_pending || statement_is_plain_read(sql) {
             return Ok(());
         }
-        cdc::enable_cdc(&state.conn).await.map_err(|e| match e {
-            BackendError::Sqlite(m) if is_busy_message(&m) => BackendError::Sqlite(format!(
-                "{m} (another connection held the write lock for the whole {} ms busy \
+        // Callers already run this under `offload::engine`.
+        cdc::enable_cdc_in_place(&state.conn)
+            .await
+            .map_err(|e| match e {
+                BackendError::Sqlite(m) if is_busy_message(&m) => BackendError::Sqlite(format!(
+                    "{m} (another connection held the write lock for the whole {} ms busy \
                  timeout while this session was turning on change capture before its first \
                  write; nothing was executed, retry the statement)",
-                self.busy_timeout_ms
-            )),
-            other => other,
-        })?;
+                    self.busy_timeout_ms
+                )),
+                other => other,
+            })?;
         state.capture_pending = false;
         Ok(())
     }
@@ -921,11 +934,14 @@ impl BackendConn for TursoConn {
         reject_unsupported(sql)?;
         self.mark_dirty_if_needed(sql);
         let mut state = self.conn.lock().await;
+        // Waits (session mutex, gate permit) stay on the runtime; only the
+        // engine work is offloaded (see `offload`).
         self.enter_gate(&mut state).await;
-        let result = match self.ensure_capture(&mut state, sql).await {
-            Ok(()) => query_on(&state.conn, sql, params).await,
-            Err(e) => Err(e),
-        };
+        let result = offload::engine(async {
+            self.ensure_capture(&mut state, sql).await?;
+            query_on(&state.conn, sql, params).await
+        })
+        .await;
         Self::settle_gate(&mut state);
         result
     }
@@ -935,10 +951,11 @@ impl BackendConn for TursoConn {
         self.mark_dirty_if_needed(sql);
         let mut state = self.conn.lock().await;
         self.enter_gate(&mut state).await;
-        let result = match self.ensure_capture(&mut state, sql).await {
-            Ok(()) => execute_on(&state.conn, sql, params, self.baseline_rowid).await,
-            Err(e) => Err(e),
-        };
+        let result = offload::engine(async {
+            self.ensure_capture(&mut state, sql).await?;
+            execute_on(&state.conn, sql, params, self.baseline_rowid).await
+        })
+        .await;
         Self::settle_gate(&mut state);
         result
     }
@@ -948,12 +965,15 @@ impl BackendConn for TursoConn {
         self.enter_gate(&mut state).await;
         // Prepare without executing -- same trick as the rusqlite backend,
         // no LIMIT-0 probe needed.
-        let result = state
-            .conn
-            .prepare_cached(sql)
-            .await
-            .map(|stmt| to_columns(&stmt.columns()))
-            .map_err(map_turso_err);
+        let result = offload::engine(async {
+            state
+                .conn
+                .prepare_cached(sql)
+                .await
+                .map(|stmt| to_columns(&stmt.columns()))
+                .map_err(map_turso_err)
+        })
+        .await;
         Self::settle_gate(&mut state);
         result
     }

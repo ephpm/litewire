@@ -637,6 +637,9 @@ async fn attempt(
     let c = &gate.counters;
     c.attempts.fetch_add(1, Ordering::Relaxed);
 
+    // Every engine call below goes through `crate::offload::engine`: a
+    // backfill or truncate copies and fsyncs up to the whole log and must
+    // not hold an async worker. The exclusive-side wait stays outside it.
     let conn = match db.connect() {
         Ok(conn) => conn,
         Err(e) => {
@@ -645,7 +648,7 @@ async fn attempt(
             return Attempt::Error;
         }
     };
-    match journal_mode_is_wal(&conn, gate).await {
+    match crate::offload::engine(journal_mode_is_wal(&conn, gate)).await {
         Ok(true) => {}
         Ok(false) => {
             c.skipped_journal_mode.fetch_add(1, Ordering::Relaxed);
@@ -668,7 +671,7 @@ async fn attempt(
     // cause. After this phase the exclusive window only has the frames
     // written during the last round to copy.
     let backfill_started = Instant::now();
-    let frames = passive_backfill(&conn).await;
+    let frames = crate::offload::engine(passive_backfill(&conn)).await;
     let backfill_micros = u64::try_from(backfill_started.elapsed().as_micros()).unwrap_or(u64::MAX);
     c.last_backfill_micros
         .store(backfill_micros, Ordering::Relaxed);
@@ -699,7 +702,7 @@ async fn attempt(
         return Attempt::TimedOut;
     };
     let started = Instant::now();
-    let outcome = checkpoint(&conn, "TRUNCATE").await;
+    let outcome = crate::offload::engine(checkpoint(&conn, "TRUNCATE")).await;
     let window = started.elapsed();
     drop(guard);
 
