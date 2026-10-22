@@ -14,11 +14,13 @@
 //!
 //! # Async in name only
 //!
-//! The Turso engine's API is `async`, but its futures do all of their work
-//! — including blocking file I/O and the commit `fsync` — synchronously
-//! inside `poll`. Awaiting them directly on a tokio worker blocks that
-//! worker, and enough blocked workers stall the whole runtime's I/O and
-//! timer drivers. Every engine call this crate makes therefore goes
+//! The Turso engine's API is `async`, but each step of a statement —
+//! including its blocking file I/O and the commit `fsync` — runs
+//! synchronously inside `poll`; the future only yields between steps.
+//! Awaited directly on a tokio worker it holds that worker for each step
+//! as long as the disk takes, and enough busy workers stall the whole
+//! runtime's I/O and timer drivers. Busy waits are hot spins (see
+//! [`offload`]). Every engine call this crate makes therefore goes
 //! through [`offload::engine`], which runs it under
 //! [`tokio::task::block_in_place`] on a multi-thread runtime (and in place
 //! elsewhere); embedders that run statements on a
@@ -928,35 +930,66 @@ async fn execute_on(
     })
 }
 
+/// Statements slower than this are logged by [`log_slow_statement`].
+const SLOW_STATEMENT: Duration = Duration::from_secs(1);
+
+/// WARN about a session statement that took [`SLOW_STATEMENT`] or longer,
+/// split into the time spent waiting (session mutex, WAL-gate permit) and
+/// the time inside the engine (under [`offload::engine`], which includes
+/// busy-timeout waits and `fsync`). Only the statement's leading keyword is
+/// logged, never its text or parameters.
+fn log_slow_statement(sql: &str, started: Instant, engine_started: Instant, ok: bool) {
+    let total = started.elapsed();
+    if total < SLOW_STATEMENT {
+        return;
+    }
+    let wait = engine_started.saturating_duration_since(started);
+    tracing::warn!(
+        statement = leading_word(strip_leading_trivia(sql)),
+        total_ms = u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
+        wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        engine_ms = u64::try_from(total.saturating_sub(wait).as_millis()).unwrap_or(u64::MAX),
+        ok,
+        "turso: slow statement (wait = session mutex + WAL-gate permit; engine = inside the \
+         engine, including busy-timeout waits and fsync)"
+    );
+}
+
 #[async_trait::async_trait]
 impl BackendConn for TursoConn {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> {
         reject_unsupported(sql)?;
+        let started = Instant::now();
         self.mark_dirty_if_needed(sql);
         let mut state = self.conn.lock().await;
         // Waits (session mutex, gate permit) stay on the runtime; only the
         // engine work is offloaded (see `offload`).
         self.enter_gate(&mut state).await;
+        let engine_started = Instant::now();
         let result = offload::engine(async {
             self.ensure_capture(&mut state, sql).await?;
             query_on(&state.conn, sql, params).await
         })
         .await;
         Self::settle_gate(&mut state);
+        log_slow_statement(sql, started, engine_started, result.is_ok());
         result
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, BackendError> {
         reject_unsupported(sql)?;
+        let started = Instant::now();
         self.mark_dirty_if_needed(sql);
         let mut state = self.conn.lock().await;
         self.enter_gate(&mut state).await;
+        let engine_started = Instant::now();
         let result = offload::engine(async {
             self.ensure_capture(&mut state, sql).await?;
             execute_on(&state.conn, sql, params, self.baseline_rowid).await
         })
         .await;
         Self::settle_gate(&mut state);
+        log_slow_statement(sql, started, engine_started, result.is_ok());
         result
     }
 

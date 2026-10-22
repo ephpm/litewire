@@ -1,22 +1,23 @@
 //! Keeping engine work off the async runtime's worker threads.
 //!
-//! The Turso Rust API is `async`, but only in name: a statement's future
-//! does all of its work — VDBE steps, B-tree reads, `pwrite`, and the
-//! `fsync` at commit — synchronously inside `poll`. Turso's default Unix
-//! I/O backend issues each read and write as a blocking syscall at
-//! submission and its `step()` is a no-op, so a future that returns
-//! `Pending` has already done its I/O. Awaiting one on a tokio worker
-//! therefore blocks that worker for the whole statement, exactly as a
-//! synchronous call would.
+//! The Turso Rust API is `async`, but its I/O is not. Each step of a
+//! statement — VDBE work, the page reads and writes it needs, and the
+//! `fsync` at commit — runs synchronously inside `poll`: Turso's default
+//! Unix I/O backend issues every read and write as a blocking syscall at
+//! submission, and its `step()` is a no-op. The future does yield between
+//! steps (it returns `Pending` after each I/O step, having already woken its
+//! waker), but within a step the calling thread is held for as long as the
+//! disk takes. Awaited on a tokio worker, a statement therefore holds that
+//! worker for every step, and a commit holds it for a full `fsync`.
 //!
 //! That matters more than it looks. A multi-thread runtime's I/O and timer
 //! drivers are turned only by a worker that has run out of tasks and
-//! parks. When every worker is inside an engine call — a few replication
-//! applies, a checkpoint, a handful of wire statements — nobody turns the
-//! drivers, so *every* task on the runtime stops seeing socket readiness
-//! and timer expiry: unrelated HTTP accepts, heartbeats, and the signal
-//! handler alike. An embedder measured a `SIGTERM` handled 20–35 s after
-//! the signal under heavy per-site replication.
+//! parks. When every worker is busy with engine steps — a few replication
+//! applies, a checkpoint, a handful of wire statements, with a slow disk —
+//! nobody turns the drivers, so *every* task on the runtime stops seeing
+//! socket readiness and timer expiry: unrelated HTTP accepts, heartbeats,
+//! and the signal handler alike. An embedder measured a `SIGTERM` handled
+//! up to 53 s after the signal under heavy per-site replication.
 //!
 //! [`engine`] runs a future that does engine work under
 //! [`tokio::task::block_in_place`] on a multi-thread runtime: the calling
@@ -28,11 +29,37 @@
 //!
 //! Where `block_in_place` is not allowed — a current-thread runtime (the
 //! default for `#[tokio::test]`), or no runtime at all — the future is
-//! simply awaited in place, which is what every call did before.
+//! simply awaited in place, which is what every call did before. Off a
+//! worker (a thread inside `Handle::block_on`, such as an embedder's
+//! synchronous caller) the call still works but is not free:
+//! `block_in_place` exits the runtime context and the work runs in a nested
+//! `Handle::block_on` on that thread.
+//!
+//! # Busy waits spin
+//!
+//! When a statement waits for a lock under the busy timeout, the engine
+//! wakes the waker and then returns `Sleep`, and the SDK reports that as
+//! plain I/O, discarding the sleep duration. The future is therefore
+//! re-polled at once, in a loop, until the lock frees or the timeout
+//! expires: a hot CPU spin. Under [`engine`] that spin runs on the
+//! offloaded thread, so each session waiting on a write lock pins one OS
+//! thread at 100% for up to its busy timeout. (On a worker it spun too,
+//! interleaved with other tasks.)
+//!
+//! # Cancellation
+//!
+//! The nested `block_on` never yields to the scheduler, so nothing outside
+//! can interrupt an offloaded scope: an enclosing `select!`, `timeout`, or
+//! task abort takes effect only once the scope has finished. Wrap an
+//! offloaded scope in `tokio::time::timeout` and the timeout cannot fire
+//! early. Anything that must race the engine work belongs *inside* the
+//! scope (nested calls run in place, so it still sees the engine's
+//! `Pending` points).
 //!
 //! # What not to put inside
 //!
-//! Only engine work. The thread is a blocking-pool thread for the whole
+//! Only engine work (and, per the section above, anything that must race
+//! it). The thread is a blocking-pool thread for the whole
 //! call, so an `.await` inside that waits on something other than the
 //! engine (a gate permit, a socket, a channel) parks a thread for nothing.
 //! Acquire the WAL gate permit, the session mutex, and anything else that
