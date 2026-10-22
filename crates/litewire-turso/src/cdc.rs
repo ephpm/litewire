@@ -99,6 +99,11 @@ mod change_type {
 /// Returns [`BackendError::Sqlite`] if the pragma cannot execute (e.g. the
 /// underlying engine rejects the mode).
 pub async fn enable_cdc(conn: &turso::Connection) -> Result<(), BackendError> {
+    crate::offload::engine(enable_cdc_in_place(conn)).await
+}
+
+/// [`enable_cdc`] for a caller already inside [`crate::offload::engine`].
+pub(crate) async fn enable_cdc_in_place(conn: &turso::Connection) -> Result<(), BackendError> {
     conn.execute("PRAGMA capture_data_changes_conn('full')", ())
         .await
         .map_err(map_turso_err)?;
@@ -232,14 +237,6 @@ impl<'a> CdcTailer<'a> {
     /// [`BackendError::Other`] — Phase 2 pins turso exactly, so this
     /// should only fire on a schema change we haven't caught up to.
     pub async fn poll_batch(&mut self) -> Result<Option<TxnBatch>, BackendError> {
-        // Rows are read in windows of this size. A transaction larger than
-        // one window is read across several windows: the batch is complete
-        // only at its COMMIT row, however far that is. (Returning `None` for
-        // a full window with no COMMIT — what this did before — reported a
-        // large committed transaction as "nothing pending" on every poll, so
-        // replication stopped there for good without an error.)
-        const WINDOW: i64 = 1024;
-
         // A poll is a reader for as long as it runs. Holding the WAL gate's
         // shared side here is what lets a database with continuous tailers
         // (one per replica) still reach the reader-free instant the
@@ -248,60 +245,82 @@ impl<'a> CdcTailer<'a> {
             Some(gate) => Some(gate.permit().await),
             None => None,
         };
-        let conn = self.factory.db.connect().map_err(map_turso_err)?;
-        let prepared = conn
-            .prepare(
-                "SELECT change_id, change_txn_id, change_type, table_name, id, \
-                        before, after, updates \
-                 FROM turso_cdc \
-                 WHERE change_id > ? \
-                 ORDER BY change_id \
-                 LIMIT ?",
-            )
-            .await;
-        let mut stmt = match prepared {
-            Ok(stmt) => stmt,
-            // No log table yet => no changes captured yet. Mirrors
-            // `read_watermark`, which already reports 0 rather than
-            // failing when its table is absent.
-            Err(e) if is_missing_cdc_log(&e) => return Ok(None),
-            Err(e) => return Err(map_turso_err(e)),
+        // The permit wait above stays on the runtime; the read itself is
+        // engine work (see `crate::offload`).
+        let next = read_next_batch(self.factory, self.last_seen_change_id);
+        let Some((batch, commit_change_id)) = crate::offload::engine(next).await? else {
+            return Ok(None);
         };
-        // Rows up to and including the *first* COMMIT; rows after it are not
-        // read (the next poll starts from the advanced cursor).
-        let mut buffered: Vec<CdcRow> = Vec::new();
-        // Where the next window starts: after the last row read so far.
-        let mut window_after = self.last_seen_change_id;
-
-        let commit_change_id = 'windows: loop {
-            let mut rows = stmt
-                .query((window_after, WINDOW))
-                .await
-                .map_err(map_turso_err)?;
-            let mut read_in_window: i64 = 0;
-            while let Some(row) = rows.next().await.map_err(map_turso_err)? {
-                let cdc_row = decode_cdc_row(&row)?;
-                read_in_window += 1;
-                window_after = cdc_row.change_id;
-                let commit =
-                    (cdc_row.change_type == change_type::COMMIT).then_some(cdc_row.change_id);
-                buffered.push(cdc_row);
-                if let Some(commit_change_id) = commit {
-                    break 'windows commit_change_id;
-                }
-            }
-            // A short window means the log ended before a COMMIT: the newest
-            // transaction is still being written. Nothing complete yet.
-            if read_in_window < WINDOW {
-                return Ok(None);
-            }
-            // A full window with no COMMIT is one large transaction. Read on.
-        };
-
-        let batch = TxnBatch { rows: buffered };
         self.last_seen_change_id = commit_change_id;
         Ok(Some(batch))
     }
+}
+
+/// The body of [`CdcTailer::poll_batch`]: the next complete transaction
+/// after `last_seen_change_id` with its COMMIT row's `change_id`, or `None`
+/// if there is none yet.
+async fn read_next_batch(
+    factory: &Turso,
+    last_seen_change_id: i64,
+) -> Result<Option<(TxnBatch, i64)>, BackendError> {
+    // Rows are read in windows of this size. A transaction larger than
+    // one window is read across several windows: the batch is complete
+    // only at its COMMIT row, however far that is. (Returning `None` for
+    // a full window with no COMMIT — what this did before — reported a
+    // large committed transaction as "nothing pending" on every poll, so
+    // replication stopped there for good without an error.)
+    const WINDOW: i64 = 1024;
+
+    let conn = factory.db.connect().map_err(map_turso_err)?;
+    let prepared = conn
+        .prepare(
+            "SELECT change_id, change_txn_id, change_type, table_name, id, \
+                    before, after, updates \
+             FROM turso_cdc \
+             WHERE change_id > ? \
+             ORDER BY change_id \
+             LIMIT ?",
+        )
+        .await;
+    let mut stmt = match prepared {
+        Ok(stmt) => stmt,
+        // No log table yet => no changes captured yet. Mirrors
+        // `read_watermark`, which already reports 0 rather than
+        // failing when its table is absent.
+        Err(e) if is_missing_cdc_log(&e) => return Ok(None),
+        Err(e) => return Err(map_turso_err(e)),
+    };
+    // Rows up to and including the *first* COMMIT; rows after it are not
+    // read (the next poll starts from the advanced cursor).
+    let mut buffered: Vec<CdcRow> = Vec::new();
+    // Where the next window starts: after the last row read so far.
+    let mut window_after = last_seen_change_id;
+
+    let commit_change_id = 'windows: loop {
+        let mut rows = stmt
+            .query((window_after, WINDOW))
+            .await
+            .map_err(map_turso_err)?;
+        let mut read_in_window: i64 = 0;
+        while let Some(row) = rows.next().await.map_err(map_turso_err)? {
+            let cdc_row = decode_cdc_row(&row)?;
+            read_in_window += 1;
+            window_after = cdc_row.change_id;
+            let commit = (cdc_row.change_type == change_type::COMMIT).then_some(cdc_row.change_id);
+            buffered.push(cdc_row);
+            if let Some(commit_change_id) = commit {
+                break 'windows commit_change_id;
+            }
+        }
+        // A short window means the log ended before a COMMIT: the newest
+        // transaction is still being written. Nothing complete yet.
+        if read_in_window < WINDOW {
+            return Ok(None);
+        }
+        // A full window with no COMMIT is one large transaction. Read on.
+    };
+
+    Ok(Some((TxnBatch { rows: buffered }, commit_change_id)))
 }
 
 /// Decode one row of `turso_cdc` (in the SELECT order used by
@@ -400,6 +419,11 @@ async fn ensure_watermark_table(conn: &turso::Connection) -> Result<(), BackendE
 /// Returns [`BackendError::Sqlite`] if the read fails for any reason other
 /// than a missing table (a missing table returns 0).
 pub async fn read_watermark(conn: &turso::Connection) -> Result<i64, BackendError> {
+    crate::offload::engine(read_watermark_in_place(conn)).await
+}
+
+/// [`read_watermark`] for a caller already inside [`crate::offload::engine`].
+async fn read_watermark_in_place(conn: &turso::Connection) -> Result<i64, BackendError> {
     // Best-effort: if the table doesn't exist, treat as 0.
     let mut stmt = match conn
         .prepare("SELECT applied_change_id FROM __litewire_cdc_watermark WHERE id = 0")
@@ -449,10 +473,18 @@ pub async fn apply_batch(
             "cdc apply: empty batch (a TxnBatch always ends in a COMMIT row)".into(),
         ));
     };
+    crate::offload::engine(apply_committed_batch(replica_conn, batch, commit_change_id)).await
+}
 
+/// The engine side of [`apply_batch`], run under [`crate::offload::engine`].
+async fn apply_committed_batch(
+    replica_conn: &turso::Connection,
+    batch: &TxnBatch,
+    commit_change_id: i64,
+) -> Result<(), BackendError> {
     ensure_watermark_table(replica_conn).await?;
 
-    let current = read_watermark(replica_conn).await?;
+    let current = read_watermark_in_place(replica_conn).await?;
     if commit_change_id <= current {
         // Already applied; idempotent no-op.
         return Ok(());
