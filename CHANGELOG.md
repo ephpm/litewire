@@ -96,18 +96,26 @@ the commit that merges this changelog.
 ### Fixed
 
 - The Turso backend no longer runs engine work on tokio's async worker
-  threads. The engine's `async` API does its page I/O and commit `fsync`
-  synchronously inside `poll`, so every session statement, `Turso::build`,
-  `CdcTailer::poll_batch`, `apply_batch`/`read_watermark`/`enable_cdc` and
-  the WAL gate's checkpoints blocked a worker for their whole duration; with
-  enough of them in flight no worker was left to turn the runtime's I/O and
-  timer drivers, and every other task on the runtime stalled (ePHPm measured
-  its `SIGTERM` handler running 48 s late under replication load). They now
-  run through the new `litewire_turso::offload::engine`, which uses
+  threads (#52). The engine's `async` API runs each step's page I/O and the
+  commit `fsync` synchronously inside `poll`, yielding only between steps, so
+  every session statement, `Turso::build`, `CdcTailer::poll_batch`,
+  `apply_batch`/`read_watermark`/`enable_cdc` and the WAL gate's checkpoints
+  held a worker for each step as long as the disk took; with enough of them
+  in flight no worker was left to turn the runtime's I/O and timer drivers,
+  and every other task on the runtime stalled (ePHPm measured its `SIGTERM`
+  handler running up to 53 s late under replication load). They now run
+  through the new `litewire_turso::offload::engine`, which uses
   `block_in_place` on a multi-thread runtime and awaits in place on a
   current-thread runtime. Embedders running statements on a
   `Turso::raw_connection` should use it too. Nested calls run in place, so
-  an embedder that offloads a whole `select!` keeps its interleaving.
+  an embedder that offloads a whole `select!` keeps its interleaving. An
+  offloaded scope cannot be cancelled from outside (an enclosing `timeout`
+  fires only after it ends), and a busy wait inside one is a hot spin that
+  pins its thread for up to the busy timeout; both are documented on
+  `offload`.
+- Session statements taking 1 s or longer are logged at WARN with the split
+  between waiting (session mutex + WAL-gate permit) and engine time, and only
+  the statement's leading keyword.
 - `CdcTailer::poll_batch` now ships a transaction that changes more rows than
   one 1024-row read window. Before, a full window with no COMMIT returned
   `Ok(None)` ("nothing pending") on every poll, so CDC replication stopped
