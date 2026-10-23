@@ -71,6 +71,8 @@ impl PostgresHandler {
                 let sql = meta.to_sqlite_sql();
                 Ok((sql, StatementKind::Query))
             }
+            // Only the MySQL dialect produces table rebuilds.
+            TranslateResult::RebuildTable(_) => Err("table rebuilds are MySQL-only".to_string()),
             TranslateResult::Sql(sql) => {
                 let kind = classify(sql);
                 Ok((sql.clone(), kind))
@@ -429,6 +431,10 @@ impl SimpleQueryHandler for PostgresHandler {
                     let sqlite_sql = meta.to_sqlite_sql();
                     self.exec_query(&sqlite_sql, &[], &Format::UnifiedText)
                         .await?
+                }
+                // Only the MySQL dialect produces table rebuilds.
+                TranslateResult::RebuildTable(_) => {
+                    return Err(pg_error("table rebuilds are MySQL-only"));
                 }
                 TranslateResult::Sql(sqlite_sql) => {
                     if sqlite_sql.is_empty() {

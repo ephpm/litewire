@@ -40,6 +40,11 @@ pub enum MetadataQuery {
         /// Translated SQLite predicate over the result columns, if any.
         filter: Option<String>,
     },
+    /// `SHOW TABLE STATUS [FROM db] [LIKE 'pat' | WHERE expr]`.
+    ShowTableStatus {
+        /// Translated SQLite predicate over the result columns, if any.
+        filter: Option<String>,
+    },
     /// Unfiltered `SHOW DATABASES` / `SHOW SCHEMAS`.
     ShowDatabases,
     /// `SHOW [FULL] COLUMNS FROM <table> [LIKE | WHERE]` or
@@ -156,6 +161,23 @@ impl MetadataQuery {
                     where_clause(filter.as_ref()),
                 )
             }
+            Self::ShowTableStatus { filter } => format!(
+                "SELECT \"Name\", \"Engine\", \"Version\", \"Row_format\", \"Rows\", \
+                 \"Avg_row_length\", \"Data_length\", \"Max_data_length\", \"Index_length\", \
+                 \"Data_free\", \"Auto_increment\", \"Create_time\", \"Update_time\", \
+                 \"Check_time\", \"Collation\", \"Checksum\", \"Create_options\", \"Comment\" \
+                 FROM (SELECT TABLE_NAME AS \"Name\", ENGINE AS \"Engine\", VERSION AS \"Version\", \
+                 ROW_FORMAT AS \"Row_format\", TABLE_ROWS AS \"Rows\", \
+                 AVG_ROW_LENGTH AS \"Avg_row_length\", DATA_LENGTH AS \"Data_length\", \
+                 MAX_DATA_LENGTH AS \"Max_data_length\", INDEX_LENGTH AS \"Index_length\", \
+                 DATA_FREE AS \"Data_free\", AUTO_INCREMENT AS \"Auto_increment\", \
+                 CREATE_TIME AS \"Create_time\", UPDATE_TIME AS \"Update_time\", \
+                 CHECK_TIME AS \"Check_time\", TABLE_COLLATION AS \"Collation\", \
+                 CHECKSUM AS \"Checksum\", CREATE_OPTIONS AS \"Create_options\", \
+                 TABLE_COMMENT AS \"Comment\" FROM ({})) AS {SHOW_ALIAS}{} ORDER BY \"Name\"",
+                catalog::table_rows(),
+                where_clause(filter.as_ref()),
+            ),
             Self::ShowDatabases => "SELECT 'main' AS \"Database\"".into(),
             Self::ShowColumns {
                 table,
@@ -970,7 +992,7 @@ fn unsupported_show(what: &str) -> TranslateError {
     TranslateError::Unsupported(format!(
         "SHOW {what} is not supported by litewire (supported: SHOW [FULL] TABLES, \
          SHOW [FULL] COLUMNS|FIELDS, SHOW INDEX|INDEXES|KEYS, SHOW CREATE TABLE, \
-         SHOW DATABASES, DESCRIBE)"
+         SHOW TABLE STATUS, SHOW DATABASES, DESCRIBE)"
     ))
 }
 
@@ -1015,6 +1037,11 @@ fn detect_show(sql: &str) -> Result<Option<MetadataQuery>, TranslateError> {
     };
     cur.pos += 1;
     let query = match kw.as_str() {
+        "TABLE" if cur.keyword("STATUS") => {
+            check_db(cur.optional_db()?.as_deref())?;
+            let filter = translate_filter(filter_clause(&mut cur, true)?, "Name")?;
+            MetadataQuery::ShowTableStatus { filter }
+        }
         "TABLES" => {
             check_db(cur.optional_db()?.as_deref())?;
             let filter = translate_filter(filter_clause(&mut cur, true)?, "Tables_in_database")?;
@@ -1495,10 +1522,32 @@ mod tests {
     }
 
     #[test]
+    fn show_table_status() {
+        for sql in ["SHOW TABLE STATUS", "SHOW TABLE STATUS FROM sendy"] {
+            assert!(
+                matches!(
+                    detect(sql),
+                    Some(MetadataQuery::ShowTableStatus { filter: None })
+                ),
+                "{sql}"
+            );
+        }
+        let Some(MetadataQuery::ShowTableStatus { filter }) =
+            detect("SHOW TABLE STATUS LIKE 'email_content_analyses'")
+        else {
+            panic!()
+        };
+        assert!(filter.unwrap().contains("`Name` LIKE"));
+        let sql = MetadataQuery::ShowTableStatus { filter: None }.to_sqlite_sql();
+        assert!(sql.contains("\"Collation\""), "{sql}");
+        assert_single_statement(&sql);
+        detect_err("SHOW TABLE STATUS FROM mysql");
+    }
+
+    #[test]
     fn unsupported_show_forms_error() {
         for sql in [
             "SHOW VARIABLES LIKE 'sql_mode'",
-            "SHOW TABLE STATUS",
             "SHOW WARNINGS",
             "SHOW ENGINES",
             "SHOW GRANTS",
