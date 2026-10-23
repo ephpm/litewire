@@ -273,7 +273,10 @@ byte, turning `'café'` in DDL or in a hinted `SELECT` into `'cafÃ©'`.
     table can gain an index MySQL would not have added). An unnamed key gets
     MySQL's default name: its first column, then `_2`, `_3`. `FULLTEXT` /
     `SPATIAL` keys have no SQLite analogue and are dropped. Index prefix
-    lengths (`name(20)`) are dropped, so the whole value is indexed.
+    lengths (`name(20)`) are dropped, so the whole value is indexed, and so is
+    a column direction (`KEY k (col DESC)`): sqlparser cannot parse it there
+    and it never changes query results. A standalone `CREATE INDEX ... (col
+    DESC)` keeps it.
   * `ALTER TABLE ... ADD {KEY|INDEX|UNIQUE} [name] (cols)` expands the same
     way; `DROP {INDEX|KEY} name` becomes `DROP INDEX`; other ALTER
     operations remain in a residual `ALTER TABLE`.

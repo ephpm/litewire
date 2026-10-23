@@ -184,6 +184,75 @@ pub(crate) fn strip_lock_in_share_mode(sql: &str) -> Option<String> {
     Some(out)
 }
 
+/// Remove `ASC` / `DESC` from the column list of a key defined inside
+/// `CREATE TABLE` / `ALTER TABLE ... ADD` (`KEY k (col DESC)`), which
+/// sqlparser cannot parse there. The direction only affects which way
+/// SQLite stores the index, never which rows a query returns. `None` when
+/// there is nothing to remove.
+pub(crate) fn strip_key_column_direction(sql: &str) -> Option<String> {
+    use crate::metadata::{Tok, lex};
+
+    let toks = lex(sql).ok()?;
+    let is = |i: usize, w: &str| matches!(toks.get(i).map(|l| &l.tok), Some(Tok::Word(x)) if x.eq_ignore_ascii_case(w));
+    if !((is(0, "CREATE") && (is(1, "TABLE") || is(1, "TEMPORARY")))
+        || (is(0, "ALTER") && is(1, "TABLE")))
+    {
+        return None;
+    }
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if is(i, "KEY") || is(i, "INDEX") || is(i, "UNIQUE") {
+            // Skip to the key's column list: the next `(`, at most a few
+            // tokens on (`KEY name USING BTREE (`).
+            let mut j = i + 1;
+            while j < toks.len()
+                && j <= i + 6
+                && !matches!(toks[j].tok, Tok::Other('(' | ',') | Tok::Semi)
+            {
+                j += 1;
+            }
+            if j < toks.len() && matches!(toks[j].tok, Tok::Other('(')) {
+                let mut depth = 0i32;
+                let mut k = j;
+                while k < toks.len() {
+                    match &toks[k].tok {
+                        Tok::Other('(') => depth += 1,
+                        Tok::Other(')') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        Tok::Word(w)
+                            if depth == 1
+                                && (w.eq_ignore_ascii_case("ASC")
+                                    || w.eq_ignore_ascii_case("DESC")) =>
+                        {
+                            cuts.push((toks[k].start, toks[k].start + w.len()));
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                i = k;
+            }
+        }
+        i += 1;
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0;
+    for (start, end) in cuts {
+        out.push_str(&sql[last..start]);
+        last = end;
+    }
+    out.push_str(&sql[last..]);
+    Some(out)
+}
+
 /// `ALTER TABLE t DROP KEY k` → `... DROP INDEX k` (MySQL synonyms;
 /// sqlparser only parses the second). `None` when there is nothing to do.
 pub(crate) fn normalize_drop_key(sql: &str) -> Option<String> {
@@ -1329,6 +1398,40 @@ mod tests {
                 "CREATE UNIQUE INDEX IF NOT EXISTS `t__u` ON `t`(b)",
                 "CREATE INDEX IF NOT EXISTS `t__idx_b` ON `t`(b)",
             ]
+        );
+    }
+
+    #[test]
+    fn key_column_direction_in_table_ddl() {
+        // Inline keys: the direction is dropped (sqlparser cannot parse it).
+        let results = translate(
+            "CREATE TABLE s (id INT, last_campaign INT, KEY s_last (last_campaign DESC), KEY k2 (id ASC, last_campaign))",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sqls: Vec<String> = results
+            .iter()
+            .map(|r| extract_sql(r).replace(", ", ","))
+            .collect();
+        assert_eq!(sqls[1], "CREATE INDEX `s__s_last` ON s(last_campaign)");
+        assert_eq!(sqls[2], "CREATE INDEX `s__k2` ON s(id,last_campaign)");
+        // A standalone CREATE INDEX keeps it (SQLite supports it there).
+        let results = translate(
+            "CREATE INDEX s_last ON s (last_campaign DESC)",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        assert!(extract_sql(&results[0]).contains("last_campaign DESC"));
+        // ALTER ... ADD INDEX too.
+        let results = translate(
+            "ALTER TABLE s ADD INDEX s_last (last_campaign DESC), ADD INDEX k3 (id)",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            extract_sql(&results[0]),
+            "CREATE INDEX `s__s_last` ON s(last_campaign)"
         );
     }
 

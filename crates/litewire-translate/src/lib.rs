@@ -145,7 +145,8 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
     let owned_sql;
     let sql = if dialect == Dialect::MySQL && is_mysql_ddl(sql) {
         let stripped = strip_numeric_paren_groups(sql);
-        owned_sql = mysql::normalize_drop_key(&stripped).unwrap_or(stripped);
+        let stripped = mysql::normalize_drop_key(&stripped).unwrap_or(stripped);
+        owned_sql = mysql::strip_key_column_direction(&stripped).unwrap_or(stripped);
         owned_sql.as_str()
     } else {
         sql
