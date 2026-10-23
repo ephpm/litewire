@@ -17,6 +17,7 @@ use crate::common::{func_args, func_name, value_expr};
 
 /// Apply MySQL-specific rewrites to a statement in-place.
 pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
+    strip_charset_introducers(stmt);
     double_quoted_strings_to_single(stmt);
     add_default_like_escape(stmt);
     rewrite_date_part_functions(stmt);
@@ -32,6 +33,13 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
         }
         Statement::Query(query) => {
             rewrite_limit_clause(query);
+        }
+        Statement::AlterTable { operations, .. } => {
+            for op in operations {
+                if let sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } = op {
+                    rewrite_column_def(column_def);
+                }
+            }
         }
         Statement::Update { assignments, .. } => {
             rewrite_update_assignment_targets(assignments);
@@ -176,6 +184,102 @@ pub(crate) fn strip_lock_in_share_mode(sql: &str) -> Option<String> {
     Some(out)
 }
 
+/// Remove `ASC` / `DESC` from the column list of a key defined inside
+/// `CREATE TABLE` / `ALTER TABLE ... ADD` (`KEY k (col DESC)`), which
+/// sqlparser cannot parse there. The direction only affects which way
+/// SQLite stores the index, never which rows a query returns. `None` when
+/// there is nothing to remove.
+pub(crate) fn strip_key_column_direction(sql: &str) -> Option<String> {
+    use crate::metadata::{Tok, lex};
+
+    let toks = lex(sql).ok()?;
+    let is = |i: usize, w: &str| matches!(toks.get(i).map(|l| &l.tok), Some(Tok::Word(x)) if x.eq_ignore_ascii_case(w));
+    if !((is(0, "CREATE") && (is(1, "TABLE") || is(1, "TEMPORARY")))
+        || (is(0, "ALTER") && is(1, "TABLE")))
+    {
+        return None;
+    }
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if is(i, "KEY") || is(i, "INDEX") || is(i, "UNIQUE") {
+            // Skip to the key's column list: the next `(`, at most a few
+            // tokens on (`KEY name USING BTREE (`).
+            let mut j = i + 1;
+            while j < toks.len()
+                && j <= i + 6
+                && !matches!(toks[j].tok, Tok::Other('(' | ',') | Tok::Semi)
+            {
+                j += 1;
+            }
+            if j < toks.len() && matches!(toks[j].tok, Tok::Other('(')) {
+                let mut depth = 0i32;
+                let mut k = j;
+                while k < toks.len() {
+                    match &toks[k].tok {
+                        Tok::Other('(') => depth += 1,
+                        Tok::Other(')') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        Tok::Word(w)
+                            if depth == 1
+                                && (w.eq_ignore_ascii_case("ASC")
+                                    || w.eq_ignore_ascii_case("DESC")) =>
+                        {
+                            cuts.push((toks[k].start, toks[k].start + w.len()));
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                i = k;
+            }
+        }
+        i += 1;
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0;
+    for (start, end) in cuts {
+        out.push_str(&sql[last..start]);
+        last = end;
+    }
+    out.push_str(&sql[last..]);
+    Some(out)
+}
+
+/// `ALTER TABLE t DROP KEY k` → `... DROP INDEX k` (MySQL synonyms;
+/// sqlparser only parses the second). `None` when there is nothing to do.
+pub(crate) fn normalize_drop_key(sql: &str) -> Option<String> {
+    use crate::metadata::{Tok, lex};
+
+    let toks = lex(sql).ok()?;
+    let is = |i: usize, w: &str| matches!(toks.get(i).map(|l| &l.tok), Some(Tok::Word(x)) if x.eq_ignore_ascii_case(w));
+    if !(is(0, "ALTER") && is(1, "TABLE")) {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut last = 0;
+    for (i, tok) in toks.iter().enumerate().skip(1) {
+        if is(i, "KEY") && is(i - 1, "DROP") {
+            let start = tok.start;
+            out.push_str(&sql[last..start]);
+            out.push_str("INDEX");
+            last = start + "KEY".len();
+        }
+    }
+    if last == 0 {
+        return None;
+    }
+    out.push_str(&sql[last..]);
+    Some(out)
+}
+
 /// Is this an `ALTER TABLE` that only changes MySQL table options?
 ///
 /// `ALTER TABLE t ROW_FORMAT=DYNAMIC`, `ENGINE=InnoDB`, `[DEFAULT]
@@ -275,6 +379,40 @@ pub(crate) fn is_table_option_only_alter(sql: &str) -> bool {
             _ => {}
         }
     }
+}
+
+// ── Charset introducers ──────────────────────────────────────────────────────
+
+/// Drop MySQL charset introducers (`_utf8mb4'x'`, `_latin1'x'`): text is
+/// UTF-8 in SQLite. `_binary 'abc'` — what mysqldump writes for BLOB values
+/// without `--hex-blob` — becomes the blob literal `X'616263'`, so the
+/// value is stored as a BLOB, not as text.
+fn strip_charset_introducers(stmt: &mut Statement) {
+    let _: ControlFlow<()> = visit_expressions_mut(stmt, |expr| {
+        if let Expr::Prefixed { prefix, value } = expr
+            && prefix.quote_style.is_none()
+            && prefix.value.starts_with('_')
+            && let Expr::Value(v) = value.as_ref()
+        {
+            let replacement = match &v.value {
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s)
+                    if prefix.value.eq_ignore_ascii_case("_binary") =>
+                {
+                    let hex: String = s.bytes().map(|b| format!("{b:02X}")).collect();
+                    Some(Value::HexStringLiteral(hex))
+                }
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+                    Some(Value::SingleQuotedString(s.clone()))
+                }
+                Value::HexStringLiteral(h) => Some(Value::HexStringLiteral(h.clone())),
+                _ => None,
+            };
+            if let Some(r) = replacement {
+                *expr = Expr::value(r);
+            }
+        }
+        ControlFlow::Continue(())
+    });
 }
 
 // ── Scalar functions with a different SQLite name ────────────────────────────
@@ -487,19 +625,190 @@ fn rewrite_update_assignment_targets(assignments: &mut [sqlparser::ast::Assignme
     }
 }
 
-// ── ALTER TABLE ADD KEY/UNIQUE -> CREATE INDEX ───────────────────────────────
+// ── Indexes: MySQL per-table names -> SQLite per-database names ─────────────
 
-/// Expand MySQL `ALTER TABLE ... ADD {KEY|INDEX|UNIQUE} name (cols)` into
-/// standalone `CREATE [UNIQUE] INDEX` statements (SQLite has no
-/// `ALTER TABLE ... ADD CONSTRAINT`). Laravel's schema builder emits one
-/// such ALTER per `->unique()` / `->index()` after every `create table`.
+/// Separator between table and index name in the SQLite name of an index
+/// created from MySQL DDL: MySQL key `s_list` on table `subscribers` is the
+/// SQLite index `subscribers__s_list`.
 ///
-/// Non-index operations are preserved in a residual `ALTER TABLE`.
+/// MySQL index names are scoped to their table — two tables may each have a
+/// key called `s_list`, and dumps routinely do — while SQLite index names
+/// share one namespace per database, so the second `CREATE INDEX s_list`
+/// would fail. Prefixing with the table name keeps every MySQL name usable.
+/// `SHOW INDEX`, `information_schema.statistics` and `DROP INDEX` translate
+/// back (see `catalog::index_rows`); the SQLite planner never needs the name.
+pub const INDEX_NAME_SEPARATOR: &str = "__";
+
+/// The SQLite name for MySQL index `index` on `table`.
+#[must_use]
+pub fn sqlite_index_name(table: &str, index: &str) -> String {
+    format!("{table}{INDEX_NAME_SEPARATOR}{index}")
+}
+
+/// Unquoted last part of an object name (`db`.`t` -> `t`).
+fn last_part(name: &sqlparser::ast::ObjectName) -> String {
+    name.0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .unwrap_or_default()
+}
+
+fn index_ident(table: &sqlparser::ast::ObjectName, index: &str) -> sqlparser::ast::ObjectName {
+    sqlparser::ast::ObjectName::from(vec![sqlparser::ast::Ident::with_quote(
+        '`',
+        sqlite_index_name(&last_part(table), index),
+    )])
+}
+
+/// MySQL's name for an index declared without one: its first column, with
+/// `_2`, `_3`, ... appended while that name is taken on the table.
+fn default_index_name(columns: &[sqlparser::ast::Ident], taken: &[String]) -> String {
+    let base = columns.first().map(|c| c.value.clone()).unwrap_or_default();
+    let mut name = base.clone();
+    let mut n = 2;
+    while taken.iter().any(|t| t.eq_ignore_ascii_case(&name)) {
+        name = format!("{base}_{n}");
+        n += 1;
+    }
+    name
+}
+
+fn create_index(
+    table: &sqlparser::ast::ObjectName,
+    index: &str,
+    columns: &[sqlparser::ast::Ident],
+    unique: bool,
+    if_not_exists: bool,
+) -> Statement {
+    use sqlparser::ast::{CreateIndex, IndexColumn, OrderByExpr, OrderByOptions};
+    Statement::CreateIndex(CreateIndex {
+        name: Some(index_ident(table, index)),
+        table_name: table.clone(),
+        using: None,
+        columns: columns
+            .iter()
+            .map(|c| IndexColumn {
+                column: OrderByExpr {
+                    expr: Expr::Identifier(c.clone()),
+                    options: OrderByOptions {
+                        asc: None,
+                        nulls_first: None,
+                    },
+                    with_fill: None,
+                },
+                operator_class: None,
+            })
+            .collect(),
+        unique,
+        concurrently: false,
+        if_not_exists,
+        include: vec![],
+        nulls_distinct: None,
+        with: vec![],
+        predicate: None,
+    })
+}
+
+/// `DROP INDEX <sqlite name>` for MySQL index `index` on `table`.
+fn drop_index(table: &sqlparser::ast::ObjectName, index: &str, if_exists: bool) -> Statement {
+    Statement::Drop {
+        object_type: sqlparser::ast::ObjectType::Index,
+        if_exists,
+        names: vec![index_ident(table, index)],
+        cascade: false,
+        restrict: false,
+        purge: false,
+        temporary: false,
+        table: None,
+    }
+}
+
+/// Expand MySQL DDL into the SQLite statements that implement it.
+///
+/// * `CREATE TABLE` with inline `KEY` / `INDEX` / `UNIQUE KEY` definitions:
+///   the table without them, then one `CREATE [UNIQUE] INDEX` per key
+///   (`IF NOT EXISTS` when the table was `IF NOT EXISTS`). An unnamed key
+///   gets MySQL's default name (first column, `_2`, ...). `FULLTEXT` /
+///   `SPATIAL` keys have no SQLite analogue and are dropped.
+/// * `ALTER TABLE ... ADD {KEY|INDEX|UNIQUE} [name] (cols)`: one
+///   `CREATE [UNIQUE] INDEX` per key; `... DROP {INDEX|KEY} name`: one
+///   `DROP INDEX`. Other operations stay in a residual `ALTER TABLE`.
+/// * `CREATE [UNIQUE] INDEX name ON t (...)` and `DROP INDEX name ON t`:
+///   the index name becomes the SQLite name.
+///
+/// Every index name goes through [`sqlite_index_name`].
+#[must_use]
+pub fn expand_ddl(stmt: Statement) -> Vec<Statement> {
+    match stmt {
+        Statement::CreateTable(create) => expand_create_table(create),
+        Statement::AlterTable { .. } => expand_alter_table(stmt),
+        Statement::CreateIndex(mut ci) => {
+            if let Some(name) = &ci.name {
+                ci.name = Some(index_ident(&ci.table_name, &last_part(name)));
+            }
+            vec![Statement::CreateIndex(ci)]
+        }
+        Statement::Drop {
+            object_type: sqlparser::ast::ObjectType::Index,
+            if_exists,
+            names,
+            table: Some(table),
+            ..
+        } => names
+            .iter()
+            .map(|n| drop_index(&table, &last_part(n), if_exists))
+            .collect(),
+        other => vec![other],
+    }
+}
+
+fn expand_create_table(mut create: sqlparser::ast::CreateTable) -> Vec<Statement> {
+    use sqlparser::ast::TableConstraint;
+
+    let if_not_exists = create.if_not_exists;
+    let mut keys: Vec<(Option<String>, Vec<sqlparser::ast::Ident>, bool)> = Vec::new();
+    create.constraints.retain(|c| match c {
+        TableConstraint::Index { name, columns, .. } => {
+            keys.push((
+                name.as_ref().map(|n| n.value.clone()),
+                columns.clone(),
+                false,
+            ));
+            false
+        }
+        TableConstraint::Unique {
+            name,
+            index_name,
+            columns,
+            ..
+        } => {
+            let name = index_name
+                .as_ref()
+                .or(name.as_ref())
+                .map(|n| n.value.clone());
+            keys.push((name, columns.clone(), true));
+            false
+        }
+        TableConstraint::FulltextOrSpatial { .. } => false,
+        _ => true,
+    });
+
+    let table = create.name.clone();
+    let mut taken: Vec<String> = vec!["PRIMARY".into()];
+    let mut out = vec![Statement::CreateTable(create)];
+    for (name, columns, unique) in keys {
+        let name = name.unwrap_or_else(|| default_index_name(&columns, &taken));
+        out.push(create_index(&table, &name, &columns, unique, if_not_exists));
+        taken.push(name);
+    }
+    out
+}
+
+/// See [`expand_ddl`].
 #[must_use]
 pub fn expand_alter_table(stmt: Statement) -> Vec<Statement> {
-    use sqlparser::ast::{
-        AlterTableOperation, CreateIndex, IndexColumn, OrderByExpr, OrderByOptions, TableConstraint,
-    };
+    use sqlparser::ast::{AlterTableOperation, TableConstraint};
 
     let Statement::AlterTable {
         name,
@@ -514,22 +823,6 @@ pub fn expand_alter_table(stmt: Statement) -> Vec<Statement> {
         return vec![stmt];
     };
 
-    let to_index_columns = |cols: &[sqlparser::ast::Ident]| -> Vec<IndexColumn> {
-        cols.iter()
-            .map(|c| IndexColumn {
-                column: OrderByExpr {
-                    expr: sqlparser::ast::Expr::Identifier(c.clone()),
-                    options: OrderByOptions {
-                        asc: None,
-                        nulls_first: None,
-                    },
-                    with_fill: None,
-                },
-                operator_class: None,
-            })
-            .collect()
-    };
-
     let mut indexes: Vec<Statement> = Vec::new();
     let mut residual_ops: Vec<AlterTableOperation> = Vec::new();
 
@@ -541,41 +834,24 @@ pub fn expand_alter_table(stmt: Statement) -> Vec<Statement> {
                 columns,
                 ..
             }) => {
-                let idx_name = index_name.clone().or_else(|| cname.clone());
-                indexes.push(Statement::CreateIndex(CreateIndex {
-                    name: idx_name.map(|i| sqlparser::ast::ObjectName::from(vec![i])),
-                    table_name: name.clone(),
-                    using: None,
-                    columns: to_index_columns(columns),
-                    unique: true,
-                    concurrently: false,
-                    if_not_exists: false,
-                    include: vec![],
-                    nulls_distinct: None,
-                    with: vec![],
-                    predicate: None,
-                }));
+                let idx = index_name
+                    .as_ref()
+                    .or(cname.as_ref())
+                    .map_or_else(|| default_index_name(columns, &[]), |i| i.value.clone());
+                indexes.push(create_index(&name, &idx, columns, true, false));
             }
             AlterTableOperation::AddConstraint(TableConstraint::Index {
                 name: iname,
                 columns,
                 ..
             }) => {
-                indexes.push(Statement::CreateIndex(CreateIndex {
-                    name: iname
-                        .clone()
-                        .map(|i| sqlparser::ast::ObjectName::from(vec![i])),
-                    table_name: name.clone(),
-                    using: None,
-                    columns: to_index_columns(columns),
-                    unique: false,
-                    concurrently: false,
-                    if_not_exists: false,
-                    include: vec![],
-                    nulls_distinct: None,
-                    with: vec![],
-                    predicate: None,
-                }));
+                let idx = iname
+                    .as_ref()
+                    .map_or_else(|| default_index_name(columns, &[]), |i| i.value.clone());
+                indexes.push(create_index(&name, &idx, columns, false, false));
+            }
+            AlterTableOperation::DropIndex { name: iname } => {
+                indexes.push(drop_index(&name, &iname.value, false));
             }
             // FULLTEXT/SPATIAL: no SQLite analogue — drop (perf-only).
             AlterTableOperation::AddConstraint(TableConstraint::FulltextOrSpatial { .. }) => {}
@@ -683,52 +959,49 @@ fn rewrite_create_table(create: &mut sqlparser::ast::CreateTable) {
     // every `create table`.
     create.table_options = sqlparser::ast::CreateTableOptions::None;
 
-    // Constraint fixups. The emitter is sqlparser `Display`, so MySQL-only
-    // constraint syntax must be removed or normalized here:
-    // - inline `KEY name (cols)` / FULLTEXT / SPATIAL: not valid SQLite —
-    //   dropped (secondary indexes are a performance concern, not a
-    //   correctness one; WordPress dbDelta emits one per table).
-    // - `UNIQUE KEY name (cols)`: normalize to bare `UNIQUE (cols)` —
-    //   functionally required (MySQL upserts target these).
-    // - `PRIMARY KEY (col)`: displays fine for SQLite; kept as-is.
-    create.constraints.retain(|c| {
-        !matches!(
-            c,
-            sqlparser::ast::TableConstraint::Index { .. }
-                | sqlparser::ast::TableConstraint::FulltextOrSpatial { .. }
-        )
-    });
-    for c in &mut create.constraints {
-        if let sqlparser::ast::TableConstraint::Unique {
-            name,
-            index_name,
-            index_type_display,
-            index_type,
-            index_options,
-            ..
-        } = c
-        {
-            *name = None;
-            *index_name = None;
-            *index_type = None;
-            *index_type_display = sqlparser::ast::KeyOrIndexDisplay::None;
-            index_options.clear();
-        }
-    }
+    // Inline `KEY` / `UNIQUE KEY` / `FULLTEXT` definitions stay in the AST
+    // here; `expand_ddl` turns them into named `CREATE INDEX` statements.
+    // `PRIMARY KEY (col)` displays fine for SQLite and is kept as-is.
 
-    // Rewrite column types.
     for col in &mut create.columns {
-        col.data_type = rewrite_data_type(&col.data_type);
-
-        // Remove AUTO_INCREMENT from column options.
-        col.options.retain(|opt| {
-            !matches!(
-                &opt.option,
-                sqlparser::ast::ColumnOption::DialectSpecific(tokens)
-                    if tokens.iter().any(|t| t.to_string().eq_ignore_ascii_case("AUTO_INCREMENT"))
-            )
-        });
+        rewrite_column_def(col);
     }
+}
+
+/// Rewrite one column definition (`CREATE TABLE`, `ALTER TABLE ... ADD`)
+/// for SQLite: map the type to its affinity and drop the MySQL-only column
+/// options SQLite rejects.
+///
+/// * `AUTO_INCREMENT` — an `INTEGER PRIMARY KEY` is SQLite's rowid alias and
+///   auto-assigns.
+/// * `CHARACTER SET x`, `COLLATE x` — text is always UTF-8, and MySQL
+///   collation names (`utf8mb4_unicode_ci`, ...) do not exist in SQLite,
+///   which rejects an unknown collation. Comparisons therefore use SQLite's
+///   binary collation: **case-sensitive**, where MySQL's `_ci` collations
+///   are not (documented in docs/sql-translation.md).
+/// * `COMMENT '...'` — no SQLite syntax for it.
+/// * `ON UPDATE CURRENT_TIMESTAMP` — no SQLite syntax for it; the column
+///   keeps its value on UPDATE unless the statement sets it (logged).
+fn rewrite_column_def(col: &mut sqlparser::ast::ColumnDef) {
+    use sqlparser::ast::ColumnOption;
+
+    col.data_type = rewrite_data_type(&col.data_type);
+    col.options.retain(|opt| match &opt.option {
+        ColumnOption::DialectSpecific(tokens) => !tokens
+            .iter()
+            .any(|t| t.to_string().eq_ignore_ascii_case("AUTO_INCREMENT")),
+        ColumnOption::CharacterSet(_) | ColumnOption::Collation(_) | ColumnOption::Comment(_) => {
+            false
+        }
+        ColumnOption::OnUpdate(_) => {
+            tracing::debug!(
+                column = %col.name,
+                "ON UPDATE <expr> dropped: SQLite has no automatic column update"
+            );
+            false
+        }
+        _ => true,
+    });
 }
 
 /// Map MySQL types to SQLite affinities.
@@ -1081,17 +1354,143 @@ mod tests {
             Dialect::MySQL,
         )
         .unwrap();
+        // The table, then one named index per key (MySQL names, scoped to
+        // the table): the unique one keeps upserts working, the plain one
+        // keeps the query plans.
+        assert_eq!(results.len(), 3, "{results:?}");
+        let table = extract_sql(&results[0]).to_ascii_uppercase();
+        assert!(
+            !table.contains("UNIQUE") && !table.contains("KEY AUTOLOAD"),
+            "MySQL key syntax survived: {table}"
+        );
+        assert_eq!(
+            extract_sql(&results[1]),
+            "CREATE UNIQUE INDEX `wp_options__option_name` ON wp_options(option_name)"
+        );
+        assert_eq!(
+            extract_sql(&results[2]),
+            "CREATE INDEX `wp_options__autoload` ON wp_options(autoload)"
+        );
+    }
+
+    #[test]
+    fn inline_keys_become_named_indexes() {
+        let results = translate(
+            "CREATE TABLE IF NOT EXISTS `t` (id INT NOT NULL AUTO_INCREMENT, a INT, b INT, \
+             PRIMARY KEY (id), KEY (a), KEY (a, b), UNIQUE KEY `u` (b), FULLTEXT KEY ft (b), INDEX idx_b (b))",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let squash = |s: &str| s.replace(", ", ",");
+        let sqls: Vec<String> = results.iter().map(|r| squash(extract_sql(r))).collect();
+        assert_eq!(sqls.len(), 5, "{sqls:?}");
+        assert!(
+            sqls[0].starts_with("CREATE TABLE IF NOT EXISTS `t`"),
+            "{sqls:?}"
+        );
+        assert!(sqls[0].contains("PRIMARY KEY (id)"), "{sqls:?}");
+        // Unnamed keys take MySQL's default name: first column, then _2.
+        assert_eq!(
+            &sqls[1..],
+            [
+                "CREATE INDEX IF NOT EXISTS `t__a` ON `t`(a)",
+                "CREATE INDEX IF NOT EXISTS `t__a_2` ON `t`(a,b)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS `t__u` ON `t`(b)",
+                "CREATE INDEX IF NOT EXISTS `t__idx_b` ON `t`(b)",
+            ]
+        );
+    }
+
+    #[test]
+    fn key_column_direction_in_table_ddl() {
+        // Inline keys: the direction is dropped (sqlparser cannot parse it).
+        let results = translate(
+            "CREATE TABLE s (id INT, last_campaign INT, KEY s_last (last_campaign DESC), KEY k2 (id ASC, last_campaign))",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sqls: Vec<String> = results
+            .iter()
+            .map(|r| extract_sql(r).replace(", ", ","))
+            .collect();
+        assert_eq!(sqls[1], "CREATE INDEX `s__s_last` ON s(last_campaign)");
+        assert_eq!(sqls[2], "CREATE INDEX `s__k2` ON s(id,last_campaign)");
+        // A standalone CREATE INDEX keeps it (SQLite supports it there).
+        let results = translate(
+            "CREATE INDEX s_last ON s (last_campaign DESC)",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        assert!(extract_sql(&results[0]).contains("last_campaign DESC"));
+        // ALTER ... ADD INDEX too.
+        let results = translate(
+            "ALTER TABLE s ADD INDEX s_last (last_campaign DESC), ADD INDEX k3 (id)",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            extract_sql(&results[0]),
+            "CREATE INDEX `s__s_last` ON s(last_campaign)"
+        );
+    }
+
+    #[test]
+    fn index_names_are_scoped_to_their_table() {
+        for (sql, want) in [
+            (
+                "CREATE INDEX s_list ON subscribers (list)",
+                "CREATE INDEX `subscribers__s_list` ON subscribers(list)",
+            ),
+            (
+                "CREATE UNIQUE INDEX s_email ON `subscribers` (email, list)",
+                "CREATE UNIQUE INDEX `subscribers__s_email` ON `subscribers`(email,list)",
+            ),
+            (
+                "DROP INDEX s_list ON subscribers",
+                "DROP INDEX `subscribers__s_list`",
+            ),
+            (
+                "ALTER TABLE subscribers DROP INDEX s_list",
+                "DROP INDEX `subscribers__s_list`",
+            ),
+            (
+                "ALTER TABLE subscribers DROP KEY s_list",
+                "DROP INDEX `subscribers__s_list`",
+            ),
+            (
+                "ALTER TABLE subscribers ADD INDEX (list)",
+                "CREATE INDEX `subscribers__list` ON subscribers(list)",
+            ),
+        ] {
+            let results = translate(sql, Dialect::MySQL).unwrap();
+            assert_eq!(results.len(), 1, "{sql}: {results:?}");
+            assert_eq!(extract_sql(&results[0]).replace(", ", ","), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn mysql_column_options_sqlite_rejects_are_dropped() {
+        let results = translate(
+            "CREATE TABLE a (name VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL, \
+             notes TEXT COMMENT 'caf\u{e9}', updated TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP, \
+             created DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            Dialect::MySQL,
+        )
+        .unwrap();
         let sql = extract_sql(&results[0]);
-        let upper = sql.to_ascii_uppercase();
-        assert!(upper.contains("UNIQUE ("), "unique constraint lost: {sql}");
-        assert!(
-            !upper.contains("UNIQUE KEY"),
-            "MySQL UNIQUE KEY survived: {sql}"
-        );
-        assert!(
-            !upper.contains("KEY AUTOLOAD"),
-            "plain KEY constraint survived: {sql}"
-        );
+        for gone in ["CHARACTER SET", "COLLATE", "COMMENT", "ON UPDATE"] {
+            assert!(!sql.contains(gone), "{gone} survived: {sql}");
+        }
+        assert!(sql.contains("NOT NULL"), "{sql}");
+        assert!(sql.contains("DEFAULT CURRENT_TIMESTAMP"), "{sql}");
+        let results = translate(
+            "ALTER TABLE a ADD COLUMN x VARCHAR(10) COLLATE utf8mb4_unicode_ci DEFAULT ''",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(!sql.contains("COLLATE"), "{sql}");
     }
 
     #[test]

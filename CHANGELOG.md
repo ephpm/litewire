@@ -36,6 +36,21 @@ the commit that merges this changelog.
 
 ### Added
 
+- MySQL dumps restore with their indexes (ephpm Sendy compatibility).
+  Inline `KEY` / `INDEX` / `UNIQUE KEY` in `CREATE TABLE` (previously
+  dropped, or reduced to an anonymous `UNIQUE (...)`) now become named
+  `CREATE [UNIQUE] INDEX` statements. MySQL index names are scoped to their
+  table (`t__k` in SQLite, reported as `k` by `SHOW INDEX` /
+  `information_schema.statistics`) so dumps reusing a key name across
+  tables restore. `DROP INDEX k ON t`, `ALTER TABLE t DROP {INDEX|KEY} k`
+  and unnamed `ADD INDEX (cols)` work (an unnamed `ADD INDEX` used to emit
+  invalid SQL); indexes created under bare names by older versions are
+  still found. Column `CHARACTER SET` / `COLLATE` / `COMMENT` / `ON UPDATE`
+  and charset introducers (`_binary '...'` → blob, `_utf8mb4'...'`) are
+  translated or dropped instead of reaching SQLite. Restore guide in
+  docs/sql-translation.md; `tests/mysql_dump_restore.rs` replays an unedited
+  MySQL 8.4 `mysqldump --hex-blob` on both backends.
+
 - `sql_mode` is tracked per session: `SET [SESSION] sql_mode = ...` (literal,
   `DEFAULT`, an expression over `@@sql_mode`, or a bound `?`) is recorded and
   read back by `SELECT @@sql_mode`; `@@GLOBAL.sql_mode` stays `''`. Recorded,
