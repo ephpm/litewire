@@ -20,6 +20,9 @@ use std::sync::Arc;
 
 use litewire_backend::user_lock::{UserLockOp, UserLockReply};
 use litewire_backend::{BackendConn, BackendError, Column, ResultSet, Value};
+use litewire_translate::metadata::{
+    DEFAULT_SQL_MODE, SessionVars, SetSqlMode, SqlModeValue, detect_set_sql_mode,
+};
 use litewire_translate::user_locks::LockValue;
 use litewire_translate::{
     Dialect, StatementKind, TranslateCache, TranslateError, TranslateResult,
@@ -150,6 +153,13 @@ enum PreparedSpecial {
         mysql_sql: String,
         placeholder_count: usize,
     },
+    /// `SET [SESSION] sql_mode = ...`: changes session state, so it is
+    /// re-run through [`Session::query`] at execute time with the bound
+    /// parameters. `sqlite_sql` is empty (nothing to describe).
+    SetSqlMode {
+        mysql_sql: String,
+        placeholder_count: usize,
+    },
 }
 
 impl Prepared {
@@ -162,9 +172,14 @@ impl Prepared {
     #[must_use]
     pub fn param_count(&self) -> usize {
         match &self.special {
-            Some(PreparedSpecial::UserLocks {
-                placeholder_count, ..
-            }) => *placeholder_count,
+            Some(
+                PreparedSpecial::UserLocks {
+                    placeholder_count, ..
+                }
+                | PreparedSpecial::SetSqlMode {
+                    placeholder_count, ..
+                },
+            ) => *placeholder_count,
             _ => self.sqlite_sql.chars().filter(|&c| c == '?').count(),
         }
     }
@@ -200,6 +215,11 @@ pub struct Session {
     /// `RELEASE_ALL_LOCKS()`. See [`Session::may_hold_user_locks`].
     user_locks_held: bool,
 
+    /// The session `sql_mode` set by `SET [SESSION] sql_mode = ...`, read
+    /// back by `SELECT @@sql_mode`. `None` = never set (the default).
+    /// Recorded, not enforced: see [`litewire_translate::metadata::DEFAULT_SQL_MODE`].
+    sql_mode: Option<String>,
+
     dialect: Dialect,
     cache: Arc<TranslateCache>,
 }
@@ -228,6 +248,7 @@ impl Session {
             in_transaction: false,
             found_rows: 0,
             user_locks_held: false,
+            sql_mode: None,
             dialect,
             cache,
         }
@@ -340,7 +361,7 @@ impl Session {
         match result {
             TranslateResult::Noop => Ok((String::new(), StatementKind::Other)),
             TranslateResult::Metadata(meta) => {
-                let sql = meta.to_sqlite_sql();
+                let sql = meta.to_sqlite_sql_with(&self.session_vars());
                 Ok((sql, StatementKind::Query))
             }
             // The cached entry is shared, so this clones the one
@@ -401,6 +422,14 @@ impl Session {
             return user_locks::run(self, &plan, params).await;
         }
 
+        // `SET [SESSION] sql_mode = ...` is recorded so `SELECT @@sql_mode`
+        // reads it back.
+        if self.dialect == Dialect::MySQL
+            && let Some(set) = detect_set_sql_mode(sql)
+        {
+            return self.set_sql_mode(&set, params).await;
+        }
+
         // A bare `SELECT FOUND_ROWS()` is answered from session state and
         // never reaches the backend (see [`Session::found_rows`]).
         if let Some(column) = found_rows_select_column(sql, self.dialect) {
@@ -433,6 +462,80 @@ impl Session {
         }
 
         Ok(last)
+    }
+
+    /// The session `sql_mode`: what `SELECT @@sql_mode` reports. Empty
+    /// until the client sets one.
+    #[must_use]
+    pub fn sql_mode(&self) -> &str {
+        self.sql_mode.as_deref().unwrap_or(DEFAULT_SQL_MODE)
+    }
+
+    /// Per-session values metadata answers depend on.
+    fn session_vars(&self) -> SessionVars<'_> {
+        SessionVars {
+            sql_mode: self.sql_mode.as_deref(),
+        }
+    }
+
+    /// Apply a `SET ... sql_mode = ...`.
+    ///
+    /// The mode is recorded and read back; litewire enforces none of the
+    /// modes (see [`DEFAULT_SQL_MODE`]), so setting a checking mode logs a
+    /// warning once per change. `SET GLOBAL` changes nothing observable on
+    /// this connection, as on MySQL. An expression value is evaluated with
+    /// the current mode substituted for `@@sql_mode`.
+    async fn set_sql_mode(
+        &mut self,
+        set: &SetSqlMode,
+        params: &[Value],
+    ) -> Result<SessionResult, SessionError> {
+        let value = match &set.value {
+            SqlModeValue::Literal(s) => Some(s.clone()),
+            SqlModeValue::Default => None,
+            SqlModeValue::Expression(_) => {
+                let Some(select) = set.evaluation_sql(self.sql_mode()) else {
+                    return Err(SessionError::Translate(TranslateError::Unsupported(
+                        "unsupported sql_mode expression".into(),
+                    )));
+                };
+                let result = Box::pin(self.query(&select, params)).await?;
+                let SessionResult::Rows(rs) = result else {
+                    return Err(SessionError::Translate(TranslateError::Unsupported(
+                        "sql_mode expression produced no value".into(),
+                    )));
+                };
+                match rs.rows.first().and_then(|r| r.first()) {
+                    Some(Value::Text(s)) => Some(
+                        s.split(',')
+                            .map(|m| m.trim().to_ascii_uppercase())
+                            .filter(|m| !m.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                    Some(Value::Null) | None => {
+                        return Err(SessionError::Translate(TranslateError::Unsupported(
+                            "sql_mode cannot be set to NULL".into(),
+                        )));
+                    }
+                    Some(other) => Some(other.to_string().to_ascii_uppercase()),
+                }
+            }
+        };
+        if set.global {
+            tracing::debug!("SET GLOBAL sql_mode: no-op (litewire's default sql_mode is fixed)");
+        } else {
+            if let Some(mode) = &value
+                && !mode.is_empty()
+            {
+                tracing::warn!(
+                    sql_mode = %mode,
+                    "sql_mode recorded for @@sql_mode but not enforced by litewire"
+                );
+            }
+            self.sql_mode = value;
+        }
+        Ok(SessionResult::Ok(self.ok(0, 0, true)))
     }
 
     /// Build the one-row result set for `SELECT FOUND_ROWS()` and update
@@ -568,6 +671,23 @@ impl Session {
             });
         }
 
+        if self.dialect == Dialect::MySQL
+            && let Some(set) = detect_set_sql_mode(query)
+        {
+            let placeholder_count = match &set.value {
+                SqlModeValue::Expression(e) => litewire_translate::metadata::count_placeholders(e),
+                _ => 0,
+            };
+            return Ok(Prepared {
+                sqlite_sql: String::new(),
+                kind: StatementKind::Other,
+                special: Some(PreparedSpecial::SetSqlMode {
+                    mysql_sql: query.to_string(),
+                    placeholder_count,
+                }),
+            });
+        }
+
         if let Some(column) = found_rows_select_column(query, self.dialect) {
             // A valid SQLite equivalent so callers can describe columns
             // and count placeholders; execute_prepared never runs it.
@@ -613,7 +733,10 @@ impl Session {
             }
             // Re-evaluated from the original text: the lock calls' results
             // depend on the parameters bound to *this* execution.
-            Some(PreparedSpecial::UserLocks { mysql_sql, .. }) => {
+            Some(
+                PreparedSpecial::UserLocks { mysql_sql, .. }
+                | PreparedSpecial::SetSqlMode { mysql_sql, .. },
+            ) => {
                 let sql = mysql_sql.clone();
                 return self.query(&sql, params).await;
             }
@@ -668,7 +791,7 @@ impl Session {
             TranslateResult::Metadata(meta) => {
                 // Metadata emulation SQL never contains placeholders; the
                 // wire frontend has always executed it with no parameters.
-                let sql = meta.to_sqlite_sql();
+                let sql = meta.to_sqlite_sql_with(&self.session_vars());
                 self.run_translated(&sql, StatementKind::Query, &[]).await
             }
             TranslateResult::Sql(sql) => {
