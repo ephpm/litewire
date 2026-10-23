@@ -10,6 +10,11 @@ the commit that merges this changelog.
 
 ### Changed
 
+- The MySQL frontend writes a session error's **own** code to the wire
+  instead of re-classifying its message. Same codes as before for every
+  existing error; a duplicate-key message is now shaped once
+  (`Duplicate entry '<unknown>' for key 'users.email' (…)`) rather than
+  wrapped twice. (#54)
 - Turso engine bumped `=0.8.2` → `=0.8.3` (ephpm#573). No litewire API
   change; file format and the `turso_cdc` log schema are unchanged. 0.8.3
   refuses `PRAGMA journal_mode = 'mvcc'` inside a transaction. 0.8.2 accepted
@@ -31,6 +36,26 @@ the commit that merges this changelog.
 
 ### Added
 
+- MySQL named locks — `GET_LOCK()`, `RELEASE_LOCK()`, `RELEASE_ALL_LOCKS()`,
+  `IS_FREE_LOCK()`, `IS_USED_LOCK()` — and the `DO <expr>` statement, with
+  MySQL 8 semantics: exclusive across connections, re-entrant within one
+  (counted; `RELEASE_LOCK` decrements, `RELEASE_ALL_LOCKS` returns the
+  acquisitions released), case-insensitive names of at most 64 characters
+  (3057 / 3938 on bad names, `ER_WRONG_ARGUMENTS` on the wire), a
+  wakeup-driven timed wait (negative = forever), and **release on
+  disconnect however the connection ends** (clean `QUIT`, TCP reset,
+  dropped task, `COM_RESET_CONNECTION`) — a `LockSession` dies with the
+  connection. Calls are evaluated once per statement, in source order, and
+  substituted as literals, so they work with aliases, alongside other
+  columns, and as prepared statements with `?` arguments. Scope is explicit:
+  `BackendConn::user_lock` refuses by default and a backend gets locks by
+  being wrapped in `UserLockScoped` (or `scoped_conn`) with a namespace —
+  one per tenant under an authenticator, so tenants never see each other's
+  locks; a forwarding backend implements the method itself. The CLI scopes
+  its database automatically. `Session` gains `may_hold_user_locks` /
+  `release_user_locks` for embedders that borrow a session across request
+  boundaries, and `Prepared::param_count`. `docs/sql-translation.md` has the
+  full semantics. (#54)
 - WAL checkpoint gate for the Turso backend
   (`TursoBuilder::wal_checkpoint_gate`, module `litewire_turso::wal_gate`;
   off by default). Under constant read load the engine never rewinds its

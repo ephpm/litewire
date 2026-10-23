@@ -192,6 +192,67 @@ it (the value is session state), so the **session layer** does:
 * A `FOUND_ROWS()` call embedded in a larger expression (not the bare SELECT
   shape) falls back to the constant `0` shim from `common.rs`.
 
+## Named locks: `GET_LOCK()` & co. (`src/user_locks.rs` + session + backend)
+
+MySQL's user-level locks — `GET_LOCK(name, timeout)`, `RELEASE_LOCK(name)`,
+`RELEASE_ALL_LOCKS()`, `IS_FREE_LOCK(name)`, `IS_USED_LOCK(name)` — and the
+`DO <expr>` statement they are usually issued through. SQLite has nothing
+like them; they are *session* operations (they wait, and their answer
+depends on which connection asks), so they cannot be translated. Three
+layers share the work:
+
+* **Translate** (`user_locks::detect`): a statement that mentions a lock
+  function (one `_LOCK` substring scan rejects everything else) is parsed,
+  each call is pulled out with its literal or `?` arguments and replaced by
+  a sentinel, and — once the session has the values — the sentinels become
+  literals and the rest of the statement is translated as usual
+  (`LockStatement::to_sqlite`). `SELECT GET_LOCK('job', 0) AS s, NOW()`
+  runs as `SELECT 1 AS s, datetime('now')`. An unaliased call keeps MySQL's
+  column name (`GET_LOCK('job', 0)`). `DO exprs` is `SELECT exprs` with the
+  rows discarded.
+* **Session** (`litewire-session`): validates and normalizes the name as
+  MySQL does — `NULL`/empty → error 3057 `ER_USER_LOCK_WRONG_NAME`, over 64
+  characters → 3938 `ER_USER_LOCK_OVERLONG_NAME`, otherwise **lowercased**
+  (names are case-insensitive) — evaluates each call **once per statement,
+  in source order** (not once per row), and binds the remaining `?`
+  parameters to the SQLite statement. Prepared statements work
+  (`SELECT GET_LOCK(?, ?)`); the lock calls are re-evaluated with the
+  parameters bound at each execute.
+* **Backend** (`litewire_backend::user_lock`): the registry of held locks,
+  reached through `BackendConn::user_lock`. Locks are **exclusive across
+  sessions, re-entrant within one** (a count per name), **released when the
+  connection ends** — a clean `QUIT`, a TCP reset, a dropped task, all drop
+  the connection's `LockSession`, whose `Drop` releases everything it holds
+  — and untouched by `COMMIT`/`ROLLBACK`. `COM_RESET_CONNECTION` /
+  `COM_CHANGE_USER` release them too (applied at the connection's next
+  command, like the reset's rollback). A timed `GET_LOCK` parks on a
+  per-lock `Notify` and is woken by the release, never polled; a negative
+  timeout waits forever, as on MySQL. There is no deadlock detection.
+
+Return values follow the MySQL manual: `GET_LOCK` 1/0 (NULL for a NULL
+timeout); `RELEASE_LOCK` 1 released / 0 held by another session / NULL not
+held; `RELEASE_ALL_LOCKS` the number of acquisitions released; `IS_FREE_LOCK`
+1/0; `IS_USED_LOCK` the holder's session id or NULL. The session id is
+litewire's own per-connection counter, not the `CONNECTION_ID()` constant.
+
+**Scope is the embedder's choice, and refusing is the default.** A plain
+`BackendConn` answers every lock operation with an error ("named locks …
+are not available on this connection"), never a fake `1`: a lock that does
+not actually exclude anything is the one answer a caller cannot defend
+against. A backend gains locks by being wrapped — `UserLockScoped::new(
+backend, &registry, namespace)` (or `scoped_conn` per connection) — and the
+`namespace` is the isolation unit: one listener serving many tenants gives
+each tenant its own namespace, so a name taken by one is invisible to the
+others. The `litewire` CLI scopes its single database to the `""`
+namespace. A backend that forwards statements elsewhere implements
+`user_lock` by forwarding the operation, so the lock lives with the session
+on the far side.
+
+On the wire, the two name errors are reported as `ER_WRONG_ARGUMENTS`
+(1210, `HY000`): `opensrv-mysql`'s error table stops at 1885 and panics on
+codes it does not know. Embedders reading `SessionError::code()` directly
+see 3057 / 3938.
+
 ## PostgreSQL dialect (`src/postgres.rs`)
 
 `CREATE TABLE` type mappings: `SMALLINT`/`INT`/`BIGINT` → `INTEGER`;

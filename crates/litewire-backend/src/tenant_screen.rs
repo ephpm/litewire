@@ -126,6 +126,15 @@ impl BackendConn for ScreenedConn {
         screen_sql(sql).map_err(|o| refuse(&o))?;
         self.inner.describe_columns(sql).await
     }
+
+    /// Named locks carry no SQL to screen and are scoped by the inner
+    /// connection's namespace (the tenant's); forward untouched.
+    async fn user_lock(
+        &self,
+        op: &crate::user_lock::UserLockOp,
+    ) -> Result<crate::user_lock::UserLockReply, BackendError> {
+        self.inner.user_lock(op).await
+    }
 }
 
 /// Screen a (possibly multi-statement) SQL string for statements that are

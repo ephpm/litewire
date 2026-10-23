@@ -14,10 +14,13 @@
 //! Wire frontends delegate to `Session` and keep only protocol framing.
 
 pub mod error_map;
+mod user_locks;
 
 use std::sync::Arc;
 
+use litewire_backend::user_lock::{UserLockOp, UserLockReply};
 use litewire_backend::{BackendConn, BackendError, Column, ResultSet, Value};
+use litewire_translate::user_locks::LockValue;
 use litewire_translate::{
     Dialect, StatementKind, TranslateCache, TranslateError, TranslateResult,
     calc_found_rows_count_sql, classify, found_rows_select_column, translate_cached,
@@ -138,6 +141,33 @@ enum PreparedSpecial {
     /// The statement carried `SQL_CALC_FOUND_ROWS`: after executing it,
     /// run `count_sql` (same parameter list) and store the total.
     CalcFoundRows { count_sql: String },
+    /// The statement calls a named-lock function (`GET_LOCK()` & co.) or is
+    /// a `DO`. It cannot be translated ahead of time — the calls are session
+    /// operations whose results depend on the parameters bound at execute
+    /// time — so the original text is kept and re-evaluated per execution.
+    /// `sqlite_sql` is a describable shim (every call replaced by `0`).
+    UserLocks {
+        mysql_sql: String,
+        placeholder_count: usize,
+    },
+}
+
+impl Prepared {
+    /// Number of `?` parameters the client must bind.
+    ///
+    /// Normally the placeholders in the translated SQL. For a named-lock
+    /// statement it is the count in the **original** text: the lock calls'
+    /// own placeholders are consumed before the SQLite text is built, so
+    /// counting there would under-report.
+    #[must_use]
+    pub fn param_count(&self) -> usize {
+        match &self.special {
+            Some(PreparedSpecial::UserLocks {
+                placeholder_count, ..
+            }) => *placeholder_count,
+            _ => self.sqlite_sql.chars().filter(|&c| c == '?').count(),
+        }
+    }
 }
 
 /// A dialect-aware SQL session over one backend connection.
@@ -166,6 +196,10 @@ pub struct Session {
     /// What `SELECT FOUND_ROWS()` reports. See [`Session::found_rows`].
     found_rows: u64,
 
+    /// Whether a `GET_LOCK()` on this session has succeeded since the last
+    /// `RELEASE_ALL_LOCKS()`. See [`Session::may_hold_user_locks`].
+    user_locks_held: bool,
+
     dialect: Dialect,
     cache: Arc<TranslateCache>,
 }
@@ -193,6 +227,7 @@ impl Session {
             conn,
             in_transaction: false,
             found_rows: 0,
+            user_locks_held: false,
             dialect,
             cache,
         }
@@ -202,6 +237,52 @@ impl Session {
     #[must_use]
     pub fn dialect(&self) -> Dialect {
         self.dialect
+    }
+
+    /// Whether this session **may** hold MySQL named locks: a `GET_LOCK()`
+    /// succeeded on it and no `RELEASE_ALL_LOCKS()` has run since.
+    ///
+    /// Conservative on purpose — individual `RELEASE_LOCK()` calls do not
+    /// clear it, because the count lives in the lock registry, not here. It
+    /// exists so a caller that must guarantee locks are gone at a boundary
+    /// (a connection reset, the end of a request that borrows a long-lived
+    /// session) can skip the round trip in the common case of a session that
+    /// never locked anything.
+    #[must_use]
+    pub fn may_hold_user_locks(&self) -> bool {
+        self.user_locks_held
+    }
+
+    /// Release every named lock this session holds (`RELEASE_ALL_LOCKS()`),
+    /// returning how many acquisitions were released. A no-op returning 0
+    /// when [`Session::may_hold_user_locks`] is false.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Db`] if the connection cannot perform the
+    /// release (its backend has no lock scope, or a forwarding backend lost
+    /// its peer — in which case the peer's session, and the locks with it,
+    /// are gone anyway).
+    pub async fn release_user_locks(&mut self) -> Result<u64, SessionError> {
+        if !self.user_locks_held {
+            return Ok(0);
+        }
+        let reply = self
+            .conn
+            .user_lock(&UserLockOp::ReleaseAll)
+            .await
+            .map_err(map_backend_err)?;
+        self.user_locks_held = false;
+        Ok(reply.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
+    }
+
+    /// Track the lock-holding state after `op` produced `reply`.
+    fn note_user_lock(&mut self, op: &UserLockOp, reply: UserLockReply) {
+        match op {
+            UserLockOp::Get { .. } if reply == Some(1) => self.user_locks_held = true,
+            UserLockOp::ReleaseAll => self.user_locks_held = false,
+            _ => {}
+        }
     }
 
     /// The value the session's next `SELECT FOUND_ROWS()` will report.
@@ -285,6 +366,12 @@ impl Session {
     /// * **Transaction control** (`BEGIN`/`START TRANSACTION`, `COMMIT`,
     ///   `ROLLBACK`) executes against the backend and, on success, updates
     ///   [`Session::in_transaction`].
+    /// * **Named-lock functions** (`GET_LOCK()`, `RELEASE_LOCK()`,
+    ///   `RELEASE_ALL_LOCKS()`, `IS_FREE_LOCK()`, `IS_USED_LOCK()`) and the
+    ///   `DO <expr>` statement are evaluated by the session — each call once,
+    ///   in source order, through the connection's lock scope — and their
+    ///   results substituted into the statement before it runs. See
+    ///   [`litewire_translate::user_locks`] for the supported shapes.
     /// * When translation expands to **multiple statements** (see
     ///   [`Session::translate_sql`]), every statement is executed in order;
     ///   the first error stops execution and the result of the **last**
@@ -307,6 +394,13 @@ impl Session {
         sql: &str,
         params: &[Value],
     ) -> Result<SessionResult, SessionError> {
+        // Named-lock calls and `DO` are session operations; one cheap scan
+        // for the common case of a statement without them.
+        if let Some(plan) = litewire_translate::user_locks::detect(sql, self.dialect) {
+            let plan = plan?;
+            return user_locks::run(self, &plan, params).await;
+        }
+
         // A bare `SELECT FOUND_ROWS()` is answered from session state and
         // never reaches the backend (see [`Session::found_rows`]).
         if let Some(column) = found_rows_select_column(sql, self.dialect) {
@@ -452,6 +546,28 @@ impl Session {
     /// Returns [`SessionError::Translate`] if the SQL cannot be parsed or
     /// contains unsupported constructs.
     pub fn prepare(&self, query: &str) -> Result<Prepared, SessionError> {
+        if let Some(plan) = litewire_translate::user_locks::detect(query, self.dialect) {
+            let plan = plan?;
+            // A shim with every call answered `0`, good enough to describe
+            // the result columns; execution re-evaluates the original text
+            // with the parameters bound at that time.
+            let shim = vec![LockValue::Int(0); plan.calls.len()];
+            let sqlite_sql = plan.to_sqlite(&shim)?;
+            let kind = if plan.is_do {
+                StatementKind::Other
+            } else {
+                StatementKind::Query
+            };
+            return Ok(Prepared {
+                sqlite_sql,
+                kind,
+                special: Some(PreparedSpecial::UserLocks {
+                    mysql_sql: query.to_string(),
+                    placeholder_count: plan.placeholder_count,
+                }),
+            });
+        }
+
         if let Some(column) = found_rows_select_column(query, self.dialect) {
             // A valid SQLite equivalent so callers can describe columns
             // and count placeholders; execute_prepared never runs it.
@@ -490,9 +606,18 @@ impl Session {
         stmt: &Prepared,
         params: &[Value],
     ) -> Result<SessionResult, SessionError> {
-        if let Some(PreparedSpecial::FoundRows { column }) = &stmt.special {
-            let column = column.clone();
-            return Ok(SessionResult::Rows(self.take_found_rows(column)));
+        match &stmt.special {
+            Some(PreparedSpecial::FoundRows { column }) => {
+                let column = column.clone();
+                return Ok(SessionResult::Rows(self.take_found_rows(column)));
+            }
+            // Re-evaluated from the original text: the lock calls' results
+            // depend on the parameters bound to *this* execution.
+            Some(PreparedSpecial::UserLocks { mysql_sql, .. }) => {
+                let sql = mysql_sql.clone();
+                return self.query(&sql, params).await;
+            }
+            Some(PreparedSpecial::CalcFoundRows { .. }) | None => {}
         }
 
         // Noop statements (empty SQL from SET NAMES etc.).
@@ -511,6 +636,21 @@ impl Session {
         }
 
         Ok(result)
+    }
+
+    /// Run `op` on this session's lock scope, tracking the held state.
+    ///
+    /// Embedders that drive a `Session` directly use this for the same
+    /// operations the SQL functions perform, without composing a statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Db`] when the connection has no lock scope or
+    /// cannot reach it.
+    pub async fn user_lock(&mut self, op: &UserLockOp) -> Result<UserLockReply, SessionError> {
+        let reply = self.conn.user_lock(op).await.map_err(map_backend_err)?;
+        self.note_user_lock(op, reply);
+        Ok(reply)
     }
 
     /// Execute a single [`TranslateResult`].

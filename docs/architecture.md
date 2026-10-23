@@ -74,6 +74,7 @@ litewire/
 │   │   ├── src/lib.rs          #   Backend / BackendConn traits, Value, ResultSet
 │   │   ├── src/auth.rs         #   ConnectionAuthenticator (per-connection backends)
 │   │   ├── src/conn_limit.rs   #   ConnectionLimiter (max_connections)
+│   │   ├── src/user_lock.rs    #   MySQL named locks: registry, LockSession, UserLockScoped
 │   │   ├── src/rusqlite_backend.rs  # in-process SQLite (feature `rusqlite`)
 │   │   ├── src/hrana_client.rs      # remote sqld client (feature `hrana-client`)
 │   │   └── src/write_admission.rs   # write admission control (feature `hrana-client`)
@@ -85,10 +86,12 @@ litewire/
 │   │   ├── src/tds.rs          #   T-SQL rewrites (TOP, IDENTITY, types)
 │   │   ├── src/metadata.rs     #   SHOW/DESCRIBE/INFORMATION_SCHEMA/sys.* emulation
 │   │   ├── src/found_rows.rs   #   SQL_CALC_FOUND_ROWS / FOUND_ROWS() helpers
+│   │   ├── src/user_locks.rs   #   GET_LOCK() & co. / DO: detect, extract, substitute
 │   │   ├── src/cache.rs        #   bounded LRU translate cache
 │   │   └── src/emit.rs         #   AST -> SQL string (sqlparser Display)
 │   ├── litewire-session/       # dialect-aware session layer
 │   │   ├── src/lib.rs          #   Session: translation + tx state + FOUND_ROWS
+│   │   ├── src/user_locks.rs   #   named-lock call evaluation (names, timeouts)
 │   │   └── src/error_map.rs    #   SQLite error text -> MySQL error codes
 │   ├── litewire-mysql/         # MySQL wire protocol frontend
 │   │   ├── src/lib.rs          #   listener, connection cap, TCP_NODELAY, buffering
@@ -190,6 +193,9 @@ in-process with exactly the wire path's semantics. A `Session` owns one
 * `SQL_CALC_FOUND_ROWS` / `SELECT FOUND_ROWS()` emulation — the hint triggers
   a derived `COUNT(*)` round trip; a bare `SELECT FOUND_ROWS()` is answered
   from session state without touching the backend,
+* MySQL named locks (`GET_LOCK()` & co., `DO`) — each call evaluated once
+  per statement through `BackendConn::user_lock` and substituted as a
+  literal; see `docs/sql-translation.md`,
 * error mapping (`error_map.rs`): SQLite error text → MySQL error triples.
   Mapped codes: 1062 duplicate entry (with a MySQL-shaped message prefix,
   because stock drivers match the text), 1146 no such table (42S02), 1205
