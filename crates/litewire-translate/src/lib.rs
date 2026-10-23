@@ -4,6 +4,7 @@
 //! using `sqlparser-rs` for parsing and AST manipulation.
 
 pub mod cache;
+pub(crate) mod catalog;
 pub mod common;
 pub mod emit;
 pub mod found_rows;
@@ -93,7 +94,7 @@ pub enum TranslateResult {
 /// unsupported constructs.
 pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, TranslateError> {
     // Check for metadata queries first (before parsing -- some are not valid SQL).
-    if let Some(meta) = metadata::detect_metadata_query(sql, dialect) {
+    if let Some(meta) = metadata::detect_metadata_query(sql, dialect)? {
         return Ok(vec![TranslateResult::Metadata(meta)]);
     }
 
@@ -144,18 +145,33 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
     let statements = Parser::parse_sql(parser_dialect.as_ref(), sql)
         .map_err(|e| TranslateError::Parse(e.to_string()))?;
 
+    let check_catalog = catalog::mentions_information_schema(sql);
     let mut results = Vec::with_capacity(statements.len());
-    for stmt in statements {
+    for mut stmt in statements {
+        // `information_schema.<t>` -> emulation subquery, inside the
+        // client's own statement (see `catalog`).
+        let catalog_tables = if check_catalog {
+            catalog::substitute_information_schema(&mut stmt)?
+        } else {
+            Vec::new()
+        };
         let rewritten = rewrite_statement(stmt, dialect)?;
         if dialect == Dialect::MySQL {
             // `ALTER TABLE ... ADD KEY/UNIQUE` expands to CREATE INDEX
             // statements (SQLite has no ALTER ... ADD CONSTRAINT).
             for expanded in mysql::expand_alter_table(rewritten) {
-                results.push(TranslateResult::Sql(emit::emit_statement(&expanded)));
+                let sqlite_sql = emit::emit_statement(&expanded);
+                results.push(TranslateResult::Sql(catalog::splice(
+                    sqlite_sql,
+                    &catalog_tables,
+                )));
             }
         } else {
             let sqlite_sql = emit::emit_statement(&rewritten);
-            results.push(TranslateResult::Sql(sqlite_sql));
+            results.push(TranslateResult::Sql(catalog::splice(
+                sqlite_sql,
+                &catalog_tables,
+            )));
         }
     }
 

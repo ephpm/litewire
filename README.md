@@ -182,7 +182,8 @@ litewire translates MySQL and PostgreSQL SQL dialects to SQLite on the fly:
 | `ON DUPLICATE KEY UPDATE` | `ON CONFLICT DO UPDATE` |
 | `SHOW TABLES` / `sys.tables` | `SELECT name FROM sqlite_master WHERE type='table'` |
 | `DESCRIBE table` / `sp_columns` | `PRAGMA table_info(table)` |
-| `INFORMATION_SCHEMA.*` | `sqlite_master` + `PRAGMA` queries |
+| `INFORMATION_SCHEMA.{TABLES,COLUMNS,STATISTICS,SCHEMATA}` | derived table over `sqlite_master` + `pragma_*` substituted into the query; the query's own `WHERE`/projection apply |
+| `SHOW ... LIKE` / `SHOW ... WHERE` | filter applied to the emulated rows; unsupported forms are errors |
 | `TRUE` / `FALSE` | `1` / `0` |
 | `TOP n` | `LIMIT n` |
 | `ISNULL(a, b)` | `IFNULL(a, b)` |

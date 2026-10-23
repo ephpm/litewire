@@ -566,8 +566,8 @@ async fn information_schema_tables() {
         .await
         .unwrap();
 
-    // Returns TABLE_NAME, TABLE_TYPE, TABLE_SCHEMA columns.
-    let rows: Vec<(String, String, String)> = conn
+    // The client's own projection applies: one TABLE_NAME column.
+    let rows: Vec<(String,)> = conn
         .query("SELECT TABLE_NAME FROM information_schema.tables")
         .await
         .unwrap();

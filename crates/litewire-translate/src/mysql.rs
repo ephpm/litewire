@@ -17,6 +17,7 @@ use crate::common::{func_args, func_name, value_expr};
 
 /// Apply MySQL-specific rewrites to a statement in-place.
 pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
+    double_quoted_strings_to_single(stmt);
     add_default_like_escape(stmt);
     rewrite_date_part_functions(stmt);
     normalize_regexp(stmt);
@@ -36,6 +37,31 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
         _ => {}
     }
     Ok(())
+}
+
+// ── "double-quoted" strings ──────────────────────────────────────────────────
+
+/// Emit MySQL's double-quoted string literals single-quoted.
+///
+/// Without `ANSI_QUOTES` in `sql_mode` (the MySQL default, and the mode
+/// every PHP application assumes), `"abc"` is a string literal. sqlparser's
+/// MySQL tokenizer agrees and produces [`Value::DoubleQuotedString`], but
+/// emitting it back as `"abc"` hands SQLite an *identifier*: it only falls
+/// back to the string when no column of that name is in scope, so
+/// `WHERE status = "active"` compares against a column called `active` the
+/// moment one exists — and engines without the fallback reject it outright.
+fn double_quoted_strings_to_single(stmt: &mut Statement) {
+    struct Requote;
+    impl sqlparser::ast::VisitorMut for Requote {
+        type Break = ();
+        fn post_visit_value(&mut self, value: &mut Value) -> ControlFlow<()> {
+            if let Value::DoubleQuotedString(s) = value {
+                *value = Value::SingleQuotedString(std::mem::take(s));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let _ = sqlparser::ast::VisitMut::visit(stmt, &mut Requote);
 }
 
 // ── YEAR() / MONTH() / DAYOFMONTH() ──────────────────────────────────────────
@@ -973,6 +999,31 @@ mod tests {
     }
 
     // ── LIKE: MySQL implicit ESCAPE '\' ─────────────────────────────────────
+
+    #[test]
+    fn double_quoted_strings_become_single_quoted() {
+        let results = translate(
+            "SELECT * FROM login WHERE (db_updated != \"7.1\" OR db_updated IS NULL) AND license != \"\" AND n = \"it's\"",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("db_updated <> '7.1'"), "got: {sql}");
+        assert!(sql.contains("license <> ''"), "got: {sql}");
+        assert!(sql.contains("n = 'it''s'"), "got: {sql}");
+        assert!(!sql.contains('"'), "got: {sql}");
+    }
+
+    #[test]
+    fn backtick_identifiers_are_untouched_by_requoting() {
+        let results = translate(
+            "SELECT `name` FROM `t` WHERE `name` = \"x\"",
+            Dialect::MySQL,
+        )
+        .unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.contains("`name` = 'x'"), "got: {sql}");
+    }
 
     #[test]
     fn like_gains_default_escape() {
