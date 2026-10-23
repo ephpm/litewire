@@ -60,30 +60,67 @@ Answered with OK, never executed:
   requested locking semantics are not enforced (SQLite provides file-level
   locking only).
 
-## Metadata emulation (`src/metadata.rs`)
+## Metadata emulation (`src/metadata.rs`, `src/catalog.rs`)
 
-Detected before parsing and answered from `sqlite_master` / `PRAGMA`:
+`SHOW` / `DESCRIBE` are parsed before the SQL parser runs and answered from
+`sqlite_master` and the `pragma_table_info` / `pragma_index_list` /
+`pragma_index_info` table-valued functions, in the column shape MySQL uses:
 
-| Query | Emulated with |
-|-------|---------------|
-| `SHOW TABLES` | `sqlite_master` (type='table', `sqlite_%` excluded) |
-| `SHOW DATABASES` | synthetic single row (`main`) |
-| `SHOW [FULL] COLUMNS/FIELDS FROM t`, `DESCRIBE t`, `DESC t` | `pragma_table_info`, shaped like MySQL `SHOW FULL COLUMNS` (Field/Type/Null/Key/Default/Extra/Collation/Privileges/Comment; affinities mapped to `bigint`/`double`/`longtext`/`longblob`) |
-| `SHOW CREATE TABLE t` | `sqlite_master.sql` |
-| `SHOW INDEX/INDEXES/KEYS FROM t` | `PRAGMA index_list` |
-| `SELECT EXISTS (... information_schema.tables WHERE table_name = 't')` | single-scalar existence probe (Laravel `Schema::hasTable`) |
-| `SELECT ... FROM information_schema.tables` | `sqlite_master` (honors a `TABLE_SCHEMA = ...` filter; only `main`/`def` match) |
-| `SELECT ... FROM information_schema.columns` | `pragma_table_info` when a `TABLE_NAME = ...` filter is present; table list otherwise |
-| `SELECT ... FROM information_schema.schemata` | synthetic `main` row |
+| Query | Result |
+|-------|--------|
+| `SHOW [FULL] TABLES [FROM db] [LIKE 'p' \| WHERE expr]` | `Tables_in_database` (+ `Table_type` with `FULL`); tables and views, `sqlite_*` excluded. A `WHERE` may name the column `Tables_in_<anything>` |
+| `SHOW DATABASES` / `SHOW SCHEMAS` | synthetic single row (`main`). With `LIKE`/`WHERE`: **error** (litewire cannot see the name the client connected with) |
+| `SHOW [FULL] COLUMNS\|FIELDS {FROM\|IN} t [{FROM\|IN} db] [LIKE 'p' \| WHERE expr]`, `DESCRIBE t [col\|'p']`, `DESC t` | `Field`, `Type`, `Null`, `Key` (`PRI`/`UNI`/`MUL`), `Default`, `Extra` (`auto_increment` for an `INTEGER PRIMARY KEY`); `FULL` adds `Collation`, `Privileges`, `Comment`. Affinities map to `bigint`/`double`/`longtext`/`longblob` |
+| `SHOW {INDEX\|INDEXES\|KEYS} {FROM\|IN} t [{FROM\|IN} db] [WHERE expr]` | MySQL's 15 columns (`Table`, `Non_unique`, `Key_name`, `Seq_in_index`, `Column_name`, ...). `PRIMARY` first (synthesized from the table's primary key), then indexes in creation order |
+| `SHOW CREATE TABLE t` | `Table`, `Create Table` (`sqlite_master.sql`) |
 | `SELECT @@var, ...` (no `FROM`) | synthetic values, see below |
 | `pg_catalog.pg_tables` / `pg_class` | `sqlite_master` |
 | `pg_catalog.pg_attribute` | `pragma_table_info` |
 | `sys.tables` / `sysobjects`, `sp_tables` | `sqlite_master` |
 | `sys.columns` / `syscolumns`, `sp_columns t` | `pragma_table_info` |
 
-Table and schema names extracted from these queries are sanitized to
-`[A-Za-z0-9_.]` before being interpolated into emulation SQL
-(`sanitize_identifier`), closing the injection hole fixed in PR #12.
+**`LIKE` / `WHERE` filters are applied — or the statement fails.**
+Self-migrating applications guard each schema change with a probe such as
+`SHOW INDEX FROM t WHERE Key_name = 'x'` or `SHOW COLUMNS FROM t WHERE Field
+= 'x'` and alter the table only when the probe returns no rows. litewire
+once read only the table name and dropped the rest, so every probe returned
+rows (every table has a `PRIMARY` index) and those migrations never ran. The
+filter now goes through the normal MySQL translator (`LIKE` keeps MySQL's
+implicit `\` escape) and runs against the emulated rows. Name columns
+(`Field`, `Key_name`, `Column_name`, table names) compare
+case-insensitively, as MySQL's catalog does. Anything not implemented — a
+`SHOW` form not in the table (`SHOW VARIABLES`, `SHOW TABLE STATUS`, `SHOW
+WARNINGS`, ...), `SHOW INDEX ... LIKE`, `ORDER BY`/`LIMIT` after a filter,
+trailing tokens, a system schema (`FROM information_schema`, `mysql`, ...),
+an unknown column in the filter — is an error, never an unfiltered result.
+A `SHOW` on a table that does not exist returns no rows (MySQL errors with
+1146).
+
+**`information_schema`** is not pattern-matched. A reference to
+`information_schema.tables`, `.columns`, `.statistics` or `.schemata`
+anywhere in a statement (subqueries included) is replaced by a derived table
+with MySQL's column names, and the client's own projection, `WHERE`,
+`ORDER BY` and `LIMIT` run against it. Two adjustments make that faithful:
+
+* litewire serves one database under whatever name the client connected
+  with, which the translator never sees. A comparison of `table_schema` /
+  `schema_name` / `index_schema` against any non-system name (`'shop'`,
+  `DATABASE()`, a bound `?`) is therefore true, and against a system schema
+  (`'mysql'`, `'information_schema'`, ...) false. The reported schema name
+  is `main`, which is also what `DATABASE()` returns. A bound placeholder is
+  kept (`(? IS NULL OR 1)`) so the parameter count does not change.
+* A bare column in the projection is aliased as written, so
+  `SELECT row_format FROM information_schema.tables` yields a column named
+  `row_format` (PHP array keys are case-sensitive).
+
+Other `information_schema` tables (`routines`, `key_column_usage`, ...) are
+an error. `TABLES` reports `ENGINE = 'InnoDB'`, `ROW_FORMAT = 'Dynamic'`,
+`TABLE_COLLATION = 'utf8mb4_unicode_ci'` and zero sizes.
+
+Table names in the emulation SQL are always quoted SQLite string literals
+(`'a''b'`), never spliced: a quoted identifier such as `` `my-table` ``
+keeps its characters instead of being "sanitized" into another table's
+name. The PostgreSQL/T-SQL shortcuts still use `sanitize_identifier`.
 
 **System variables** (`system_variable_value`) return MySQL-plausible
 constants: `max_allowed_packet` 64 MiB, `wait_timeout`/`interactive_timeout`

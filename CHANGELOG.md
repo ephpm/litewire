@@ -120,6 +120,27 @@ the commit that merges this changelog.
 
 ### Fixed
 
+- `SHOW ... LIKE` / `SHOW ... WHERE` filters were silently dropped (ephpm
+  Sendy compatibility). Detection read only the table name, so
+  `SHOW INDEX FROM t WHERE Key_name = 'x'`, `SHOW COLUMNS FROM t WHERE
+  Field = 'x'` and `SHOW TABLES LIKE 'x'` returned every row; the probes
+  self-migrating applications use to decide whether to add an index or a
+  column always "found" it, and the migration never ran. The filter is now
+  translated and applied; unsupported `SHOW` forms, clauses and trailing
+  tokens are errors. `SHOW INDEX` now returns MySQL's columns (`Key_name`,
+  `Column_name`, `Non_unique`, `Seq_in_index`, ... with a synthesized
+  `PRIMARY`) instead of `PRAGMA index_list`'s; `SHOW COLUMNS` reports
+  `UNI`/`MUL` keys and `auto_increment`, and returns MySQL's six columns
+  unless `FULL` is given. `SHOW CREATE TABLE` gains the `Table` column.
+- `information_schema` queries ignored every predicate except one
+  `TABLE_SCHEMA`/`TABLE_NAME` literal and ignored the projection
+  (`SELECT 1 FROM information_schema.tables WHERE table_name = 'missing'`
+  returned every table). The `information_schema` table is now replaced by a
+  derived table inside the client's own statement, so its `WHERE`,
+  projection and `LIMIT` apply. `statistics` is newly emulated; other
+  `information_schema` tables are an error.
+- MySQL double-quoted string literals (`WHERE status != ""`) were emitted
+  double-quoted, which SQLite reads as an identifier first.
 - The Turso backend no longer runs engine work on tokio's async worker
   threads (#52). The engine's `async` API runs each step's page I/O and the
   commit `fsync` synchronously inside `poll`, yielding only between steps, so
