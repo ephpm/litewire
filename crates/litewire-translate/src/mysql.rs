@@ -17,6 +17,11 @@ use crate::common::{func_args, func_name, value_expr};
 
 /// Apply MySQL-specific rewrites to a statement in-place.
 pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
+    // Function rewrites build their replacement from MySQL text, so they
+    // run before the passes that turn MySQL syntax into SQLite syntax.
+    crate::mysql_compat::rewrite_functions(stmt)?;
+    crate::mysql_compat::rewrite_update_join(stmt)?;
+    crate::mysql_compat::rewrite_delete(stmt)?;
     strip_charset_introducers(stmt);
     double_quoted_strings_to_single(stmt);
     add_default_like_escape(stmt);
@@ -30,6 +35,13 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
         }
         Statement::Insert(insert) => {
             rewrite_insert_on_duplicate(insert);
+            // INSERT IGNORE: skip rows that violate a unique key. (MySQL also
+            // downgrades other errors, such as bad values, to warnings;
+            // SQLite's OR IGNORE covers constraint conflicts only.)
+            if insert.ignore {
+                insert.ignore = false;
+                insert.or = Some(sqlparser::ast::SqliteOnConflict::Ignore);
+            }
         }
         Statement::Query(query) => {
             rewrite_limit_clause(query);
@@ -724,30 +736,55 @@ fn drop_index(table: &sqlparser::ast::ObjectName, index: &str, if_exists: bool) 
     }
 }
 
-/// Expand MySQL DDL into the SQLite statements that implement it.
+/// One step of an expanded MySQL DDL statement.
+#[derive(Debug, Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "short-lived, one per expanded statement; boxing buys nothing"
+)]
+pub enum Expanded {
+    /// A SQLite statement.
+    Stmt(Statement),
+    /// A table rebuild for column changes SQLite cannot make in place.
+    Rebuild(crate::alter::ColumnRebuild),
+}
+
+/// Expand MySQL DDL into the SQLite statements that implement it, in order.
 ///
 /// * `CREATE TABLE` with inline `KEY` / `INDEX` / `UNIQUE KEY` definitions:
 ///   the table without them, then one `CREATE [UNIQUE] INDEX` per key
 ///   (`IF NOT EXISTS` when the table was `IF NOT EXISTS`). An unnamed key
 ///   gets MySQL's default name (first column, `_2`, ...). `FULLTEXT` /
 ///   `SPATIAL` keys have no SQLite analogue and are dropped.
-/// * `ALTER TABLE ... ADD {KEY|INDEX|UNIQUE} [name] (cols)`: one
-///   `CREATE [UNIQUE] INDEX` per key; `... DROP {INDEX|KEY} name`: one
-///   `DROP INDEX`. Other operations stay in a residual `ALTER TABLE`.
+/// * `ALTER TABLE` with several operations: one SQLite statement per
+///   operation (SQLite's ALTER takes one), in order. `ADD {KEY|INDEX|UNIQUE}
+///   [name] (cols)` becomes `CREATE [UNIQUE] INDEX`, `DROP {INDEX|KEY} name`
+///   becomes `DROP INDEX`, `ADD COLUMN ... {FIRST|AFTER c}` loses the
+///   position (SQLite appends; `SHOW COLUMNS` order then differs from
+///   MySQL's), and consecutive `MODIFY` / `CHANGE` / `ALTER COLUMN ...
+///   {SET|DROP} {DEFAULT|NOT NULL}` become one table rebuild
+///   ([`crate::alter`]).
 /// * `CREATE [UNIQUE] INDEX name ON t (...)` and `DROP INDEX name ON t`:
 ///   the index name becomes the SQLite name.
 ///
 /// Every index name goes through [`sqlite_index_name`].
-#[must_use]
-pub fn expand_ddl(stmt: Statement) -> Vec<Statement> {
-    match stmt {
-        Statement::CreateTable(create) => expand_create_table(create),
-        Statement::AlterTable { .. } => expand_alter_table(stmt),
+///
+/// # Errors
+///
+/// [`TranslateError::Unsupported`] for a column change with no rebuild
+/// mapping (`ALTER COLUMN ... SET DATA TYPE`).
+pub fn expand_ddl(stmt: Statement) -> Result<Vec<Expanded>, TranslateError> {
+    Ok(match stmt {
+        Statement::CreateTable(create) => expand_create_table(create)
+            .into_iter()
+            .map(Expanded::Stmt)
+            .collect(),
+        Statement::AlterTable { .. } => return expand_alter_table(stmt),
         Statement::CreateIndex(mut ci) => {
             if let Some(name) = &ci.name {
                 ci.name = Some(index_ident(&ci.table_name, &last_part(name)));
             }
-            vec![Statement::CreateIndex(ci)]
+            vec![Expanded::Stmt(Statement::CreateIndex(ci))]
         }
         Statement::Drop {
             object_type: sqlparser::ast::ObjectType::Index,
@@ -757,10 +794,10 @@ pub fn expand_ddl(stmt: Statement) -> Vec<Statement> {
             ..
         } => names
             .iter()
-            .map(|n| drop_index(&table, &last_part(n), if_exists))
+            .map(|n| Expanded::Stmt(drop_index(&table, &last_part(n), if_exists)))
             .collect(),
-        other => vec![other],
-    }
+        other => vec![Expanded::Stmt(other)],
+    })
 }
 
 fn expand_create_table(mut create: sqlparser::ast::CreateTable) -> Vec<Statement> {
@@ -805,10 +842,36 @@ fn expand_create_table(mut create: sqlparser::ast::CreateTable) -> Vec<Statement
     out
 }
 
+/// A `MODIFY` / `CHANGE` column definition as SQLite will store it.
+fn changed_column_def(
+    name: &sqlparser::ast::Ident,
+    data_type: &DataType,
+    options: &[sqlparser::ast::ColumnOption],
+) -> sqlparser::ast::ColumnDef {
+    let mut def = sqlparser::ast::ColumnDef {
+        name: name.clone(),
+        data_type: data_type.clone(),
+        options: options
+            .iter()
+            .map(|o| sqlparser::ast::ColumnOptionDef {
+                name: None,
+                option: o.clone(),
+            })
+            .collect(),
+    };
+    rewrite_column_def(&mut def);
+    def
+}
+
 /// See [`expand_ddl`].
-#[must_use]
-pub fn expand_alter_table(stmt: Statement) -> Vec<Statement> {
-    use sqlparser::ast::{AlterTableOperation, TableConstraint};
+///
+/// # Errors
+///
+/// As [`expand_ddl`].
+pub fn expand_alter_table(stmt: Statement) -> Result<Vec<Expanded>, TranslateError> {
+    use sqlparser::ast::{AlterColumnOperation, AlterTableOperation, TableConstraint};
+
+    use crate::alter::{ColumnChange, ColumnRebuild};
 
     let Statement::AlterTable {
         name,
@@ -820,14 +883,110 @@ pub fn expand_alter_table(stmt: Statement) -> Vec<Statement> {
         iceberg,
     } = stmt
     else {
-        return vec![stmt];
+        return Ok(vec![Expanded::Stmt(stmt)]);
     };
 
-    let mut indexes: Vec<Statement> = Vec::new();
-    let mut residual_ops: Vec<AlterTableOperation> = Vec::new();
+    let table = last_part(&name);
+    let mut out: Vec<Expanded> = Vec::new();
+    let mut pending: Vec<ColumnChange> = Vec::new();
+    let flush = |pending: &mut Vec<ColumnChange>, out: &mut Vec<Expanded>| {
+        if !pending.is_empty() {
+            out.push(Expanded::Rebuild(ColumnRebuild {
+                table: table.clone(),
+                changes: std::mem::take(pending),
+            }));
+        }
+    };
+
+    let move_to = |column: &sqlparser::ast::Ident,
+                   pos: Option<&sqlparser::ast::MySQLColumnPosition>| {
+        pos.map(|p| ColumnChange::Move {
+            column: column.value.clone(),
+            after: match p {
+                sqlparser::ast::MySQLColumnPosition::First => None,
+                sqlparser::ast::MySQLColumnPosition::After(a) => Some(a.value.clone()),
+            },
+        })
+    };
 
     for op in operations {
-        match &op {
+        let column_change = match &op {
+            AlterTableOperation::ModifyColumn {
+                col_name,
+                data_type,
+                options,
+                column_position,
+            } => {
+                pending.push(ColumnChange::Redefine {
+                    old: col_name.value.clone(),
+                    def: changed_column_def(col_name, data_type, options),
+                });
+                move_to(col_name, column_position.as_ref()).or_else(|| pending.pop())
+            }
+            AlterTableOperation::ChangeColumn {
+                old_name,
+                new_name,
+                data_type,
+                options,
+                column_position,
+            } => {
+                pending.push(ColumnChange::Redefine {
+                    old: old_name.value.clone(),
+                    def: changed_column_def(new_name, data_type, options),
+                });
+                move_to(new_name, column_position.as_ref()).or_else(|| pending.pop())
+            }
+            AlterTableOperation::AlterColumn { column_name, op } => Some(match op {
+                AlterColumnOperation::SetDefault { value } => ColumnChange::Default {
+                    column: column_name.value.clone(),
+                    value: Some(value.clone()),
+                },
+                AlterColumnOperation::DropDefault => ColumnChange::Default {
+                    column: column_name.value.clone(),
+                    value: None,
+                },
+                AlterColumnOperation::SetNotNull => ColumnChange::NotNull {
+                    column: column_name.value.clone(),
+                    not_null: true,
+                },
+                AlterColumnOperation::DropNotNull => ColumnChange::NotNull {
+                    column: column_name.value.clone(),
+                    not_null: false,
+                },
+                other => {
+                    return Err(TranslateError::Unsupported(format!(
+                        "ALTER TABLE ... ALTER COLUMN {column_name} {other}"
+                    )));
+                }
+            }),
+            _ => None,
+        };
+        if let Some(change) = column_change {
+            pending.push(change);
+            continue;
+        }
+        // Consecutive `ADD ... AFTER` columns share one rebuild: the adds run
+        // first, then every pending move at once.
+        let add_after_moves = matches!(op, AlterTableOperation::AddColumn { .. })
+            && pending
+                .iter()
+                .all(|c| matches!(c, ColumnChange::Move { .. }));
+        if !add_after_moves {
+            flush(&mut pending, &mut out);
+        }
+
+        let single = |op: AlterTableOperation| {
+            Expanded::Stmt(Statement::AlterTable {
+                name: name.clone(),
+                if_exists,
+                only,
+                operations: vec![op],
+                location: location.clone(),
+                on_cluster: on_cluster.clone(),
+                iceberg,
+            })
+        };
+        match op {
             AlterTableOperation::AddConstraint(TableConstraint::Unique {
                 name: cname,
                 index_name,
@@ -837,8 +996,10 @@ pub fn expand_alter_table(stmt: Statement) -> Vec<Statement> {
                 let idx = index_name
                     .as_ref()
                     .or(cname.as_ref())
-                    .map_or_else(|| default_index_name(columns, &[]), |i| i.value.clone());
-                indexes.push(create_index(&name, &idx, columns, true, false));
+                    .map_or_else(|| default_index_name(&columns, &[]), |i| i.value.clone());
+                out.push(Expanded::Stmt(create_index(
+                    &name, &idx, &columns, true, false,
+                )));
             }
             AlterTableOperation::AddConstraint(TableConstraint::Index {
                 name: iname,
@@ -847,32 +1008,40 @@ pub fn expand_alter_table(stmt: Statement) -> Vec<Statement> {
             }) => {
                 let idx = iname
                     .as_ref()
-                    .map_or_else(|| default_index_name(columns, &[]), |i| i.value.clone());
-                indexes.push(create_index(&name, &idx, columns, false, false));
+                    .map_or_else(|| default_index_name(&columns, &[]), |i| i.value.clone());
+                out.push(Expanded::Stmt(create_index(
+                    &name, &idx, &columns, false, false,
+                )));
             }
             AlterTableOperation::DropIndex { name: iname } => {
-                indexes.push(drop_index(&name, &iname.value, false));
+                out.push(Expanded::Stmt(drop_index(&name, &iname.value, false)));
             }
             // FULLTEXT/SPATIAL: no SQLite analogue — drop (perf-only).
             AlterTableOperation::AddConstraint(TableConstraint::FulltextOrSpatial { .. }) => {}
-            _ => residual_ops.push(op),
+            AlterTableOperation::AddColumn {
+                column_keyword,
+                if_not_exists,
+                column_def,
+                column_position,
+            } => {
+                // SQLite appends; a FIRST / AFTER position is applied by a
+                // rebuild right after the add.
+                if let Some(m) = move_to(&column_def.name, column_position.as_ref()) {
+                    pending.push(m);
+                }
+                out.push(single(AlterTableOperation::AddColumn {
+                    column_keyword,
+                    if_not_exists,
+                    column_def,
+                    column_position: None,
+                }));
+                continue;
+            }
+            other => out.push(single(other)),
         }
     }
-
-    let mut out = Vec::new();
-    if !residual_ops.is_empty() {
-        out.push(Statement::AlterTable {
-            name,
-            if_exists,
-            only,
-            operations: residual_ops,
-            location,
-            on_cluster,
-            iceberg,
-        });
-    }
-    out.extend(indexes);
-    out
+    flush(&mut pending, &mut out);
+    Ok(out)
 }
 
 // ── ON DUPLICATE KEY UPDATE -> ON CONFLICT DO UPDATE ─────────────────────────

@@ -36,6 +36,24 @@ the commit that merges this changelog.
 
 ### Added
 
+- The `ALTER TABLE` and DML forms self-migrating PHP applications use (ephpm
+  Sendy compatibility, found by replaying Sendy 7.1.6's updater against
+  MySQL 8.4 and litewire and diffing the schemas):
+  - `MODIFY` / `CHANGE` / `ALTER COLUMN ... DEFAULT|NOT NULL` and `ADD ...
+    FIRST|AFTER` via SQLite's table-rebuild procedure: a new
+    `TranslateResult::RebuildTable` plan that the session runs in one
+    transaction (`litewire_translate::alter`).
+  - Multi-operation `ALTER` split into one statement per operation;
+    parenthesized `ADD (a ..., b ...)`; `USING BTREE`.
+  - `INSERT IGNORE`; `UPDATE` / `DELETE ... LIMIT`; multi-table
+    `DELETE t1 FROM t t1 JOIN ...`; `UPDATE ... JOIN` (→ `UPDATE ... FROM`);
+    `UPDATE a, b SET ...` split per table.
+  - `||` / `&&` as logical operators (they were string concatenation, so
+    `SHOW COLUMNS ... WHERE Field = 'a' || Field = 'b'` matched nothing and
+    the migration re-added existing columns).
+  - `IF`, `FROM_UNIXTIME`, `DATE_SUB`/`DATE_ADD`/`INTERVAL` arithmetic,
+    `FIND_IN_SET`, `SUBSTRING_INDEX` (±1); `SHOW TABLE STATUS`.
+
 - MySQL dumps restore with their indexes (ephpm Sendy compatibility).
   Inline `KEY` / `INDEX` / `UNIQUE KEY` in `CREATE TABLE` (previously
   dropped, or reduced to an anonymous `UNIQUE (...)`) now become named
@@ -156,6 +174,11 @@ the commit that merges this changelog.
   permit (#16)
 
 ### Fixed
+
+- `UNIX_TIMESTAMP(x)` ignored its argument (always "now") and returned
+  text, which SQLite orders after every integer, so `WHERE col <
+  UNIX_TIMESTAMP()` matched every row. It now returns an integer for the
+  given time.
 
 - The DDL display-width and `SELECT`-hint pre-passes re-encoded every byte
   of multi-byte UTF-8 text separately, so `DEFAULT 'café'` (or a string in a

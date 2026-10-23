@@ -74,6 +74,7 @@ Answered with OK, never executed:
 | `SHOW [FULL] COLUMNS\|FIELDS {FROM\|IN} t [{FROM\|IN} db] [LIKE 'p' \| WHERE expr]`, `DESCRIBE t [col\|'p']`, `DESC t` | `Field`, `Type`, `Null`, `Key` (`PRI`/`UNI`/`MUL`), `Default`, `Extra` (`auto_increment` for an `INTEGER PRIMARY KEY`); `FULL` adds `Collation`, `Privileges`, `Comment`. Affinities map to `bigint`/`double`/`longtext`/`longblob` |
 | `SHOW {INDEX\|INDEXES\|KEYS} {FROM\|IN} t [{FROM\|IN} db] [WHERE expr]` | MySQL's 15 columns (`Table`, `Non_unique`, `Key_name`, `Seq_in_index`, `Column_name`, ...). `PRIMARY` first (synthesized from the table's primary key), then indexes in creation order |
 | `SHOW CREATE TABLE t` | `Table`, `Create Table` (`sqlite_master.sql`) |
+| `SHOW TABLE STATUS [FROM db] [LIKE 'p' \| WHERE expr]` | MySQL's 18 columns (`Name`, `Engine` = InnoDB, `Row_format` = Dynamic, `Collation` = utf8mb4_unicode_ci, ...); `Rows`, `Auto_increment` and the times are `NULL`, sizes 0 |
 | `SELECT @@var, ...` (no `FROM`) | synthetic values, see below |
 | `pg_catalog.pg_tables` / `pg_class` | `sqlite_master` |
 | `pg_catalog.pg_attribute` | `pragma_table_info` |
@@ -90,7 +91,7 @@ filter now goes through the normal MySQL translator (`LIKE` keeps MySQL's
 implicit `\` escape) and runs against the emulated rows. Name columns
 (`Field`, `Key_name`, `Column_name`, table names) compare
 case-insensitively, as MySQL's catalog does. Anything not implemented — a
-`SHOW` form not in the table (`SHOW VARIABLES`, `SHOW TABLE STATUS`, `SHOW
+`SHOW` form not in the table (`SHOW VARIABLES`, `SHOW
 WARNINGS`, ...), `SHOW INDEX ... LIKE`, `ORDER BY`/`LIMIT` after a filter,
 trailing tokens, a system schema (`FROM information_schema`, `mysql`, ...),
 an unknown column in the filter — is an error, never an unfiltered result.
@@ -206,6 +207,25 @@ byte, turning `'café'` in DDL or in a hinted `SELECT` into `'cafÃ©'`.
   always-on implicit escape. Without it, `wpdb::esc_like()`-style patterns
   (`'50\%'`) match the wrong rows on SQLite, which has *no* default escape
   character. An explicit `ESCAPE` clause in the input is preserved.
+* `||` / `&&` are logical `OR` / `AND`, as in MySQL without `PIPES_AS_CONCAT`.
+  They are rewritten before anything else reads the statement, `SHOW`
+  filters included. In SQLite `||` concatenates, so a probe like
+  `SHOW COLUMNS FROM t WHERE Field = 'a' || Field = 'b'` would otherwise
+  match nothing.
+* Function mappings (`mysql_compat.rs`):
+
+  | MySQL | SQLite | Notes |
+  |---|---|---|
+  | `IF(c, a, b)` | `iif(c, a, b)` | |
+  | `UNIX_TIMESTAMP()` / `UNIX_TIMESTAMP(d)` | `CAST(strftime('%s', 'now' \| d) AS INTEGER)` | An integer, like MySQL. The argument used to be ignored, and the result was text, which compares greater than every integer. |
+  | `FROM_UNIXTIME(t)` | `datetime(t, 'unixepoch')` | UTC. The two-argument (format) form is an error. |
+  | `DATE_SUB` / `DATE_ADD` / `SUBDATE` / `ADDDATE(d, INTERVAL n unit)`, `d ± INTERVAL n unit` | `datetime(d, '±n unit')` | Units: SECOND, MINUTE, HOUR, DAY, WEEK, MONTH, YEAR. Others are an error. |
+  | `FIND_IN_SET(x, s)` | `instr`/`replace` expression | Same 1-based position, 0 when absent, `NULL` on a `NULL` argument. |
+  | `SUBSTRING_INDEX(s, d, 1)` | `substr`/`instr` expression | |
+  | `SUBSTRING_INDEX(s, d, -1)` | `substr`/`rtrim` expression | One-character delimiter only. Other counts are an error. |
+
+  `NOW()` / `CURRENT_TIMESTAMP` and the date functions above use **UTC**.
+  MySQL uses the session `time_zone`, and `SET time_zone` is a no-op here.
 
 **DML:**
 
@@ -237,6 +257,22 @@ byte, turning `'café'` in DDL or in a hinted `SELECT` into `'cafÃ©'`.
   blocking until the first commits. The row cannot be claimed twice, but code
   must treat that write error as "someone else got it" and roll back, where
   MySQL would have made it wait.
+* `INSERT IGNORE` → `INSERT OR IGNORE`: rows that would violate a unique key
+  are skipped and not counted. MySQL's `IGNORE` also turns other errors
+  (bad values) into warnings; SQLite's covers constraint conflicts only.
+* `UPDATE ... [ORDER BY ...] LIMIT n` and `DELETE ... [ORDER BY ...] LIMIT n`
+  (SQLite takes no LIMIT on these) restrict the statement to
+  `rowid IN (SELECT rowid ... LIMIT n)`.
+* Multi-table `DELETE t1 FROM t AS t1 JOIN t AS t2 ON ... [WHERE ...]` (the
+  dedup idiom) → `DELETE FROM t WHERE rowid IN (SELECT t1.rowid FROM <the
+  join> ...)`. Deleting from several tables at once is an error.
+* `UPDATE a JOIN b ON c SET a.x = <expr> [WHERE w]` (including a join to a
+  derived table) → SQLite's `UPDATE a SET x = <expr> FROM b WHERE c AND w`.
+  `UPDATE a, b SET a.x = ..., b.y = ...` (assigning to several tables) becomes
+  one `UPDATE` per table over `rowid IN (SELECT ... FROM <the join>)`. That is
+  allowed only when every value reads its own table: MySQL evaluates all
+  assignments against the original joined row, so a cross-table value would
+  read already-updated data. Otherwise it is an error.
 
 **DDL:**
 
@@ -284,6 +320,34 @@ byte, turning `'café'` in DDL or in a hinted `SELECT` into `'cafÃ©'`.
     is reported under its first column's name, as MySQL names it.
 * Charset introducers are dropped: `_utf8mb4'x'` → `'x'`. `_binary 'abc'`
   → `X'616263'`, a BLOB.
+
+**`ALTER TABLE`** (`expand_ddl`, `alter.rs`, session):
+
+* Several operations in one statement become one SQLite statement each, in
+  order (SQLite's `ALTER` takes one operation).
+* `ADD (a INT, b TEXT)` (parenthesized) → `ADD COLUMN a INT, ADD COLUMN b
+  TEXT`. `USING BTREE|HASH` key clauses are dropped.
+* **Column changes SQLite cannot make in place are done by rebuilding the
+  table**, SQLite's documented procedure: `MODIFY [COLUMN] c <def>`,
+  `CHANGE [COLUMN] old new <def>`, `ALTER [COLUMN] c {SET DEFAULT x | DROP
+  DEFAULT | SET NOT NULL | DROP NOT NULL}`, and `ADD COLUMN ... {FIRST |
+  AFTER c}`. The column is appended first, then moved, so `SHOW COLUMNS` and
+  `SELECT *` order match MySQL. Translation returns a plan
+  (`TranslateResult::RebuildTable`), and the session reads the table's
+  `CREATE` statement, indexes and triggers from `sqlite_master`. It then runs
+  create-new → copy rows → drop old → rename → recreate indexes/triggers in
+  one transaction, or in a savepoint inside a client transaction.
+  * Rows are copied column by column. A type change therefore re-applies
+    SQLite affinity (`'07'` becomes `7` in an INTEGER column).
+  * The inline `PRIMARY KEY` of a redefined column is kept, because MySQL's
+    `MODIFY id INT AUTO_INCREMENT` does not drop the key. Table constraints,
+    indexes and triggers follow a renamed column.
+  * `NOT NULL` over existing `NULL`s fails the statement and leaves the table
+    unchanged, as MySQL's strict mode does.
+  * **Cost:** the whole table is copied, much as many MySQL `ALTER`s rebuild
+    the table. Views that name a renamed column are not rewritten.
+* `ALTER COLUMN ... SET DATA TYPE` is an error. `DROP COLUMN` / `RENAME
+  COLUMN` / `RENAME TO` run natively.
 
 ### Restoring a mysqldump
 

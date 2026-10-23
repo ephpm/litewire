@@ -3,6 +3,7 @@
 //! Translates MySQL, PostgreSQL, and T-SQL dialects to SQLite-compatible SQL
 //! using `sqlparser-rs` for parsing and AST manipulation.
 
+pub mod alter;
 pub mod cache;
 pub(crate) mod catalog;
 pub mod common;
@@ -10,6 +11,7 @@ pub mod emit;
 pub mod found_rows;
 pub mod metadata;
 pub mod mysql;
+pub(crate) mod mysql_compat;
 pub mod postgres;
 pub mod tds;
 pub mod user_locks;
@@ -83,6 +85,10 @@ pub enum TranslateResult {
     Noop,
     /// A metadata query that requires special handling.
     Metadata(metadata::MetadataQuery),
+    /// A MySQL column change SQLite cannot make in place (`MODIFY`,
+    /// `CHANGE`, `ALTER COLUMN ... DEFAULT`): the session rebuilds the
+    /// table (see [`alter`]).
+    RebuildTable(alter::ColumnRebuild),
 }
 
 /// Translate a SQL string from the given dialect to SQLite.
@@ -94,6 +100,20 @@ pub enum TranslateResult {
 /// Returns a [`TranslateError`] if the SQL cannot be parsed or contains
 /// unsupported constructs.
 pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, TranslateError> {
+    // MySQL `||` / `&&` are logical OR / AND; rewritten before anything else
+    // reads the text (SHOW filters included).
+    let owned_logical;
+    let sql = match (dialect == Dialect::MySQL)
+        .then(|| mysql_compat::logical_operators(sql))
+        .flatten()
+    {
+        Some(s) => {
+            owned_logical = s;
+            owned_logical.as_str()
+        }
+        None => sql,
+    };
+
     // Check for metadata queries first (before parsing -- some are not valid SQL).
     if let Some(meta) = metadata::detect_metadata_query(sql, dialect)? {
         return Ok(vec![TranslateResult::Metadata(meta)]);
@@ -146,10 +166,41 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
     let sql = if dialect == Dialect::MySQL && is_mysql_ddl(sql) {
         let stripped = strip_numeric_paren_groups(sql);
         let stripped = mysql::normalize_drop_key(&stripped).unwrap_or(stripped);
+        let stripped = mysql_compat::parenthesized_add_columns(&stripped).unwrap_or(stripped);
+        let stripped = mysql_compat::strip_index_type(&stripped).unwrap_or(stripped);
         owned_sql = mysql::strip_key_column_direction(&stripped).unwrap_or(stripped);
         owned_sql.as_str()
     } else {
         sql
+    };
+
+    // `UPDATE a, b SET` (comma join) only parses as a CROSS JOIN.
+    let owned_comma;
+    let sql = match (dialect == Dialect::MySQL)
+        .then(|| mysql_compat::comma_update_tables(sql))
+        .flatten()
+    {
+        Some(s) => {
+            owned_comma = s;
+            owned_comma.as_str()
+        }
+        None => sql,
+    };
+
+    // `UPDATE ... [ORDER BY ...] LIMIT n` does not parse; the tail is split
+    // off here and re-applied to the parsed statement below.
+    let update_limit = if dialect == Dialect::MySQL {
+        mysql_compat::split_update_limit(sql)
+    } else {
+        None
+    };
+    let owned_unlimited;
+    let sql = match &update_limit {
+        Some((head, _)) => {
+            owned_unlimited = head.clone();
+            owned_unlimited.as_str()
+        }
+        None => sql,
     };
 
     // MySQL SELECT hints (`SQL_CALC_FOUND_ROWS`, `SQL_NO_CACHE`, ...) are not
@@ -163,8 +214,29 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
         sql
     };
 
-    let statements = Parser::parse_sql(parser_dialect.as_ref(), sql)
+    let mut statements = Parser::parse_sql(parser_dialect.as_ref(), sql)
         .map_err(|e| TranslateError::Parse(e.to_string()))?;
+
+    if dialect == Dialect::MySQL {
+        if let Some((_, tail)) = &update_limit {
+            let [stmt] = statements.as_mut_slice() else {
+                return Err(TranslateError::Unsupported(
+                    "LIMIT on a multi-statement UPDATE".into(),
+                ));
+            };
+            mysql_compat::apply_update_limit(stmt, tail)?;
+        }
+        // `UPDATE a, b SET a.x = .., b.y = ..` updates two tables: one
+        // SQLite UPDATE per table.
+        let mut split = Vec::with_capacity(statements.len());
+        for stmt in statements {
+            match mysql_compat::split_multi_table_update(&stmt)? {
+                Some(parts) => split.extend(parts),
+                None => split.push(stmt),
+            }
+        }
+        statements = split;
+    }
 
     let check_catalog = catalog::mentions_information_schema(sql);
     let mut results = Vec::with_capacity(statements.len());
@@ -180,12 +252,19 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
         if dialect == Dialect::MySQL {
             // Inline/`ALTER TABLE ... ADD` keys expand to named CREATE INDEX
             // statements (SQLite has no ALTER ... ADD CONSTRAINT).
-            for expanded in mysql::expand_ddl(rewritten) {
-                let sqlite_sql = emit::emit_statement(&expanded);
-                results.push(TranslateResult::Sql(catalog::splice(
-                    sqlite_sql,
-                    &catalog_tables,
-                )));
+            for expanded in mysql::expand_ddl(rewritten)? {
+                match expanded {
+                    mysql::Expanded::Stmt(s) => {
+                        let sqlite_sql = emit::emit_statement(&s);
+                        results.push(TranslateResult::Sql(catalog::splice(
+                            sqlite_sql,
+                            &catalog_tables,
+                        )));
+                    }
+                    mysql::Expanded::Rebuild(plan) => {
+                        results.push(TranslateResult::RebuildTable(plan));
+                    }
+                }
             }
         } else {
             let sqlite_sql = emit::emit_statement(&rewritten);

@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use litewire_backend::user_lock::{UserLockOp, UserLockReply};
 use litewire_backend::{BackendConn, BackendError, Column, ResultSet, Value};
+use litewire_translate::alter::ColumnRebuild;
 use litewire_translate::metadata::{
     DEFAULT_SQL_MODE, SessionVars, SetSqlMode, SqlModeValue, detect_set_sql_mode,
 };
@@ -153,10 +154,12 @@ enum PreparedSpecial {
         mysql_sql: String,
         placeholder_count: usize,
     },
-    /// `SET [SESSION] sql_mode = ...`: changes session state, so it is
-    /// re-run through [`Session::query`] at execute time with the bound
-    /// parameters. `sqlite_sql` is empty (nothing to describe).
-    SetSqlMode {
+    /// A statement the session evaluates itself rather than as one SQLite
+    /// statement: `SET [SESSION] sql_mode = ...` (session state) or an
+    /// `ALTER TABLE` that needs a table rebuild. It is re-run through
+    /// [`Session::query`] at execute time with the bound parameters.
+    /// `sqlite_sql` is empty (nothing to describe).
+    Requery {
         mysql_sql: String,
         placeholder_count: usize,
     },
@@ -176,7 +179,7 @@ impl Prepared {
                 PreparedSpecial::UserLocks {
                     placeholder_count, ..
                 }
-                | PreparedSpecial::SetSqlMode {
+                | PreparedSpecial::Requery {
                     placeholder_count, ..
                 },
             ) => *placeholder_count,
@@ -371,6 +374,8 @@ impl Session {
                 let kind = classify(sql);
                 Ok((sql.clone(), kind))
             }
+            // Executed by the session (see `prepare`); nothing to describe.
+            TranslateResult::RebuildTable(_) => Ok((String::new(), StatementKind::Ddl)),
         }
     }
 
@@ -681,7 +686,7 @@ impl Session {
             return Ok(Prepared {
                 sqlite_sql: String::new(),
                 kind: StatementKind::Other,
-                special: Some(PreparedSpecial::SetSqlMode {
+                special: Some(PreparedSpecial::Requery {
                     mysql_sql: query.to_string(),
                     placeholder_count,
                 }),
@@ -699,6 +704,22 @@ impl Session {
             });
         }
 
+        // An ALTER that rebuilds a table runs through the session.
+        let translated = translate_cached(&self.cache, query, self.dialect)?;
+        if translated
+            .iter()
+            .any(|r| matches!(r, TranslateResult::RebuildTable(_)))
+        {
+            return Ok(Prepared {
+                sqlite_sql: String::new(),
+                kind: StatementKind::Ddl,
+                special: Some(PreparedSpecial::Requery {
+                    mysql_sql: query.to_string(),
+                    placeholder_count: litewire_translate::metadata::count_placeholders(query),
+                }),
+            });
+        }
+
         let (sqlite_sql, kind) = self.translate_sql(query)?;
         let special = calc_found_rows_count_sql(query, self.dialect)
             .map(|count_sql| PreparedSpecial::CalcFoundRows { count_sql });
@@ -707,6 +728,80 @@ impl Session {
             kind,
             special,
         })
+    }
+
+    /// Run a [`ColumnRebuild`]: read the table's definition and dependents
+    /// from `sqlite_master`, then create-copy-drop-rename inside one
+    /// transaction (a savepoint when the client already has one open, as
+    /// MySQL's implicit commit would otherwise end it).
+    async fn rebuild_table(&mut self, plan: &ColumnRebuild) -> Result<SessionResult, SessionError> {
+        let table = Value::Text(plan.table.clone());
+        let rs = self
+            .conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1 COLLATE NOCASE",
+                std::slice::from_ref(&table),
+            )
+            .await
+            .map_err(map_backend_err)?;
+        let Some(Value::Text(table_sql)) = rs.rows.first().and_then(|r| r.first()).cloned() else {
+            let mapped = error_map::classify(&format!("no such table: {}", plan.table));
+            return Err(SessionError::Db {
+                code: mapped.code,
+                sqlstate: mapped.sqlstate,
+                message: format!("Table '{}' doesn't exist", plan.table),
+            });
+        };
+        let deps = self
+            .conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type IN ('index', 'trigger') \
+                 AND tbl_name = ?1 COLLATE NOCASE AND sql IS NOT NULL ORDER BY rowid",
+                &[table],
+            )
+            .await
+            .map_err(map_backend_err)?;
+        let dependents: Vec<String> = deps
+            .rows
+            .iter()
+            .filter_map(|r| match r.first() {
+                Some(Value::Text(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        let stmts = plan.statements(&table_sql, &dependents)?;
+
+        let (open, commit, rollback) = if self.in_transaction {
+            (
+                "SAVEPOINT litewire_rebuild",
+                "RELEASE SAVEPOINT litewire_rebuild",
+                "ROLLBACK TO SAVEPOINT litewire_rebuild",
+            )
+        } else {
+            ("BEGIN", "COMMIT", "ROLLBACK")
+        };
+        self.conn
+            .execute(open, &[])
+            .await
+            .map_err(map_backend_err)?;
+        for s in &stmts {
+            if let Err(e) = self.conn.execute(s, &[]).await {
+                let _ = self.conn.execute(rollback, &[]).await;
+                if self.in_transaction {
+                    let _ = self
+                        .conn
+                        .execute("RELEASE SAVEPOINT litewire_rebuild", &[])
+                        .await;
+                }
+                return Err(map_backend_err(e));
+            }
+        }
+        self.conn
+            .execute(commit, &[])
+            .await
+            .map_err(map_backend_err)?;
+        tracing::debug!(table = %plan.table, statements = stmts.len(), "ALTER TABLE: table rebuilt");
+        Ok(SessionResult::Ok(self.ok(0, 0, false)))
     }
 
     /// Execute a [`Prepared`] statement.
@@ -735,7 +830,7 @@ impl Session {
             // depend on the parameters bound to *this* execution.
             Some(
                 PreparedSpecial::UserLocks { mysql_sql, .. }
-                | PreparedSpecial::SetSqlMode { mysql_sql, .. },
+                | PreparedSpecial::Requery { mysql_sql, .. },
             ) => {
                 let sql = mysql_sql.clone();
                 return self.query(&sql, params).await;
@@ -794,6 +889,7 @@ impl Session {
                 let sql = meta.to_sqlite_sql_with(&self.session_vars());
                 self.run_translated(&sql, StatementKind::Query, &[]).await
             }
+            TranslateResult::RebuildTable(plan) => self.rebuild_table(plan).await,
             TranslateResult::Sql(sql) => {
                 let kind = classify(sql);
                 match (
