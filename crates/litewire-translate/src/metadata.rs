@@ -64,8 +64,10 @@ pub enum MetadataQuery {
         /// Translated SQLite predicate over the result columns, if any.
         filter: Option<String>,
     },
-    /// `SELECT @@variable` queries — MySQL system variables.
-    SystemVariables { variables: Vec<String> },
+    /// `SELECT @@variable [[AS] alias], ... [LIMIT n]` — MySQL system
+    /// variables, answered with constants (and, for `sql_mode`, the
+    /// session's value; see [`SessionVars`]).
+    SystemVariables { variables: Vec<SystemVariable> },
     /// `SELECT ... FROM pg_catalog.pg_tables` or similar.
     PgCatalogTables,
     /// `SELECT ... FROM pg_catalog.pg_columns` or `pg_attribute` for a table.
@@ -75,6 +77,47 @@ pub enum MetadataQuery {
     /// `SELECT ... FROM sys.columns` (T-SQL) for a table.
     SysColumns { table: String },
 }
+
+/// One `@@variable` read in a [`MetadataQuery::SystemVariables`] query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemVariable {
+    /// Variable name as written, without `@@` and scope (`sql_mode`).
+    pub name: String,
+    /// `@@GLOBAL.x` (as opposed to `@@x`, `@@SESSION.x`, `@@LOCAL.x`).
+    pub global: bool,
+    /// The result column name: the select-list text as written
+    /// (`@@SESSION.sql_mode`), or the alias. MySQL names the column this
+    /// way and PHP reads it back by that key (`$row['@@sql_mode']`).
+    pub label: String,
+}
+
+/// Per-session values a metadata answer depends on.
+///
+/// Translation is stateless and cached; the session layer passes these in
+/// when it turns a [`MetadataQuery`] into SQL
+/// ([`MetadataQuery::to_sqlite_sql_with`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionVars<'a> {
+    /// The session `sql_mode`, as last set by `SET [SESSION] sql_mode = ...`
+    /// on this connection. `None` = never set: the server default,
+    /// [`DEFAULT_SQL_MODE`].
+    pub sql_mode: Option<&'a str>,
+}
+
+/// The `sql_mode` litewire reports by default (`@@GLOBAL.sql_mode`, and
+/// `@@sql_mode` until a session sets one): empty.
+///
+/// It is the closest honest answer. litewire enforces none of the modes in
+/// MySQL 8.4's default (`ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,
+/// NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,
+/// NO_ENGINE_SUBSTITUTION`): SQLite accepts bare columns next to an
+/// aggregate, stores out-of-range or ill-typed values instead of rejecting
+/// them, and returns `NULL` for division by zero. Reporting those modes
+/// would claim checks that do not happen. Applications that probe
+/// `@@sql_mode` to *remove* `ONLY_FULL_GROUP_BY` see it absent, which is
+/// accurate. A session `SET sql_mode = ...` is recorded and read back, but
+/// not enforced.
+pub const DEFAULT_SQL_MODE: &str = "";
 
 /// Alias of the derived table the `SHOW` emulations select from — and the
 /// placeholder table name a `SHOW` filter is translated against.
@@ -86,9 +129,18 @@ fn where_clause(filter: Option<&String>) -> String {
 }
 
 impl MetadataQuery {
-    /// Convert this metadata query to the SQLite SQL that produces equivalent results.
+    /// Convert this metadata query to the SQLite SQL that produces
+    /// equivalent results, for a session that has set nothing (see
+    /// [`MetadataQuery::to_sqlite_sql_with`]).
     #[must_use]
     pub fn to_sqlite_sql(&self) -> String {
+        self.to_sqlite_sql_with(&SessionVars::default())
+    }
+
+    /// Convert this metadata query to SQLite SQL, answering session-scoped
+    /// variables from `vars`.
+    #[must_use]
+    pub fn to_sqlite_sql_with(&self, vars: &SessionVars<'_>) -> String {
         match self {
             Self::ShowTables { full, filter } => {
                 let cols = if *full {
@@ -163,8 +215,17 @@ impl MetadataQuery {
                 let cols: Vec<String> = variables
                     .iter()
                     .map(|v| {
-                        let val = system_variable_value(v);
-                        format!("{val} AS `@@{v}`")
+                        let val = if v.name.eq_ignore_ascii_case("sql_mode") {
+                            let mode = if v.global {
+                                DEFAULT_SQL_MODE
+                            } else {
+                                vars.sql_mode.unwrap_or(DEFAULT_SQL_MODE)
+                            };
+                            sql_str(mode)
+                        } else {
+                            system_variable_value(&v.name).to_string()
+                        };
+                        format!("{val} AS \"{}\"", v.label.replace('"', "\"\""))
                     })
                     .collect();
                 format!("SELECT {}", cols.join(", "))
@@ -248,35 +309,11 @@ pub fn detect_metadata_query(
     }
 
     // SELECT @@variable queries (MySQL system variables).
-    if upper.starts_with("SELECT ") && trimmed.contains("@@") {
-        // Check that all projected columns are @@variables (no FROM clause).
-        let after_select = &trimmed["SELECT ".len()..];
-        if !upper.contains(" FROM ") {
-            let variables: Vec<String> = after_select
-                .split(',')
-                .filter_map(|part| {
-                    let part = part.trim();
-                    // Handle @@global.var, @@session.var, @@var
-                    if let Some(pos) = part.find("@@") {
-                        let var_part = &part[pos + 2..];
-                        let var_name = var_part
-                            .trim_start_matches("global.")
-                            .trim_start_matches("session.")
-                            .split(|c: char| !c.is_alphanumeric() && c != '_')
-                            .next()
-                            .unwrap_or("");
-                        if !var_name.is_empty() {
-                            return Some(var_name.to_string());
-                        }
-                    }
-                    None
-                })
-                .collect();
-
-            if !variables.is_empty() {
-                return Ok(Some(MetadataQuery::SystemVariables { variables }));
-            }
-        }
+    if upper.starts_with("SELECT")
+        && trimmed.contains("@@")
+        && let Some(variables) = parse_system_variable_select(trimmed)
+    {
+        return Ok(Some(MetadataQuery::SystemVariables { variables }));
     }
 
     // pg_catalog queries.
@@ -319,6 +356,279 @@ pub fn detect_metadata_query(
     }
 
     Ok(None)
+}
+
+// ── SELECT @@variable ───────────────────────────────────────────────────────
+
+/// Parse `SELECT @@[scope.]name [[AS] alias], ... [LIMIT n] [;]`.
+///
+/// `None` unless *every* select item is a bare system variable — a
+/// statement mixing in anything else (`SELECT @@version, NOW()`,
+/// `SELECT @@x + 1`, a `FROM`) goes to the parser instead of having the
+/// rest dropped. The trailing `LIMIT n` is accepted because the `mysql`
+/// command-line client sends `select @@version_comment limit 1` on connect.
+fn parse_system_variable_select(sql: &str) -> Option<Vec<SystemVariable>> {
+    let toks = lex(sql).ok()?;
+    let mut i = 0;
+    let word = |i: usize, w: &str| matches!(toks.get(i).map(|l| &l.tok), Some(Tok::Word(x)) if x.eq_ignore_ascii_case(w));
+    if !word(i, "SELECT") {
+        return None;
+    }
+    i += 1;
+    let mut out = Vec::new();
+    loop {
+        // `@@`
+        if !(matches!(toks.get(i).map(|l| &l.tok), Some(Tok::Other('@')))
+            && matches!(toks.get(i + 1).map(|l| &l.tok), Some(Tok::Other('@'))))
+        {
+            return None;
+        }
+        let start = toks[i].start;
+        i += 2;
+        let Some(Tok::Word(first)) = toks.get(i).map(|l| &l.tok) else {
+            return None;
+        };
+        let (name, global) = if matches!(toks.get(i + 1).map(|l| &l.tok), Some(Tok::Dot)) {
+            let scope = first.to_ascii_uppercase();
+            if !matches!(scope.as_str(), "GLOBAL" | "SESSION" | "LOCAL") {
+                return None;
+            }
+            let Some(Tok::Word(n)) = toks.get(i + 2).map(|l| &l.tok) else {
+                return None;
+            };
+            i += 3;
+            (n.clone(), scope == "GLOBAL")
+        } else {
+            i += 1;
+            (first.clone(), false)
+        };
+        let end = toks.get(i - 1).map_or(sql.len(), |l| {
+            l.start
+                + match &l.tok {
+                    Tok::Word(w) => w.len(),
+                    _ => 1,
+                }
+        });
+        let mut label = sql[start..end].to_string();
+        // Optional alias.
+        if word(i, "AS") {
+            i += 1;
+        }
+        match toks.get(i).map(|l| &l.tok) {
+            Some(Tok::Word(a)) if !a.eq_ignore_ascii_case("LIMIT") => {
+                label.clone_from(a);
+                i += 1;
+            }
+            Some(Tok::Quoted(a) | Tok::Str(a)) => {
+                label.clone_from(a);
+                i += 1;
+            }
+            _ => {}
+        }
+        out.push(SystemVariable {
+            name,
+            global,
+            label,
+        });
+        match toks.get(i).map(|l| &l.tok) {
+            Some(Tok::Other(',')) => i += 1,
+            _ => break,
+        }
+    }
+    // Optional `LIMIT n`, optional `;`, then the end.
+    if word(i, "LIMIT") {
+        if !matches!(toks.get(i + 1).map(|l| &l.tok), Some(Tok::Word(n)) if n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return None;
+        }
+        i += 2;
+    }
+    if matches!(toks.get(i).map(|l| &l.tok), Some(Tok::Semi)) {
+        i += 1;
+    }
+    (i == toks.len()).then_some(out)
+}
+
+// ── SET sql_mode ────────────────────────────────────────────────────────────
+
+/// The right-hand side of a `SET ... sql_mode = <value>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlModeValue {
+    /// A string literal, normalized like MySQL does for display: upper-case,
+    /// no spaces around the commas. (Combination modes such as
+    /// `TRADITIONAL` are not expanded.)
+    Literal(String),
+    /// `DEFAULT`: back to [`DEFAULT_SQL_MODE`].
+    Default,
+    /// Any other expression, as written — e.g.
+    /// `REPLACE(@@sql_mode, 'ONLY_FULL_GROUP_BY', '')` or a bound `?`. The
+    /// session evaluates it (see [`SetSqlMode::evaluation_sql`]).
+    Expression(String),
+}
+
+/// A detected `SET [SESSION|GLOBAL] sql_mode = ...`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetSqlMode {
+    /// `SET GLOBAL` / `SET PERSIST` / `@@GLOBAL.`: changes nothing a client
+    /// can observe on this connection (MySQL applies it to *new* sessions;
+    /// litewire's default never changes).
+    pub global: bool,
+    /// The value assigned.
+    pub value: SqlModeValue,
+}
+
+impl SetSqlMode {
+    /// For an [`SqlModeValue::Expression`]: a `SELECT` (in the MySQL
+    /// dialect, to be translated and run as usual) that evaluates it, with
+    /// every `@@[SESSION.|LOCAL.]sql_mode` replaced by `current` and
+    /// `@@GLOBAL.sql_mode` by the default. Bound `?` parameters stay in
+    /// place.
+    #[must_use]
+    pub fn evaluation_sql(&self, current: &str) -> Option<String> {
+        let SqlModeValue::Expression(expr) = &self.value else {
+            return None;
+        };
+        let toks = lex(expr).ok()?;
+        let mut out = String::from("SELECT ");
+        let mut last = 0;
+        let mut i = 0;
+        while i < toks.len() {
+            if let Some((end_tok, global)) = sql_mode_reference(&toks, i) {
+                let end = toks[end_tok].start + "sql_mode".len();
+                out.push_str(&expr[last..toks[i].start]);
+                out.push_str(&sql_str(if global { DEFAULT_SQL_MODE } else { current }));
+                last = end;
+                i = end_tok + 1;
+            } else {
+                i += 1;
+            }
+        }
+        out.push_str(&expr[last..]);
+        Some(out)
+    }
+}
+
+/// If tokens at `i` spell `@@[scope.]sql_mode`, the index of the
+/// `sql_mode` token and whether the scope is `GLOBAL`.
+fn sql_mode_reference(toks: &[Lexed], i: usize) -> Option<(usize, bool)> {
+    let tok = |k: usize| toks.get(k).map(|l| &l.tok);
+    if !(matches!(tok(i), Some(Tok::Other('@'))) && matches!(tok(i + 1), Some(Tok::Other('@')))) {
+        return None;
+    }
+    match (tok(i + 2), tok(i + 3), tok(i + 4)) {
+        (Some(Tok::Word(scope)), Some(Tok::Dot), Some(Tok::Word(name)))
+            if name.eq_ignore_ascii_case("sql_mode")
+                && ["GLOBAL", "SESSION", "LOCAL"]
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(scope)) =>
+        {
+            Some((i + 4, scope.eq_ignore_ascii_case("GLOBAL")))
+        }
+        (Some(Tok::Word(name)), _, _) if name.eq_ignore_ascii_case("sql_mode") => {
+            Some((i + 2, false))
+        }
+        _ => None,
+    }
+}
+
+/// Number of `?` placeholders in `sql`, outside quotes and comments.
+#[must_use]
+pub fn count_placeholders(sql: &str) -> usize {
+    lex(sql).map_or(0, |toks| {
+        toks.iter()
+            .filter(|l| matches!(l.tok, Tok::Other('?')))
+            .count()
+    })
+}
+
+/// Normalize a `sql_mode` literal the way MySQL displays it.
+fn normalize_sql_mode(s: &str) -> String {
+    s.split(',')
+        .map(|m| m.trim().to_ascii_uppercase())
+        .filter(|m| !m.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Detect `SET [SESSION|LOCAL|GLOBAL|PERSIST|PERSIST_ONLY]
+/// [@@[scope.]]sql_mode {=|:=} <value> [;]` — a single assignment.
+///
+/// `None` for anything else, including a `SET` that assigns several
+/// variables at once (those stay plain no-ops).
+#[must_use]
+pub fn detect_set_sql_mode(sql: &str) -> Option<SetSqlMode> {
+    let trimmed = sql.trim();
+    if trimmed.len() < 3 || !trimmed[..3].eq_ignore_ascii_case("SET") {
+        return None;
+    }
+    let toks = lex(trimmed).ok()?;
+    let tok = |k: usize| toks.get(k).map(|l| &l.tok);
+    let is_word =
+        |k: usize, w: &str| matches!(tok(k), Some(Tok::Word(x)) if x.eq_ignore_ascii_case(w));
+    if !is_word(0, "SET") {
+        return None;
+    }
+    let mut i = 1;
+    let mut global = false;
+    for scope in ["SESSION", "LOCAL", "GLOBAL", "PERSIST", "PERSIST_ONLY"] {
+        if is_word(i, scope) {
+            global = !matches!(scope, "SESSION" | "LOCAL");
+            i += 1;
+            break;
+        }
+    }
+    if let Some((end, g)) = sql_mode_reference(&toks, i) {
+        global |= g;
+        i = end + 1;
+    } else if is_word(i, "sql_mode") {
+        i += 1;
+    } else {
+        return None;
+    }
+    // `=` or `:=`
+    match (tok(i), tok(i + 1)) {
+        (Some(Tok::Other(':')), Some(Tok::Other('='))) => i += 2,
+        (Some(Tok::Other('=')), _) => i += 1,
+        _ => return None,
+    }
+    let value_start = toks.get(i)?.start;
+    // The value runs to the end (minus a trailing `;`); a top-level comma
+    // means several assignments.
+    let mut end_tok = toks.len();
+    if matches!(toks.last().map(|l| &l.tok), Some(Tok::Semi)) {
+        end_tok -= 1;
+    }
+    let mut depth = 0i32;
+    for l in &toks[i..end_tok] {
+        match l.tok {
+            Tok::Other('(') => depth += 1,
+            Tok::Other(')') => depth -= 1,
+            Tok::Other(',') if depth == 0 => return None,
+            Tok::Semi => return None,
+            _ => {}
+        }
+    }
+    let value_end = if end_tok < toks.len() {
+        toks[end_tok].start
+    } else {
+        trimmed.len()
+    };
+    let raw = trimmed[value_start..value_end].trim();
+    let value = match &toks[i..end_tok] {
+        [
+            Lexed {
+                tok: Tok::Str(s), ..
+            },
+        ] => SqlModeValue::Literal(normalize_sql_mode(s)),
+        [
+            Lexed {
+                tok: Tok::Word(w), ..
+            },
+        ] if w.eq_ignore_ascii_case("DEFAULT") => SqlModeValue::Default,
+        [] => return None,
+        _ => SqlModeValue::Expression(raw.to_string()),
+    };
+    Some(SetSqlMode { global, value })
 }
 
 // ── SHOW / DESCRIBE grammar ─────────────────────────────────────────────────
@@ -1264,62 +1574,84 @@ mod tests {
 
     // ── System variable detection (SELECT @@...) ────────────────────────────
 
+    fn vars(sql: &str) -> Vec<SystemVariable> {
+        match detect(sql) {
+            Some(MetadataQuery::SystemVariables { variables }) => variables,
+            other => panic!("expected SystemVariables for {sql}, got: {other:?}"),
+        }
+    }
+
+    fn sv(name: &str) -> SystemVariable {
+        SystemVariable {
+            name: name.into(),
+            global: false,
+            label: format!("@@{name}"),
+        }
+    }
+
     #[test]
     fn detect_single_system_variable() {
-        match detect("SELECT @@version") {
-            Some(MetadataQuery::SystemVariables { variables }) => {
-                assert_eq!(variables, vec!["version"]);
-            }
-            other => panic!("expected SystemVariables, got: {other:?}"),
-        }
+        assert_eq!(vars("SELECT @@version"), [sv("version")]);
     }
 
     #[test]
     fn detect_multiple_system_variables() {
-        match detect("SELECT @@version, @@max_allowed_packet, @@wait_timeout") {
-            Some(MetadataQuery::SystemVariables { variables }) => {
-                assert_eq!(variables.len(), 3);
-                assert!(variables.contains(&"version".to_string()));
-                assert!(variables.contains(&"max_allowed_packet".to_string()));
-                assert!(variables.contains(&"wait_timeout".to_string()));
-            }
-            other => panic!("expected SystemVariables, got: {other:?}"),
-        }
+        let v = vars("SELECT @@version, @@max_allowed_packet, @@wait_timeout");
+        assert_eq!(
+            v,
+            [sv("version"), sv("max_allowed_packet"), sv("wait_timeout")]
+        );
     }
 
     #[test]
-    fn detect_global_scoped_variable() {
-        match detect("SELECT @@global.max_connections") {
-            Some(MetadataQuery::SystemVariables { variables }) => {
-                assert_eq!(variables, vec!["max_connections"]);
-            }
-            other => panic!("expected SystemVariables, got: {other:?}"),
-        }
+    fn scoped_variables_keep_their_written_label() {
+        let v = vars("SELECT @@global.max_connections, @@SESSION.sql_mode, @@local.wait_timeout");
+        assert_eq!(v[0].name, "max_connections");
+        assert!(v[0].global);
+        assert_eq!(v[0].label, "@@global.max_connections");
+        assert_eq!(v[1].name, "sql_mode");
+        assert!(!v[1].global);
+        assert_eq!(v[1].label, "@@SESSION.sql_mode");
+        assert_eq!(v[2].name, "wait_timeout");
+        assert_eq!(v[2].label, "@@local.wait_timeout");
     }
 
     #[test]
-    fn detect_session_scoped_variable() {
-        match detect("SELECT @@session.wait_timeout") {
-            Some(MetadataQuery::SystemVariables { variables }) => {
-                assert_eq!(variables, vec!["wait_timeout"]);
-            }
-            other => panic!("expected SystemVariables, got: {other:?}"),
-        }
+    fn aliases_and_limit() {
+        let v = vars(
+            "SELECT @@session.auto_increment_increment AS auto_increment_increment, @@character_set_client cs",
+        );
+        assert_eq!(v[0].label, "auto_increment_increment");
+        assert_eq!(v[1].label, "cs");
+        // The mysql CLI's connect-time probe.
+        assert_eq!(vars("select @@version_comment limit 1").len(), 1);
+        assert_eq!(vars("SELECT @@sql_mode;"), [sv("sql_mode")]);
     }
 
     #[test]
-    fn select_with_from_not_system_variable() {
-        assert!(detect("SELECT @@version FROM dual").is_none());
+    fn mixed_select_lists_are_not_system_variable_queries() {
+        for sql in [
+            "SELECT @@version FROM dual",
+            "SELECT @@version, NOW()",
+            "SELECT @@version + 1",
+            "SELECT @@foo.bar",
+            "SELECT @@version LIMIT x",
+        ] {
+            assert!(
+                !matches!(detect(sql), Some(MetadataQuery::SystemVariables { .. })),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
     fn system_variables_sql() {
         let sql = MetadataQuery::SystemVariables {
-            variables: vec!["version".into(), "max_allowed_packet".into()],
+            variables: vec![sv("version"), sv("max_allowed_packet")],
         }
         .to_sqlite_sql();
-        assert!(sql.contains("@@version"), "got: {sql}");
-        assert!(sql.contains("@@max_allowed_packet"), "got: {sql}");
+        assert!(sql.contains("\"@@version\""), "got: {sql}");
+        assert!(sql.contains("\"@@max_allowed_packet\""), "got: {sql}");
         // Deliberate behaviour change (issue #21): was `8.0.0-litewire`,
         // which disagreed with the version the wire handshake advertises.
         assert!(sql.contains(crate::SERVER_VERSION), "got: {sql}");
@@ -1328,9 +1660,86 @@ mod tests {
     }
 
     #[test]
+    fn sql_mode_comes_from_the_session() {
+        let q = detect("SELECT @@sql_mode, @@SESSION.sql_mode, @@GLOBAL.sql_mode").unwrap();
+        let default = q.to_sqlite_sql();
+        assert_eq!(
+            default,
+            "SELECT '' AS \"@@sql_mode\", '' AS \"@@SESSION.sql_mode\", '' AS \"@@GLOBAL.sql_mode\""
+        );
+        let set = q.to_sqlite_sql_with(&SessionVars {
+            sql_mode: Some("STRICT_TRANS_TABLES,NO_ZERO_DATE"),
+        });
+        assert_eq!(
+            set,
+            "SELECT 'STRICT_TRANS_TABLES,NO_ZERO_DATE' AS \"@@sql_mode\", \
+             'STRICT_TRANS_TABLES,NO_ZERO_DATE' AS \"@@SESSION.sql_mode\", '' AS \"@@GLOBAL.sql_mode\""
+        );
+    }
+
+    #[test]
+    fn set_sql_mode_forms() {
+        let lit = |s: &str| SqlModeValue::Literal(s.into());
+        for (sql, global, value) in [
+            ("SET sql_mode = ''", false, lit("")),
+            ("SET SESSION sql_mode = 'a, b'", false, lit("A,B")),
+            ("set @@session.sql_mode='x';", false, lit("X")),
+            ("SET @@sql_mode := 'x'", false, lit("X")),
+            ("SET LOCAL sql_mode = 'x'", false, lit("X")),
+            ("SET GLOBAL sql_mode = 'x'", true, lit("X")),
+            ("SET @@GLOBAL.sql_mode = 'x'", true, lit("X")),
+            ("SET PERSIST sql_mode = 'x'", true, lit("X")),
+            ("SET sql_mode = DEFAULT", false, SqlModeValue::Default),
+            (
+                "SET sql_mode = (SELECT REPLACE(@@sql_mode, 'A', ''))",
+                false,
+                SqlModeValue::Expression("(SELECT REPLACE(@@sql_mode, 'A', ''))".into()),
+            ),
+            (
+                "SET sql_mode = ?",
+                false,
+                SqlModeValue::Expression("?".into()),
+            ),
+        ] {
+            assert_eq!(
+                detect_set_sql_mode(sql),
+                Some(SetSqlMode { global, value }),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_sql_mode_ignores_other_statements() {
+        for sql in [
+            "SET NAMES utf8mb4",
+            "SET sql_mode = 'a', NAMES utf8mb4",
+            "SET @sql_mode = 'x'",
+            "SET sql_mode",
+            "SELECT @@sql_mode",
+            "SET sql_mode_x = 'a'",
+        ] {
+            assert_eq!(detect_set_sql_mode(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn sql_mode_expression_substitutes_the_current_value() {
+        let set = detect_set_sql_mode(
+            "SET sql_mode = REPLACE(@@SESSION.sql_mode, 'X', @@GLOBAL.sql_mode)",
+        )
+        .unwrap();
+        assert_eq!(
+            set.evaluation_sql("X,Y").unwrap(),
+            "SELECT REPLACE('X,Y', 'X', '')"
+        );
+        assert_eq!(count_placeholders("CONCAT(?, '?', ?)"), 2);
+    }
+
+    #[test]
     fn unknown_system_variable_returns_null() {
         let sql = MetadataQuery::SystemVariables {
-            variables: vec!["nonexistent_var".into()],
+            variables: vec![sv("nonexistent_var")],
         }
         .to_sqlite_sql();
         assert!(sql.contains("NULL"), "got: {sql}");
@@ -1351,7 +1760,7 @@ mod tests {
         ];
         for (var, expected_fragment) in cases {
             let sql = MetadataQuery::SystemVariables {
-                variables: vec![var.into()],
+                variables: vec![sv(var)],
             }
             .to_sqlite_sql();
             assert!(

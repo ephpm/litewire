@@ -36,6 +36,18 @@ the commit that merges this changelog.
 
 ### Added
 
+- `sql_mode` is tracked per session: `SET [SESSION] sql_mode = ...` (literal,
+  `DEFAULT`, an expression over `@@sql_mode`, or a bound `?`) is recorded and
+  read back by `SELECT @@sql_mode`; `@@GLOBAL.sql_mode` stays `''`. Recorded,
+  not enforced (warning logged). `SELECT @@var` result columns are now named
+  as written (`@@SESSION.sql_mode`, or the alias) and `@@SESSION.x` /
+  `@@GLOBAL.x` resolve case-insensitively (previously `@@SESSION.sql_mode`
+  read the variable "SESSION" and returned `NULL`). A select list mixing
+  `@@vars` with anything else is no longer answered with only the variables.
+  The non-strict differences from MySQL (empty string in an INTEGER column,
+  bare `GROUP BY` columns) are documented and pinned by
+  `tests/mysql_sql_mode.rs`.
+
 - MySQL statement shapes PHP applications use that SQLite rejects (ephpm
   Sendy compatibility): `INSERT ... SELECT ... FROM DUAL WHERE NOT EXISTS`
   (`FROM DUAL` dropped; affected rows 0 when suppressed), index hints

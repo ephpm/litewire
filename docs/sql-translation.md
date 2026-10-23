@@ -46,7 +46,8 @@ these statements and reports it in the MySQL `SERVER_STATUS_IN_TRANS` flag.
 Answered with OK, never executed:
 
 * `SET NAMES ...`, `SET CHARACTER SET ...`
-* `SET time_zone = ...`, `SET sql_mode = ...`
+* `SET time_zone = ...`; `SET GLOBAL sql_mode = ...` (a session `SET sql_mode`
+  is recorded by the session, see "sql_mode" below)
 * `SET [SESSION|GLOBAL] <anything>` (e.g. `wait_timeout`), including the
   `@@session.` / `@@global.` / `@@` spellings
 * `SET [SESSION|GLOBAL] TRANSACTION ISOLATION LEVEL ...` (SQLite runs
@@ -126,10 +127,14 @@ name. The PostgreSQL/T-SQL shortcuts still use `sanitize_identifier`.
 constants: `max_allowed_packet` 64 MiB, `wait_timeout`/`interactive_timeout`
 28800, the `character_set_*`/`collation_*` family as utf8mb4,
 `version` = `8.0.36-litewire` (the same `SERVER_VERSION` constant the
-handshake and `SELECT VERSION()` use — issue #21), `sql_mode` empty,
+handshake and `SELECT VERSION()` use — issue #21), `sql_mode` (see below),
 `autocommit` 1, `transaction_isolation` `SERIALIZABLE`, `@@identity` →
 `last_insert_rowid()`, `@@rowcount` → `changes()`. Unknown variables return
-`NULL`.
+`NULL`. A query qualifies only when every select item is a bare
+`@@[GLOBAL.|SESSION.|LOCAL.]name [[AS] alias]` (optionally followed by
+`LIMIT n`); each result column is named as written (`@@SESSION.sql_mode`) or
+by its alias, as MySQL names it. A select list mixing in anything else goes
+to the parser instead of having the rest dropped.
 
 ## Shared expression rewrites (`src/common.rs`)
 
@@ -368,6 +373,72 @@ triples:
 | readonly database | 1290 `ER_OPTION_PREVENTS_STATEMENT` | HY000 |
 | untranslatable / unparseable SQL | 1064 `ER_PARSE_ERROR` | 42000 |
 | anything else | 1105 `ER_UNKNOWN_ERROR` (message forwarded verbatim) | HY000 |
+
+## `sql_mode` (`metadata.rs` + session)
+
+**Reporting.** `@@sql_mode` / `@@SESSION.sql_mode` is `''` until the
+connection runs `SET [SESSION|LOCAL] sql_mode = ...`, and from then on it is
+the value the connection set. Literals are normalized as MySQL displays them:
+upper-case, no spaces around commas. Combination modes such as `TRADITIONAL`
+are not expanded. `DEFAULT` resets the value. Any other value expression is
+evaluated with the current mode substituted for `@@sql_mode`, so the idiom
+`SET sql_mode = (SELECT REPLACE(@@sql_mode, 'ONLY_FULL_GROUP_BY', ''))`
+works. Bound parameters (`SET sql_mode = ?`) work too. `@@GLOBAL.sql_mode` is
+always `''`, and `SET GLOBAL|PERSIST sql_mode` changes nothing on the
+connection, as on MySQL.
+
+**Enforcement: none.** The mode is recorded so applications can read back
+what they set. litewire does not change behaviour by mode, and it logs a
+warning when a session sets a non-empty one. The default `''` was chosen
+because none of the modes in MySQL 8.4's default
+(`ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION`)
+is enforced:
+
+* **`ONLY_FULL_GROUP_BY`**: SQLite accepts bare columns next to `GROUP BY`,
+  as MySQL does without this mode. The value comes from one row of the
+  group. Both engines take it from the first row in scan order, so
+  `SELECT list, email FROM s GROUP BY list` returns the same row on every
+  run. But the row is the first *visited*, which depends on the plan (an
+  index can change it), just as MySQL calls it indeterminate. **With
+  `MIN()`/`MAX()` in the same select the engines differ.** The rusqlite
+  (SQLite) backend takes bare columns from the row holding the min/max (a
+  documented SQLite extension). Turso does not: it stays on the first row.
+  Don't rely on either. Verified on Turso 0.8.3 and on SQLite through
+  rusqlite (`crates/litewire/tests/mysql_sql_mode.rs` pins the parts that
+  are deterministic).
+* **`STRICT_TRANS_TABLES`**: litewire neither rejects nor coerces
+  ill-typed values. In particular an **empty string written to an INTEGER
+  column stays an empty string**. MySQL 8.4 strict rejects it (error 1366).
+  MySQL non-strict (`sql_mode = ''`, which many PHP apps set) stores `0`
+  with a warning. On litewire:
+
+  | Expression on a row with `n = ''` | MySQL non-strict (`n` is 0) | litewire |
+  |---|---|---|
+  | `typeof(n)` | n/a | `text` |
+  | `n = 0` | true | **false** |
+  | `n > 5` | false | **true** (text sorts after numbers) |
+  | `n + 1`, `SUM(n)` | 1, counts as 0 | 1, counts as 0 |
+  | `ORDER BY n` | among the zeros | **after every number** |
+  | `MAX(n)` | numeric | **`''`/text wins** |
+
+  `'12abc'` likewise stays text where MySQL non-strict stores 12 (`n + 1` is
+  13 on both). Whitespace-padded numbers (`' 7 '`) are converted by SQLite's
+  INTEGER affinity, as on MySQL.
+
+  **Decision: no coercion in litewire for now.** Translation is stateless
+  and does not know a column's declared type, so it cannot tell `''` bound
+  for an INTEGER column from `''` bound for a TEXT one. Coercing would take
+  a schema-aware session layer: cache `pragma_table_info` per table,
+  invalidate it on DDL, and wrap literals and bound parameters assigned to
+  INTEGER-affinity columns in `CAST(... AS INTEGER)`, which yields exactly
+  MySQL's non-strict values (`''` → 0, `'12abc'` → 12). That is tracked as
+  a follow-up. Applications that are clean under MySQL's strict default are
+  unaffected. Ones that write `''` into integer columns after
+  `SET sql_mode = ''` see the differences in the table above.
+* **`NO_ZERO_DATE` / `NO_ZERO_IN_DATE`**: dates are text, and any value is
+  stored.
+* **`ERROR_FOR_DIVISION_BY_ZERO`**: division by zero yields `NULL`, as in
+  MySQL with the mode off.
 
 ## What does not work
 
