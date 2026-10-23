@@ -25,6 +25,7 @@
 pub mod auth;
 pub mod conn_limit;
 pub mod tenant_screen;
+pub mod user_lock;
 
 #[cfg(feature = "rusqlite")]
 pub mod rusqlite_backend;
@@ -138,6 +139,33 @@ pub trait BackendConn: Send + Sync {
         let rs = self.query(&probe, &[]).await?;
         Ok(rs.columns)
     }
+
+    /// Perform a MySQL named-lock operation (`GET_LOCK()` and friends) on
+    /// behalf of this session. See [`user_lock`] for the semantics.
+    ///
+    /// The session layer calls this when a statement contains a lock
+    /// function; the lock must belong to **this connection's** lifetime so
+    /// that dropping the connection releases it. The default refuses with
+    /// [`user_lock::USER_LOCKS_UNSUPPORTED`]: only a connection that was
+    /// given a lock scope ([`user_lock::scoped_conn`],
+    /// [`user_lock::UserLockScoped`]), or one that forwards the operation to
+    /// the session that really holds the lock, may answer. Decorators that
+    /// wrap another connection must forward this method, or the connection
+    /// they wrap silently loses its locks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when locks are unavailable on this connection, or
+    /// when a forwarding backend cannot reach the holder.
+    async fn user_lock(
+        &self,
+        op: &user_lock::UserLockOp,
+    ) -> Result<user_lock::UserLockReply, BackendError> {
+        let _ = op;
+        Err(BackendError::Other(
+            user_lock::USER_LOCKS_UNSUPPORTED.to_string(),
+        ))
+    }
 }
 
 /// The core backend trait -- a factory for per-session [`BackendConn`] handles.
@@ -212,6 +240,7 @@ pub use async_trait::async_trait;
 pub use auth::{AuthOutcome, AuthRequest, ConnectionAuthenticator, SharedAuthenticator};
 pub use conn_limit::{ConnectionLimiter, ConnectionSlot};
 pub use tenant_screen::TenantScreened;
+pub use user_lock::{LockTimeout, UserLockOp, UserLockRegistry, UserLockReply, UserLockScoped};
 
 #[cfg(feature = "rusqlite")]
 pub use rusqlite_backend::Rusqlite;

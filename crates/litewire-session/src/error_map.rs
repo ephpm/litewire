@@ -26,6 +26,12 @@ pub const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
 pub const ER_OPTION_PREVENTS_STATEMENT: u16 = 1290;
 /// MySQL `ER_NO_REFERENCED_ROW_2` -- foreign key constraint failure.
 pub const ER_NO_REFERENCED_ROW_2: u16 = 1452;
+/// MySQL `ER_WRONG_ARGUMENTS` -- incorrect arguments to a function.
+pub const ER_WRONG_ARGUMENTS: u16 = 1210;
+/// MySQL `ER_USER_LOCK_WRONG_NAME` -- a `NULL` or empty named-lock name.
+pub const ER_USER_LOCK_WRONG_NAME: u16 = 3057;
+/// MySQL `ER_USER_LOCK_OVERLONG_NAME` -- a named-lock name over 64 characters.
+pub const ER_USER_LOCK_OVERLONG_NAME: u16 = 3938;
 
 /// The full MySQL error triple: numeric code + SQLSTATE + message.
 #[derive(Debug, Clone)]

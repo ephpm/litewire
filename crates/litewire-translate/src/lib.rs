@@ -11,6 +11,7 @@ pub mod metadata;
 pub mod mysql;
 pub mod postgres;
 pub mod tds;
+pub mod user_locks;
 
 pub use cache::TranslateCache;
 pub use found_rows::{calc_found_rows_count_sql, found_rows_select_column};

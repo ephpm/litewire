@@ -47,9 +47,65 @@ pub fn classify(err_msg: &str) -> MysqlError {
     }
 }
 
+/// The wire [`ErrorKind`] for a numeric MySQL code the session layer
+/// produced.
+///
+/// `opensrv-mysql` knows the codes up to 1885 and **panics** on any other in
+/// its `From<u16>`, so this never converts blindly: it maps exactly the codes
+/// [`litewire_session`] can emit. The named-lock name errors (3057 / 3938)
+/// post-date the wire crate's table and are reported as
+/// `ER_WRONG_ARGUMENTS` (1210, `HY000`) on the wire; embedders that read
+/// [`litewire_session::SessionError::code`] directly still see the real
+/// codes. Anything unrecognised is `ER_UNKNOWN_ERROR`, as before.
+#[must_use]
+pub fn wire_kind(code: u16) -> ErrorKind {
+    use litewire_session::error_map as codes;
+    match code {
+        codes::ER_DUP_ENTRY => ErrorKind::ER_DUP_ENTRY,
+        codes::ER_NO_SUCH_TABLE => ErrorKind::ER_NO_SUCH_TABLE,
+        codes::ER_LOCK_WAIT_TIMEOUT => ErrorKind::ER_LOCK_WAIT_TIMEOUT,
+        codes::ER_OPTION_PREVENTS_STATEMENT => ErrorKind::ER_OPTION_PREVENTS_STATEMENT,
+        codes::ER_NO_REFERENCED_ROW_2 => ErrorKind::ER_NO_REFERENCED_ROW_2,
+        codes::ER_WRONG_ARGUMENTS
+        | codes::ER_USER_LOCK_WRONG_NAME
+        | codes::ER_USER_LOCK_OVERLONG_NAME => ErrorKind::ER_WRONG_ARGUMENTS,
+        litewire_session::ER_PARSE_ERROR => ErrorKind::ER_PARSE_ERROR,
+        _ => ErrorKind::ER_UNKNOWN_ERROR,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every code the session classifier can produce has a wire kind with
+    /// the same number, and the post-1885 lock-name codes degrade to a known
+    /// kind instead of panicking inside `opensrv-mysql`.
+    #[test]
+    fn wire_kind_covers_every_session_code() {
+        use litewire_session::error_map as codes;
+        for code in [
+            codes::ER_DUP_ENTRY,
+            codes::ER_NO_SUCH_TABLE,
+            codes::ER_LOCK_WAIT_TIMEOUT,
+            codes::ER_OPTION_PREVENTS_STATEMENT,
+            codes::ER_NO_REFERENCED_ROW_2,
+            codes::ER_WRONG_ARGUMENTS,
+            codes::ER_UNKNOWN_ERROR,
+            litewire_session::ER_PARSE_ERROR,
+        ] {
+            assert_eq!(wire_kind(code) as u16, code);
+        }
+        assert!(matches!(
+            wire_kind(codes::ER_USER_LOCK_WRONG_NAME),
+            ErrorKind::ER_WRONG_ARGUMENTS
+        ));
+        assert!(matches!(
+            wire_kind(codes::ER_USER_LOCK_OVERLONG_NAME),
+            ErrorKind::ER_WRONG_ARGUMENTS
+        ));
+        assert!(matches!(wire_kind(9999), ErrorKind::ER_UNKNOWN_ERROR));
+    }
 
     #[test]
     fn unique_constraint_maps_to_1062() {

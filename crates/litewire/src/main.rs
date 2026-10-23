@@ -57,6 +57,12 @@ async fn main() -> anyhow::Result<()> {
     let backend = litewire::backend::Rusqlite::open(&cli.db)?;
     info!(db = %cli.db, "Opened SQLite database");
 
+    // One database, one lock namespace: MySQL named locks (`GET_LOCK()` and
+    // friends) are scoped to this process, and released when the connection
+    // that holds them ends.
+    let locks = litewire::backend::UserLockRegistry::new();
+    let backend = litewire::backend::UserLockScoped::new(std::sync::Arc::new(backend), &locks, "");
+
     let mut builder = litewire::LiteWire::new(backend);
 
     if !cli.no_mysql

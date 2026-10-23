@@ -213,10 +213,14 @@ VarBinary), and the SSL handshake is not implemented. Real SQL Server tools
 Anywhere you would normally point at MySQL/PG/SQL Server -- PHP PDO drivers,
 `mysql` / `psql` / `sqlcmd` CLIs, DBeaver, pgAdmin -- should work for standard
 CRUD workloads. `SQL_CALC_FOUND_ROWS` + `SELECT FOUND_ROWS()` (WordPress
-pagination) is emulated at the session layer. Anything that depends on
-server-side features SQLite doesn't have (stored procedures, `LOCK TABLES`
-isolation, row-level locking semantics, dollar-quoted PL/pgSQL bodies, etc.)
-will not.
+pagination) is emulated at the session layer, and so are MySQL's named locks
+— `GET_LOCK()`, `RELEASE_LOCK()`, `RELEASE_ALL_LOCKS()`, `IS_FREE_LOCK()`,
+`IS_USED_LOCK()` and `DO <expr>` — with MySQL's semantics (exclusive across
+connections, re-entrant, released when the holding connection ends however
+it ends), scoped per backend by `UserLockScoped` (see
+`docs/sql-translation.md`). Anything that depends on server-side features
+SQLite doesn't have (stored procedures, `LOCK TABLES` isolation, row-level
+locking semantics, dollar-quoted PL/pgSQL bodies, etc.) will not.
 
 ## Limitations
 

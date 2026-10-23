@@ -231,18 +231,26 @@ impl LiteWireHandler {
     /// report it on (the client has already been told `OK`), and the
     /// alternative — leaving the flag set — would retry the rollback before
     /// every subsequent statement.
+    ///
+    /// Named locks are released too: MySQL's `COM_RESET_CONNECTION` and
+    /// `COM_CHANGE_USER` both release the session's user-level locks, and a
+    /// pooled connection handed to a new borrower must not still hold the
+    /// previous borrower's job lock.
     async fn apply_pending_reset(&mut self) {
         if !self.reset_pending.swap(false, Ordering::Relaxed) {
             return;
         }
         self.stmts.clear();
-        if let Some(session) = self.session_mut()
-            && session.in_transaction
-        {
-            if let Err(e) = session.query("ROLLBACK", &[]).await {
-                warn!("MySQL: rollback during connection reset failed: {e}");
+        if let Some(session) = self.session_mut() {
+            if session.in_transaction {
+                if let Err(e) = session.query("ROLLBACK", &[]).await {
+                    warn!("MySQL: rollback during connection reset failed: {e}");
+                }
+                session.in_transaction = false;
             }
-            session.in_transaction = false;
+            if let Err(e) = session.release_user_locks().await {
+                warn!("MySQL: releasing named locks during connection reset failed: {e}");
+            }
         }
         debug!("MySQL connection state reset");
     }
@@ -421,16 +429,22 @@ async fn write_result_set<W: AsyncWrite + Send + Unpin>(
 
 /// Write a [`SessionError`] as a MySQL error packet.
 ///
-/// Backend errors go through [`error_map::classify`] exactly as before the
-/// Session extraction (the classified message is the one [`SessionError::Db`]
-/// carries, so the mapping is identical); translation errors become
-/// `ER_PARSE_ERROR` with the error's Display output.
+/// A backend error carries the code [`litewire_session::error_map::classify`]
+/// assigned it (and the message it shaped), so the wire packet uses that code
+/// directly via [`error_map::wire_kind`] rather than classifying the message
+/// a second time — which also lets the session report codes that are not
+/// derivable from message text (the named-lock name errors). Translation
+/// errors become `ER_PARSE_ERROR` with the error's Display output.
 async fn write_session_error<W: AsyncWrite + Send + Unpin>(
     results: QueryResultWriter<'_, W>,
     err: &SessionError,
 ) -> Result<(), std::io::Error> {
     match err {
-        SessionError::Db { message, .. } => write_backend_error(results, message).await,
+        SessionError::Db { code, message, .. } => {
+            results
+                .error(error_map::wire_kind(*code), message.as_bytes())
+                .await
+        }
         translate_err => {
             results
                 .error(
@@ -440,16 +454,6 @@ async fn write_session_error<W: AsyncWrite + Send + Unpin>(
                 .await
         }
     }
-}
-
-/// Convert a backend error string into a MySQL error packet with a specific
-/// error code + SQLSTATE (via [`crate::error_map::classify`]) and send it.
-async fn write_backend_error<W: AsyncWrite + Send + Unpin>(
-    results: QueryResultWriter<'_, W>,
-    err_msg: &str,
-) -> Result<(), std::io::Error> {
-    let mapped = error_map::classify(err_msg);
-    results.error(mapped.code, mapped.message.as_bytes()).await
 }
 
 /// Convert an opensrv-mysql parameter value to our backend Value type.
@@ -636,8 +640,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
             }
         };
 
-        // Count `?` placeholders in the translated SQL.
-        let param_count = prepared.sqlite_sql.chars().filter(|&c| c == '?').count();
+        // `?` placeholders the client must bind (the translated SQL's, except
+        // for a named-lock statement, whose own placeholders are consumed
+        // before translation — see `Prepared::param_count`).
+        let param_count = prepared.param_count();
 
         let params: Vec<Column> = (0..param_count)
             .map(|_| Column {
