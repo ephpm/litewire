@@ -250,15 +250,61 @@ byte, turning `'café'` in DDL or in a hinted `SELECT` into `'cafÃ©'`.
 * `AUTO_INCREMENT` column option removed (rowid aliasing via
   `INTEGER PRIMARY KEY` provides the behavior).
 * Table options stripped entirely: `ENGINE=...`, `DEFAULT CHARSET=...`,
-  `COLLATE=...`.
-* Inline `KEY name (cols)` and `FULLTEXT`/`SPATIAL` constraints dropped
-  (secondary indexes are a performance concern, not correctness);
-  `UNIQUE KEY name (cols)` normalized to bare `UNIQUE (cols)` (upserts
-  target these, so they must survive).
-* `ALTER TABLE ... ADD {KEY|INDEX|UNIQUE} name (cols)` expands into
-  standalone `CREATE [UNIQUE] INDEX` statements (`expand_alter_table`);
-  `ADD FULLTEXT/SPATIAL` is dropped; other ALTER operations remain in a
-  residual `ALTER TABLE`.
+  `COLLATE=...`, `AUTO_INCREMENT=n`, `ROW_FORMAT=...`, `COMMENT=...`.
+* Column options SQLite rejects are dropped: `CHARACTER SET x`, `COLLATE x`,
+  `COMMENT '...'`, `ON UPDATE CURRENT_TIMESTAMP`. Two of these are
+  **behaviour differences**. Text compares with SQLite's binary collation, so
+  equality, `UNIQUE` keys and `ORDER BY` are **case-sensitive**, where
+  MySQL's `_ci` collations (its default) are not (`LIKE` is
+  case-insensitive for ASCII on both). And a column declared `ON UPDATE
+  CURRENT_TIMESTAMP` is not refreshed automatically.
+* **Indexes keep their MySQL names, scoped to their table.** MySQL index
+  names are per table and SQLite's are per database, and dumps routinely
+  reuse a key name across tables. So index `k` on table `t` is created in
+  SQLite as `` `t__k` `` (`mysql::sqlite_index_name`). `SHOW INDEX`,
+  `information_schema.statistics` and `SHOW COLUMNS`' `Key` report the MySQL
+  name, and `DROP INDEX k ON t` / `ALTER TABLE t DROP {INDEX|KEY} k` drop
+  `t__k`. An index created under its bare name by an older litewire is
+  reported unchanged. Dropping it with MySQL syntax still works: on "no such
+  index" the session drops the one index of `t` named `k`.
+  * Inline `KEY [name] (cols)`, `INDEX ...` and `UNIQUE KEY [name] (cols)`
+    in `CREATE TABLE` become `CREATE [UNIQUE] INDEX` statements after the
+    table (`IF NOT EXISTS` when the table is `IF NOT EXISTS`, so an existing
+    table can gain an index MySQL would not have added). An unnamed key gets
+    MySQL's default name: its first column, then `_2`, `_3`. `FULLTEXT` /
+    `SPATIAL` keys have no SQLite analogue and are dropped. Index prefix
+    lengths (`name(20)`) are dropped, so the whole value is indexed.
+  * `ALTER TABLE ... ADD {KEY|INDEX|UNIQUE} [name] (cols)` expands the same
+    way; `DROP {INDEX|KEY} name` becomes `DROP INDEX`; other ALTER
+    operations remain in a residual `ALTER TABLE`.
+  * An inline `UNIQUE` column constraint keeps SQLite's automatic index and
+    is reported under its first column's name, as MySQL names it.
+* Charset introducers are dropped: `_utf8mb4'x'` → `'x'`. `_binary 'abc'`
+  → `X'616263'`, a BLOB.
+
+### Restoring a mysqldump
+
+A `mysqldump` from MySQL 8.4 restores statement by statement, through the
+`mysql` client or any MySQL driver. `crates/litewire/tests/mysql_dump_restore.rs`
+replays an unedited dump on both backends and checks schema, keys, data and
+key enforcement. What happens to each part of a dump:
+
+* `/*!NNNNN ... */` conditional comments (the `SET @OLD_...`, `SET NAMES`,
+  `SET TIME_ZONE`, `DISABLE KEYS` / `ENABLE KEYS` wrappers) are comments to
+  the parser and are skipped. **Views, triggers and routines that mysqldump
+  wraps in `/*!50001 ... */` / `/*!50003 ... */` are skipped too** and must
+  be recreated by hand.
+* `LOCK TABLES` / `UNLOCK TABLES` are no-ops, and `DROP TABLE IF EXISTS` runs.
+* `CREATE TABLE` translates as above: types to affinities, keys to named
+  indexes, MySQL-only options dropped.
+* Extended INSERTs of any size up to the reported `max_allowed_packet` (64 MiB)
+  are accepted; string escapes (`\'`, `\"`, `\`, `\n`, `\t`) are decoded as
+  MySQL does.
+* **Use `mysqldump --hex-blob`** when the dump has BLOB/BINARY data. Without
+  it, binary values are written as raw bytes inside string literals, the
+  statement is not valid UTF-8, and the MySQL frontend cannot accept it.
+  With `--hex-blob` they are `0x...` literals and restore byte-exact.
+* `AUTO_INCREMENT` continues after the highest restored id.
 
 ## `SQL_CALC_FOUND_ROWS` / `FOUND_ROWS()` (`src/found_rows.rs` + session)
 

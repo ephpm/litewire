@@ -160,15 +160,29 @@ pub(crate) fn column_rows(tables: Tables<'_>) -> String {
 /// PRIMARY KEY` has no index of its own in SQLite); the automatic index
 /// SQLite builds for any other primary key (`origin = 'pk'`) is therefore
 /// skipped so the key is not listed twice.
+///
+/// Index names are reported as MySQL knows them: the table prefix the
+/// translator adds (`subscribers__s_list`, see
+/// [`crate::mysql::sqlite_index_name`]) is removed, and SQLite's
+/// `sqlite_autoindex_*` for an inline `UNIQUE` column constraint is named
+/// after its first column, as MySQL names an unnamed key. Indexes created
+/// under their bare name by an older litewire show unchanged.
 pub(crate) fn index_rows(tables: Tables<'_>) -> String {
     let src = tables.source();
+    let index_name = "CASE \
+        WHEN il.origin = 'u' AND il.name LIKE 'sqlite\\_autoindex\\_%' ESCAPE '\\' \
+          THEN (SELECT x.name FROM pragma_index_info(il.name) AS x WHERE x.seqno = 0) \
+        WHEN length(il.name) > length(m.name) + 2 \
+          AND substr(il.name, 1, length(m.name) + 2) = m.name || '__' COLLATE NOCASE \
+          THEN substr(il.name, length(m.name) + 3) \
+        ELSE il.name END";
     format!(
         "SELECT m.name COLLATE NOCASE AS TABLE_NAME, 0 AS NON_UNIQUE, \
          'PRIMARY' COLLATE NOCASE AS INDEX_NAME, p.pk AS SEQ_IN_INDEX, \
          p.name COLLATE NOCASE AS COLUMN_NAME, '' AS NULLABLE, -1000000000 AS __ord \
          FROM {src} JOIN pragma_table_info(m.name) AS p WHERE p.pk > 0 \
          UNION ALL \
-         SELECT m.name, 1 - il.\"unique\", il.name, ii.seqno + 1, ii.name, \
+         SELECT m.name, 1 - il.\"unique\", {index_name}, ii.seqno + 1, ii.name, \
          CASE WHEN c.\"notnull\" = 1 OR c.pk > 0 THEN '' ELSE 'YES' END, -il.seq \
          FROM {src} JOIN pragma_index_list(m.name) AS il \
          JOIN pragma_index_info(il.name) AS ii \

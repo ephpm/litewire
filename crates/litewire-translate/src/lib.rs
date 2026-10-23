@@ -144,7 +144,8 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
     // touched. (`decimal(10,2)` is unaffected: it contains a comma.)
     let owned_sql;
     let sql = if dialect == Dialect::MySQL && is_mysql_ddl(sql) {
-        owned_sql = strip_numeric_paren_groups(sql);
+        let stripped = strip_numeric_paren_groups(sql);
+        owned_sql = mysql::normalize_drop_key(&stripped).unwrap_or(stripped);
         owned_sql.as_str()
     } else {
         sql
@@ -176,9 +177,9 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
         };
         let rewritten = rewrite_statement(stmt, dialect)?;
         if dialect == Dialect::MySQL {
-            // `ALTER TABLE ... ADD KEY/UNIQUE` expands to CREATE INDEX
+            // Inline/`ALTER TABLE ... ADD` keys expand to named CREATE INDEX
             // statements (SQLite has no ALTER ... ADD CONSTRAINT).
-            for expanded in mysql::expand_alter_table(rewritten) {
+            for expanded in mysql::expand_ddl(rewritten) {
                 let sqlite_sql = emit::emit_statement(&expanded);
                 results.push(TranslateResult::Sql(catalog::splice(
                     sqlite_sql,

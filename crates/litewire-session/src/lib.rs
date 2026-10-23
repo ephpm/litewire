@@ -796,9 +796,61 @@ impl Session {
             }
             TranslateResult::Sql(sql) => {
                 let kind = classify(sql);
-                self.run_translated(sql, kind, params).await
+                match (
+                    self.run_translated(sql, kind, params).await,
+                    dropped_index_name(sql),
+                ) {
+                    (Err(SessionError::Db { message, .. }), Some(mangled))
+                        if message.to_ascii_lowercase().contains("no such index") =>
+                    {
+                        self.drop_legacy_index(mangled, message).await
+                    }
+                    (other, _) => other,
+                }
             }
         }
+    }
+
+    /// Fallback for `DROP INDEX` of an index created before litewire scoped
+    /// MySQL index names to their table.
+    ///
+    /// MySQL DDL now names the SQLite index `<table>__<name>`, and
+    /// `DROP INDEX name ON t` drops `t__name`. An index an older litewire
+    /// created under the bare name `name` is then not found; when exactly
+    /// one index of table `t` is called `name` (the catalog row whose
+    /// `tbl_name || '__' || name` is the scoped name), that one is dropped
+    /// instead. Otherwise the original "no such index" error stands.
+    async fn drop_legacy_index(
+        &mut self,
+        mangled: &str,
+        message: String,
+    ) -> Result<SessionResult, SessionError> {
+        let not_found = || {
+            let mapped = error_map::classify(&message);
+            SessionError::Db {
+                code: mapped.code,
+                sqlstate: mapped.sqlstate,
+                message: message.clone(),
+            }
+        };
+        let lookup = self
+            .conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' \
+                 AND (tbl_name || '__' || name) = ?1 COLLATE NOCASE",
+                &[Value::Text(mangled.to_string())],
+            )
+            .await
+            .map_err(|_| not_found())?;
+        let [row] = lookup.rows.as_slice() else {
+            return Err(not_found());
+        };
+        let Some(Value::Text(legacy)) = row.first() else {
+            return Err(not_found());
+        };
+        let sql = format!("DROP INDEX \"{}\"", legacy.replace('"', "\"\""));
+        tracing::debug!(%mangled, %legacy, "DROP INDEX: dropping pre-scoping index name");
+        self.run_translated(&sql, StatementKind::Ddl, &[]).await
     }
 
     /// Build a [`SessionOk`] snapshot of the current transaction state.
@@ -816,6 +868,14 @@ impl Session {
 ///
 /// The classified message is the error's Display output, exactly what the
 /// MySQL wire frontend has always forwarded to clients.
+/// The scoped index name in a translator-emitted ``DROP INDEX `t__k` ``
+/// (see `litewire_translate::mysql::sqlite_index_name`), if `sql` is one.
+fn dropped_index_name(sql: &str) -> Option<&str> {
+    let name = sql.strip_prefix("DROP INDEX `")?.strip_suffix('`')?;
+    (name.contains(litewire_translate::mysql::INDEX_NAME_SEPARATOR) && !name.contains('`'))
+        .then_some(name)
+}
+
 fn map_backend_err(e: BackendError) -> SessionError {
     let mapped = error_map::classify(&e.to_string());
     SessionError::Db {
@@ -1118,8 +1178,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(names.contains(&"idx_a".to_string()), "got: {names:?}");
-        assert!(names.contains(&"idx_b".to_string()), "got: {names:?}");
+        // MySQL index names are scoped to their table (`<table>__<name>`).
+        assert!(
+            names.iter().any(|n| n.ends_with("__idx_a")),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("__idx_b")),
+            "got: {names:?}"
+        );
     }
 
     #[tokio::test]
