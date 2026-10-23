@@ -111,6 +111,24 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
     if is_noop(sql, dialect) {
         return Ok(vec![TranslateResult::Noop]);
     }
+    if dialect == Dialect::MySQL && mysql::is_table_option_only_alter(sql) {
+        tracing::debug!(sql = %sql.trim(), "ALTER TABLE <table options>: noop");
+        return Ok(vec![TranslateResult::Noop]);
+    }
+
+    // `SELECT ... LOCK IN SHARE MODE` (MySQL's legacy locking read) does not
+    // parse; drop it like `FOR SHARE` (see `mysql::QueryShape`).
+    let owned_unlocked;
+    let sql = match (dialect == Dialect::MySQL)
+        .then(|| mysql::strip_lock_in_share_mode(sql))
+        .flatten()
+    {
+        Some(s) => {
+            owned_unlocked = s;
+            owned_unlocked.as_str()
+        }
+        None => sql,
+    };
 
     let parser_dialect: Box<dyn sqlparser::dialect::Dialect> = match dialect {
         Dialect::MySQL => Box::new(MySqlDialect {}),
@@ -196,45 +214,66 @@ fn is_mysql_ddl(sql: &str) -> bool {
 /// Groups containing anything but digits (e.g. `decimal(10,2)`) are kept.
 fn strip_numeric_paren_groups(sql: &str) -> String {
     let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
+    let mut out: Vec<u8> = Vec::with_capacity(sql.len());
     let mut i = 0;
-    let mut quote: Option<u8> = None;
     while i < bytes.len() {
-        let c = bytes[i];
-        if let Some(q) = quote {
-            out.push(c as char);
-            if c == q {
-                quote = None;
-            }
-            i += 1;
+        if let Some(end) = quoted_span_end(bytes, i) {
+            out.extend_from_slice(&bytes[i..end]);
+            i = end;
             continue;
         }
-        match c {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(c);
-                out.push(c as char);
-                i += 1;
+        if bytes[i] == b'(' {
+            // Look ahead: digits then ')'.
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
             }
-            b'(' => {
-                // Look ahead: digits then ')'.
-                let mut j = i + 1;
-                while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j > i + 1 && j < bytes.len() && bytes[j] == b')' {
-                    i = j + 1; // skip the whole (NNN) group
-                } else {
-                    out.push('(');
-                    i += 1;
-                }
-            }
-            _ => {
-                out.push(c as char);
-                i += 1;
+            if j > i + 1 && j < bytes.len() && bytes[j] == b')' {
+                i = j + 1; // skip the whole (NNN) group
+                continue;
             }
         }
+        out.push(bytes[i]);
+        i += 1;
     }
-    out
+    bytes_to_string(out)
+}
+
+/// If a quoted string or identifier starts at `bytes[i]`, the index just
+/// past its closing quote (or the end of input when unterminated).
+///
+/// Handles MySQL's backslash escapes inside `'...'` and `"..."` (so `'it\'s'`
+/// does not end at the escaped quote) and doubled quotes (`'it''s'`, which
+/// simply reads as two adjacent spans). Backtick identifiers have no
+/// backslash escapes.
+fn quoted_span_end(bytes: &[u8], i: usize) -> Option<usize> {
+    let q = *bytes.get(i)?;
+    if !matches!(q, b'\'' | b'"' | b'`') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if c == b'\\' && q != b'`' {
+            j += 2;
+            continue;
+        }
+        if c == q {
+            return Some(j + 1);
+        }
+        j += 1;
+    }
+    Some(bytes.len())
+}
+
+/// Reassemble text from a byte buffer built by copying whole spans of a
+/// valid UTF-8 input and dropping only ASCII bytes, so it is valid UTF-8.
+///
+/// These pre-passes used to push each byte as a `char`, which re-encoded
+/// every byte of a multi-byte character separately: `'café'` in a DDL
+/// default or comment came out as `'cafÃ©'`.
+fn bytes_to_string(out: Vec<u8>) -> String {
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// MySQL-only SELECT hint keywords stripped before parsing.
@@ -257,50 +296,40 @@ fn has_mysql_select_hint(sql: &str) -> bool {
 /// Remove MySQL SELECT hint keywords outside string/identifier quotes.
 pub(crate) fn strip_mysql_select_hints(sql: &str) -> String {
     let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
+    let mut out: Vec<u8> = Vec::with_capacity(sql.len());
     let mut i = 0;
-    let mut quote: Option<u8> = None;
     while i < bytes.len() {
-        let c = bytes[i];
-        if let Some(q) = quote {
-            out.push(c as char);
-            if c == q {
-                quote = None;
-            }
-            i += 1;
+        if let Some(end) = quoted_span_end(bytes, i) {
+            out.extend_from_slice(&bytes[i..end]);
+            i = end;
             continue;
         }
-        match c {
-            b'\'' | b'"' | b'`' => {
-                quote = Some(c);
-                out.push(c as char);
+        let c = bytes[i];
+        if c.is_ascii_alphabetic() || c == b'_' {
+            // Read a whole word, compare against the hint list.
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
-                // Read a whole word, compare against the hint list.
-                let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            let word = &sql[start..i];
+            if MYSQL_SELECT_HINTS
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(word))
+            {
+                // Drop the hint and one following space (if any) so
+                // `SELECT SQL_NO_CACHE x` becomes `SELECT x`.
+                if i < bytes.len() && bytes[i] == b' ' {
                     i += 1;
                 }
-                let word = &sql[start..i];
-                let upper_word = word.to_ascii_uppercase();
-                if MYSQL_SELECT_HINTS.contains(&upper_word.as_str()) {
-                    // Drop the hint and one following space (if any) so
-                    // `SELECT SQL_NO_CACHE x` becomes `SELECT x`.
-                    if i < bytes.len() && bytes[i] == b' ' {
-                        i += 1;
-                    }
-                } else {
-                    out.push_str(word);
-                }
+            } else {
+                out.extend_from_slice(word.as_bytes());
             }
-            _ => {
-                out.push(c as char);
-                i += 1;
-            }
+            continue;
         }
+        out.push(c);
+        i += 1;
     }
-    out
+    bytes_to_string(out)
 }
 
 /// Translate a SQL string, using a bounded LRU cache in front of the

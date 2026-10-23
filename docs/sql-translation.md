@@ -165,9 +165,28 @@ Applied for every dialect:
 * SELECT hints are stripped: `SQL_CALC_FOUND_ROWS` (see below),
   `SQL_NO_CACHE`, `SQL_CACHE`, `SQL_SMALL_RESULT`, `SQL_BIG_RESULT`,
   `SQL_BUFFER_RESULT`.
+* `LOCK IN SHARE MODE` is removed (sqlparser cannot parse it; see locking
+  reads below).
+* `ALTER TABLE t <table options>` alone (`ENGINE`, `ROW_FORMAT`,
+  `[DEFAULT] CHARSET|CHARACTER SET`, `COLLATE`, `AUTO_INCREMENT`, `COMMENT`,
+  `CONVERT TO CHARACTER SET ...`, `ENABLE|DISABLE KEYS`, `FORCE`, the storage
+  tuning options, `ALGORITHM=`/`LOCK=`) is a no-op: OK, nothing executed.
+  Storage format, engine and character set (always UTF-8) are fixed in
+  SQLite. `AUTO_INCREMENT=n` does not move the next id (still
+  `max(rowid) + 1`). Mixed with a real change (`ADD COLUMN ...`) the
+  statement is not matched and goes to the parser.
+
+The pre-passes copy multi-byte UTF-8 text through unchanged and honour
+MySQL's backslash escapes inside strings. An earlier version re-encoded each
+byte, turning `'café'` in DDL or in a hinted `SELECT` into `'cafÃ©'`.
 
 **Expressions:**
 
+* `"double-quoted"` literals are strings in MySQL (no `ANSI_QUOTES`), so they
+  are emitted single-quoted. SQLite reads `"x"` as an identifier first.
+* `LEAST(a, b, ...)` / `GREATEST(...)` → multi-argument `min()` / `max()`
+  (`NULL` if any argument is `NULL`, as in MySQL); `CHAR_LENGTH` /
+  `CHARACTER_LENGTH` → `length` (characters).
 * `YEAR(x)` / `MONTH(x)` / `DAYOFMONTH(x)` / `DAY(x)` →
   `CAST(strftime('%Y'|'%m'|'%d', x) AS INTEGER)`. The cast matters: MySQL
   returns integers and `'03' = 3` is false in SQLite. Deliberately absent:
@@ -193,6 +212,26 @@ Applied for every dialect:
   dropped them).
 * `UPDATE t SET t.col = ...` → table qualifier stripped from the assignment
   target (Laravel qualifies `updated_at`).
+* `... FROM DUAL` → the `FROM` is dropped (SQLite accepts `SELECT ... WHERE`
+  without one). So `INSERT ... SELECT ... FROM DUAL WHERE NOT EXISTS (...)`
+  ("insert unless present") works and reports 1 affected row when it inserts
+  and 0 when the guard suppresses it. A quoted or aliased `dual` is a user
+  table and is kept.
+* Index hints (`FORCE|USE|IGNORE {INDEX|KEY} [FOR JOIN|ORDER BY|GROUP BY]
+  (...)`) are removed and SQLite's planner chooses. They are never mapped to
+  `INDEXED BY`, which fails when the index does not exist.
+* `LIMIT n` with `n` ≥ 2^63 becomes `LIMIT -1` (SQLite's "no limit"). That
+  covers MySQL's documented "no limit" value `18446744073709551615` in both
+  spellings: `LIMIT 18446744073709551615 OFFSET m` and
+  `LIMIT m, 18446744073709551615`.
+* Locking reads (`FOR UPDATE`, `FOR SHARE`, `LOCK IN SHARE MODE`, `NOWAIT`,
+  `SKIP LOCKED`) are removed and the rows returned. **Semantics differ**:
+  SQLite has a single writer and no row locks. Inside `BEGIN` a locking read
+  takes no lock, so two transactions can both read ("claim") the same row.
+  The second to *write* then fails with a busy/snapshot error instead of
+  blocking until the first commits. The row cannot be claimed twice, but code
+  must treat that write error as "someone else got it" and roll back, where
+  MySQL would have made it wait.
 
 **DDL:**
 
@@ -344,8 +383,8 @@ triples:
   as-is if they parse, where SQLite rejects unknown functions at prepare
   time; there is no silent substitution.
 * **Dollar-quoted PL/pgSQL bodies**, PG server-side features — fail to parse.
-* **`SELECT ... FOR UPDATE` row locking semantics** — SQLite's locking model
-  applies, not MySQL's.
+* **`SELECT ... FOR UPDATE` row locking semantics**: accepted and stripped.
+  SQLite's single-writer model applies, not MySQL's row locks (see above).
 
 The wire-level test suites (`crates/litewire/tests/`) pin the constructs that
 matter to WordPress and Laravel: CRUD, prepared statements, transactions,

@@ -36,6 +36,16 @@ the commit that merges this changelog.
 
 ### Added
 
+- MySQL statement shapes PHP applications use that SQLite rejects (ephpm
+  Sendy compatibility): `INSERT ... SELECT ... FROM DUAL WHERE NOT EXISTS`
+  (`FROM DUAL` dropped; affected rows 0 when suppressed), index hints
+  (`FORCE|USE|IGNORE INDEX`, removed), locking reads (`FOR UPDATE`,
+  `FOR SHARE`, `LOCK IN SHARE MODE`, removed; SQLite's single-writer
+  semantics documented), `LIMIT 18446744073709551615` (→ `LIMIT -1`),
+  table-option-only `ALTER TABLE` (`ROW_FORMAT`, `ENGINE`, `CHARSET`,
+  `CONVERT TO CHARACTER SET`, `ENABLE/DISABLE KEYS`, ...: no-op), and
+  `LEAST`/`GREATEST`/`CHAR_LENGTH` (→ `min`/`max`/`length`).
+
 - MySQL named locks — `GET_LOCK()`, `RELEASE_LOCK()`, `RELEASE_ALL_LOCKS()`,
   `IS_FREE_LOCK()`, `IS_USED_LOCK()` — and the `DO <expr>` statement, with
   MySQL 8 semantics: exclusive across connections, re-entrant within one
@@ -119,6 +129,11 @@ the commit that merges this changelog.
   permit (#16)
 
 ### Fixed
+
+- The DDL display-width and `SELECT`-hint pre-passes re-encoded every byte
+  of multi-byte UTF-8 text separately, so `DEFAULT 'café'` (or a string in a
+  `SELECT SQL_NO_CACHE ...`) was stored as `'cafÃ©'`. They also ended a
+  string at a backslash-escaped quote (`'it\'s'`). Both fixed.
 
 - `SHOW ... LIKE` / `SHOW ... WHERE` filters were silently dropped (ephpm
   Sendy compatibility). Detection read only the table name, so

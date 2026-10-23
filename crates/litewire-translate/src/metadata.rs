@@ -325,7 +325,7 @@ pub fn detect_metadata_query(
 
 /// One lexical token of a `SHOW` / `DESCRIBE` prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Tok {
+pub(crate) enum Tok {
     /// Bare word (keyword or unquoted identifier), as written.
     Word(String),
     /// Backtick- or double-quoted identifier, unescaped.
@@ -341,14 +341,14 @@ enum Tok {
 }
 
 /// A token and the byte offset where it starts in the statement.
-struct Lexed {
-    tok: Tok,
-    start: usize,
+pub(crate) struct Lexed {
+    pub(crate) tok: Tok,
+    pub(crate) start: usize,
 }
 
 /// Quote-aware lexer for the `SHOW` / `DESCRIBE` prefix. Skips whitespace
 /// and comments. Fails on an unterminated quote.
-fn lex(sql: &str) -> Result<Vec<Lexed>, TranslateError> {
+pub(crate) fn lex(sql: &str) -> Result<Vec<Lexed>, TranslateError> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;

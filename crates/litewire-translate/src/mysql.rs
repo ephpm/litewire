@@ -20,7 +20,9 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
     double_quoted_strings_to_single(stmt);
     add_default_like_escape(stmt);
     rewrite_date_part_functions(stmt);
+    rewrite_scalar_function_names(stmt);
     normalize_regexp(stmt);
+    let _ = sqlparser::ast::VisitMut::visit(stmt, &mut QueryShape);
     match stmt {
         Statement::CreateTable(create) => {
             rewrite_create_table(create);
@@ -37,6 +39,273 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
         _ => {}
     }
     Ok(())
+}
+
+// ── Query shape: FROM DUAL, index hints, locking reads, "no limit" ──────────
+
+/// MySQL's "no upper bound" `LIMIT` value (2^64 - 1), which its manual
+/// recommends for "all rows from an offset on": `LIMIT 18446744073709551615
+/// OFFSET 20`. Any literal at or above 2^63 overflows SQLite's signed
+/// 64-bit `LIMIT` and is mapped to SQLite's own "no limit", `-1`.
+const SQLITE_MAX_LIMIT: u128 = i64::MAX as u128;
+
+/// Query-level rewrites that drop MySQL-only syntax SQLite has no use for.
+///
+/// * `FROM DUAL` — MySQL's dummy table, used for `INSERT ... SELECT ...
+///   FROM DUAL WHERE NOT EXISTS (...)` ("insert unless present"). SQLite
+///   accepts `SELECT ... WHERE ...` without a `FROM`, which is the same
+///   query; the row is inserted only when the `WHERE` holds, and the
+///   affected-row count is 0 when it does not.
+/// * Index hints (`FORCE INDEX (i)`, `USE INDEX`, `IGNORE INDEX`, `... KEY`,
+///   `FOR JOIN/ORDER BY/GROUP BY`) — removed, and SQLite's planner picks the
+///   index. Mapping `FORCE INDEX` to `INDEXED BY` would make the statement
+///   fail whenever the index is missing (and MySQL index names are not
+///   SQLite index names), so a hint is never an error.
+/// * Locking reads (`FOR UPDATE`, `FOR SHARE`, `NOWAIT`, `SKIP LOCKED`; the
+///   older `LOCK IN SHARE MODE` is removed before parsing) — removed; the
+///   rows are returned. SQLite has one writer at a time and no row locks:
+///   inside `BEGIN` a read takes no write lock, so two transactions can both
+///   "claim" a row, and the second to write fails with a busy/snapshot error
+///   instead of waiting for the first. Correct-but-loud, never silently
+///   double-applied — but not MySQL's blocking behaviour.
+/// * `LIMIT 18446744073709551615` (and any limit >= 2^63) — `LIMIT -1`.
+struct QueryShape;
+
+impl QueryShape {
+    fn is_dual(from: &[sqlparser::ast::TableWithJoins]) -> bool {
+        use sqlparser::ast::TableFactor;
+        let [only] = from else { return false };
+        if !only.joins.is_empty() {
+            return false;
+        }
+        matches!(&only.relation, TableFactor::Table { name, alias: None, args: None, .. }
+            if name.0.len() == 1
+                && name.0[0].as_ident().is_some_and(|i| i.quote_style.is_none() && i.value.eq_ignore_ascii_case("dual")))
+    }
+
+    fn drop_dual(body: &mut sqlparser::ast::SetExpr) {
+        use sqlparser::ast::SetExpr;
+        match body {
+            SetExpr::Select(select) if Self::is_dual(&select.from) => select.from.clear(),
+            SetExpr::SetOperation { left, right, .. } => {
+                Self::drop_dual(left);
+                Self::drop_dual(right);
+            }
+            _ => {}
+        }
+    }
+
+    fn unbounded(expr: &mut Expr) {
+        if let Expr::Value(v) = expr
+            && let Value::Number(n, _) = &v.value
+            && n.parse::<u128>().is_ok_and(|n| n > SQLITE_MAX_LIMIT)
+        {
+            v.value = Value::Number("-1".into(), false);
+        }
+    }
+}
+
+impl sqlparser::ast::VisitorMut for QueryShape {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut sqlparser::ast::Query) -> ControlFlow<()> {
+        Self::drop_dual(&mut query.body);
+        query.locks.clear();
+        match &mut query.limit_clause {
+            Some(LimitClause::LimitOffset {
+                limit: Some(limit), ..
+            }) => Self::unbounded(limit),
+            Some(LimitClause::OffsetCommaLimit { limit, .. }) => Self::unbounded(limit),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(
+        &mut self,
+        table_factor: &mut sqlparser::ast::TableFactor,
+    ) -> ControlFlow<()> {
+        if let sqlparser::ast::TableFactor::Table { index_hints, .. } = table_factor {
+            index_hints.clear();
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+// ── Text-level pre-passes (before sqlparser) ─────────────────────────────────
+
+/// Remove MySQL's legacy `LOCK IN SHARE MODE` locking-read clause, which
+/// sqlparser cannot parse. Returns `None` when the statement has none.
+/// Quote- and comment-aware (works on the lexer's tokens, so the words
+/// inside a string literal are never touched). See [`QueryShape`] for what
+/// dropping a locking read means on SQLite.
+pub(crate) fn strip_lock_in_share_mode(sql: &str) -> Option<String> {
+    use crate::metadata::{Tok, lex};
+
+    if !sql.to_ascii_uppercase().contains("SHARE") {
+        return None;
+    }
+    let toks = lex(sql).ok()?;
+    let words = ["LOCK", "IN", "SHARE", "MODE"];
+    let mut cuts = Vec::new();
+    let mut i = 0;
+    while i + words.len() <= toks.len() {
+        let hit = words
+            .iter()
+            .enumerate()
+            .all(|(k, w)| matches!(&toks[i + k].tok, Tok::Word(t) if t.eq_ignore_ascii_case(w)));
+        if hit {
+            let start = toks[i].start;
+            let end = toks[i + 3].start + "MODE".len();
+            cuts.push((start, end));
+            i += words.len();
+        } else {
+            i += 1;
+        }
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0;
+    for (start, end) in cuts {
+        out.push_str(&sql[last..start]);
+        last = end;
+    }
+    out.push_str(&sql[last..]);
+    Some(out)
+}
+
+/// Is this an `ALTER TABLE` that only changes MySQL table options?
+///
+/// `ALTER TABLE t ROW_FORMAT=DYNAMIC`, `ENGINE=InnoDB`, `[DEFAULT]
+/// CHARSET=...`, `COLLATE ...`, `AUTO_INCREMENT=n`, `COMMENT='...'`,
+/// `CONVERT TO CHARACTER SET ...`, `ENABLE KEYS` / `DISABLE KEYS`, `FORCE`,
+/// the storage tuning options and the `ALGORITHM=` / `LOCK=` clauses, alone
+/// or comma-separated. None of them has a SQLite counterpart: storage
+/// format, engine and character set (always UTF-8) are fixed, and SQLite
+/// assigns the next rowid itself. Such a statement is answered OK without
+/// touching the database. A statement mixing an option with a real change
+/// (`ADD COLUMN ...`) is not matched and goes to the parser as usual.
+///
+/// `AUTO_INCREMENT=n` is the one option with a visible effect on MySQL (the
+/// next id); on SQLite the next id stays `max(rowid) + 1`.
+pub(crate) fn is_table_option_only_alter(sql: &str) -> bool {
+    use crate::metadata::{Tok, lex};
+
+    let Ok(toks) = lex(sql) else { return false };
+    let mut it = toks.iter().map(|l| &l.tok).peekable();
+    let word =
+        |t: Option<&&Tok>, w: &str| matches!(t, Some(Tok::Word(x)) if x.eq_ignore_ascii_case(w));
+
+    if !word(it.next().as_ref(), "ALTER") || !word(it.next().as_ref(), "TABLE") {
+        return false;
+    }
+    // Table name: ident or db.ident.
+    if !matches!(it.next(), Some(Tok::Word(_) | Tok::Quoted(_))) {
+        return false;
+    }
+    if matches!(it.peek(), Some(Tok::Dot)) {
+        it.next();
+        if !matches!(it.next(), Some(Tok::Word(_) | Tok::Quoted(_))) {
+            return false;
+        }
+    }
+
+    // `[=] value`, value being a word, number, string or quoted ident.
+    fn value<'a>(it: &mut std::iter::Peekable<impl Iterator<Item = &'a Tok>>) -> bool {
+        if matches!(it.peek(), Some(Tok::Other('='))) {
+            it.next();
+        }
+        matches!(it.next(), Some(Tok::Word(_) | Tok::Str(_) | Tok::Quoted(_)))
+    }
+
+    loop {
+        let Some(Tok::Word(w)) = it.next() else {
+            return false;
+        };
+        let ok = match w.to_ascii_uppercase().as_str() {
+            "ENGINE" | "ROW_FORMAT" | "AUTO_INCREMENT" | "COMMENT" | "KEY_BLOCK_SIZE"
+            | "AVG_ROW_LENGTH" | "MAX_ROWS" | "MIN_ROWS" | "PACK_KEYS" | "CHECKSUM"
+            | "DELAY_KEY_WRITE" | "STATS_AUTO_RECALC" | "STATS_PERSISTENT"
+            | "STATS_SAMPLE_PAGES" | "ALGORITHM" | "LOCK" | "CHARSET" | "COLLATE" => value(&mut it),
+            "CHARACTER" => word(it.next().as_ref(), "SET") && value(&mut it),
+            "DEFAULT" => match it.next() {
+                Some(Tok::Word(x))
+                    if x.eq_ignore_ascii_case("CHARSET") || x.eq_ignore_ascii_case("COLLATE") =>
+                {
+                    value(&mut it)
+                }
+                Some(Tok::Word(x)) if x.eq_ignore_ascii_case("CHARACTER") => {
+                    word(it.next().as_ref(), "SET") && value(&mut it)
+                }
+                _ => false,
+            },
+            "CONVERT" => {
+                word(it.next().as_ref(), "TO")
+                    && match it.next() {
+                        Some(Tok::Word(x)) if x.eq_ignore_ascii_case("CHARSET") => value(&mut it),
+                        Some(Tok::Word(x)) if x.eq_ignore_ascii_case("CHARACTER") => {
+                            word(it.next().as_ref(), "SET") && value(&mut it)
+                        }
+                        _ => false,
+                    }
+                    && (!word(it.peek(), "COLLATE") || {
+                        it.next();
+                        value(&mut it)
+                    })
+            }
+            "ENABLE" | "DISABLE" => word(it.next().as_ref(), "KEYS"),
+            "FORCE" => true,
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+        // Options are separated by commas or (as MySQL also accepts) spaces.
+        match it.peek() {
+            None => return true,
+            Some(Tok::Semi) => {
+                it.next();
+                return it.next().is_none();
+            }
+            Some(Tok::Other(',')) => {
+                it.next();
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Scalar functions with a different SQLite name ────────────────────────────
+
+/// Rename MySQL scalar functions that exist in SQLite under another name.
+///
+/// * `LEAST(a, b, ...)` / `GREATEST(...)` → multi-argument `min()` / `max()`.
+///   Both return `NULL` when any argument is `NULL`, as MySQL's do.
+/// * `CHAR_LENGTH(s)` / `CHARACTER_LENGTH(s)` → `length(s)`, which counts
+///   characters for text, as MySQL's `CHAR_LENGTH` does.
+///
+/// MySQL-only: PostgreSQL's `LEAST`/`GREATEST` ignore `NULL`s.
+fn rewrite_scalar_function_names(stmt: &mut Statement) {
+    let _: ControlFlow<()> = visit_expressions_mut(stmt, |expr| {
+        if let Expr::Function(func) = expr {
+            let renamed = match func.name.to_string().to_ascii_uppercase().as_str() {
+                "LEAST" => Some(("min", 2)),
+                "GREATEST" => Some(("max", 2)),
+                "CHAR_LENGTH" | "CHARACTER_LENGTH" => Some(("length", 1)),
+                _ => None,
+            };
+            // A one-argument min()/max() would be the aggregate: malformed
+            // calls are left for SQLite to reject.
+            if let Some((name, min_args)) = renamed
+                && matches!(&func.args, FunctionArguments::List(l) if l.args.len() >= min_args)
+            {
+                func.name = func_name(name);
+            }
+        }
+        ControlFlow::Continue(())
+    });
 }
 
 // ── "double-quoted" strings ──────────────────────────────────────────────────
@@ -1205,5 +1474,177 @@ mod tests {
         let results = translate("SELECT * FROM t WHERE v NOT RLIKE '^a'", Dialect::MySQL).unwrap();
         let sql = extract_sql(&results[0]);
         assert!(sql.contains("v NOT REGEXP '^a'"), "got: {sql}");
+    }
+
+    // ── Statement shapes MySQL applications rely on ──────────────────────
+
+    fn one(sql: &str) -> String {
+        let results = translate(sql, Dialect::MySQL).unwrap();
+        assert_eq!(results.len(), 1, "{sql}: {results:?}");
+        extract_sql(&results[0]).to_string()
+    }
+
+    fn is_noop(sql: &str) -> bool {
+        matches!(
+            translate(sql, Dialect::MySQL).unwrap().as_slice(),
+            [TranslateResult::Noop]
+        )
+    }
+
+    #[test]
+    fn insert_select_from_dual_drops_dual() {
+        let sql = one(
+            "INSERT INTO t (a, b) SELECT 'x', 1 FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM t WHERE a = 'x')",
+        );
+        assert!(!sql.to_ascii_uppercase().contains("DUAL"), "got: {sql}");
+        assert!(sql.contains("SELECT 'x', 1 WHERE NOT EXISTS"), "got: {sql}");
+        let sql = one("SELECT 1 + 1 FROM dual");
+        assert_eq!(sql, "SELECT 1 + 1");
+    }
+
+    #[test]
+    fn a_real_table_named_like_dual_is_kept() {
+        // Quoted, aliased or joined: a user table, not MySQL's dummy.
+        assert!(one("SELECT * FROM `dual`").contains("`dual`"));
+        assert!(one("SELECT * FROM dual AS d").contains("dual AS d"));
+    }
+
+    #[test]
+    fn index_hints_are_removed() {
+        for sql in [
+            "SELECT * FROM queue FORCE INDEX (q_campaign_sent_id) WHERE campaign_id = 1",
+            "SELECT * FROM queue USE INDEX (a) WHERE campaign_id = 1",
+            "SELECT * FROM queue IGNORE KEY (a, b) WHERE campaign_id = 1",
+            "SELECT * FROM queue FORCE INDEX FOR ORDER BY (a) WHERE campaign_id = 1",
+        ] {
+            let out = one(sql);
+            assert_eq!(out, "SELECT * FROM queue WHERE campaign_id = 1", "{sql}");
+        }
+        let out = one("SELECT * FROM a USE INDEX (x) JOIN b FORCE INDEX (y) ON a.id = b.id");
+        assert_eq!(out, "SELECT * FROM a JOIN b ON a.id = b.id");
+    }
+
+    #[test]
+    fn locking_reads_are_removed() {
+        for sql in [
+            "SELECT id FROM queue WHERE sent = 2 FOR UPDATE",
+            "SELECT id FROM queue WHERE sent = 2 FOR SHARE",
+            "SELECT id FROM queue WHERE sent = 2 FOR UPDATE NOWAIT",
+            "SELECT id FROM queue WHERE sent = 2 FOR UPDATE SKIP LOCKED",
+            "SELECT id FROM queue WHERE sent = 2 LOCK IN SHARE MODE",
+            "select id from queue where sent = 2 lock in share mode",
+        ] {
+            let out = one(sql);
+            assert_eq!(
+                out.to_ascii_uppercase(),
+                "SELECT ID FROM QUEUE WHERE SENT = 2",
+                "{sql}"
+            );
+        }
+        // Inside a subquery too.
+        let out = one("SELECT * FROM (SELECT id FROM q FOR UPDATE) AS x");
+        assert!(!out.contains("FOR UPDATE"), "got: {out}");
+        // The words inside a string literal are data.
+        let out = one("SELECT 'lock in share mode' AS s");
+        assert!(out.contains("'lock in share mode'"), "got: {out}");
+    }
+
+    #[test]
+    fn unbounded_limit_becomes_minus_one() {
+        assert_eq!(
+            one("SELECT * FROM t ORDER BY id LIMIT 18446744073709551615 OFFSET 20"),
+            "SELECT * FROM t ORDER BY id LIMIT -1 OFFSET 20"
+        );
+        assert_eq!(
+            one("SELECT * FROM t LIMIT 20, 18446744073709551615"),
+            "SELECT * FROM t LIMIT -1 OFFSET 20"
+        );
+        assert_eq!(
+            one("SELECT * FROM t LIMIT 9223372036854775808"),
+            "SELECT * FROM t LIMIT -1"
+        );
+        // In range: untouched.
+        assert_eq!(
+            one("SELECT * FROM t LIMIT 9223372036854775807"),
+            "SELECT * FROM t LIMIT 9223372036854775807"
+        );
+    }
+
+    #[test]
+    fn table_option_only_alters_are_noops() {
+        for sql in [
+            "ALTER TABLE apps ROW_FORMAT=DYNAMIC",
+            "ALTER TABLE `apps` ROW_FORMAT = DYNAMIC;",
+            "ALTER TABLE apps ENGINE=InnoDB",
+            "ALTER TABLE apps ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+            "ALTER TABLE apps ENGINE=InnoDB, ROW_FORMAT=COMPRESSED, KEY_BLOCK_SIZE=8",
+            "ALTER TABLE apps DEFAULT CHARSET=utf8mb4",
+            "ALTER TABLE apps DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            "ALTER TABLE apps CHARACTER SET = utf8mb4",
+            "ALTER TABLE apps COLLATE utf8mb4_unicode_ci",
+            "ALTER TABLE apps CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            "ALTER TABLE apps CONVERT TO CHARSET utf8mb4",
+            "ALTER TABLE apps AUTO_INCREMENT=100",
+            "ALTER TABLE apps COMMENT='brands'",
+            "ALTER TABLE sendy.apps ENGINE=InnoDB",
+            "ALTER TABLE apps ENABLE KEYS",
+            "ALTER TABLE apps DISABLE KEYS",
+            "ALTER TABLE apps FORCE",
+            "ALTER TABLE apps ENGINE=InnoDB, ALGORITHM=INPLACE, LOCK=NONE",
+        ] {
+            assert!(is_noop(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn real_alters_are_not_swallowed() {
+        for sql in [
+            "ALTER TABLE apps ADD COLUMN x INT",
+            "ALTER TABLE apps ADD COLUMN x INT, ENGINE=InnoDB",
+            "ALTER TABLE apps ENGINE=InnoDB, ADD COLUMN x INT",
+            "ALTER TABLE apps RENAME TO apps2",
+            "ALTER TABLE apps",
+        ] {
+            assert!(
+                !matches!(
+                    translate(sql, Dialect::MySQL).as_deref(),
+                    Ok([TranslateResult::Noop])
+                ),
+                "{sql} must not be a no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn least_greatest_char_length() {
+        assert_eq!(
+            one(
+                "SELECT LEAST(a, 5), GREATEST(a, b, c), CHAR_LENGTH(s), CHARACTER_LENGTH(s) FROM t"
+            ),
+            "SELECT min(a, 5), max(a, b, c), length(s), length(s) FROM t"
+        );
+        // One argument is not LEAST/GREATEST; not turned into an aggregate.
+        assert!(one("SELECT LEAST(a) FROM t").contains("LEAST(a)"));
+    }
+
+    #[test]
+    fn ddl_prepass_keeps_non_ascii_text() {
+        let sql = one("CREATE TABLE y (d VARCHAR(5) DEFAULT 'n\u{e9}', e INT(11) DEFAULT 0)");
+        assert!(sql.contains("'n\u{e9}'"), "got: {sql}");
+        assert!(!sql.contains('\u{c3}'), "mojibake: {sql}");
+    }
+
+    #[test]
+    fn hint_strip_keeps_non_ascii_text() {
+        let sql = one("SELECT SQL_NO_CACHE name FROM t WHERE name = 'Zo\u{eb}'");
+        assert!(sql.contains("'Zo\u{eb}'"), "got: {sql}");
+    }
+
+    #[test]
+    fn ddl_prepass_respects_backslash_escaped_quotes() {
+        // The `(11)` inside the string is data and must survive.
+        let sql = one("CREATE TABLE y (d VARCHAR(50) DEFAULT 'it\\'s (11)', e INT(11))");
+        assert!(sql.contains("(11)'"), "got: {sql}");
+        assert!(sql.contains("e INTEGER"), "got: {sql}");
     }
 }
