@@ -3,6 +3,15 @@ version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
+    # zstd 0.13 / zstd-safe 7 (decompression stream reuse, Seekable, legacy
+    # frames). Pulled only by mysql_common 0.32 (via opensrv-mysql), which
+    # calls zstd solely to decode binlog TRANSACTION_PAYLOAD events
+    # (src/binlog/events/transaction_payload_event.rs) -- a replication
+    # client path the opensrv server never reaches. No mysql_common 0.32.x
+    # on zstd >= 0.14; drop these once there is one.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
     # rustls-webpki cert-verification vulns (name constraints, CRL handling).
     # The opensrv-mysql -> rustls 0.22 -> rustls-webpki 0.102.8 copy is GONE now
     # that opensrv-mysql is patched to the aws-lc-rs fork on rustls >= 0.23.45

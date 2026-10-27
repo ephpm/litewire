@@ -248,13 +248,6 @@ fn rewrite_function(func: &mut Function) {
             func.name = func_name("date");
             func.args = func_args(vec![value_expr(Value::SingleQuotedString("now".into()))]);
         }
-        "UNIX_TIMESTAMP" => {
-            func.name = func_name("strftime");
-            func.args = func_args(vec![
-                value_expr(Value::SingleQuotedString("%s".into())),
-                value_expr(Value::SingleQuotedString("now".into())),
-            ]);
-        }
         "ISNULL" => {
             func.name = func_name("IFNULL");
         }

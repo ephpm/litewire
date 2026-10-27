@@ -293,7 +293,7 @@ async fn probes(backend: SharedBackend) {
 
     // ── Unsupported forms are errors, never unfiltered sets ──────────────
     must_fail(&mut c, "SHOW INDEX FROM subscribers LIKE 's_list'").await;
-    must_fail(&mut c, "SHOW TABLE STATUS LIKE 'lists'").await;
+    must_fail(&mut c, "SHOW VARIABLES LIKE 'sql_mode'").await;
     must_fail(&mut c, "SHOW DATABASES LIKE 'shop'").await;
     must_fail(&mut c, "SELECT * FROM information_schema.routines").await;
     must_fail(&mut c, "SHOW COLUMNS FROM subscribers WHERE nosuchcol = 1").await;

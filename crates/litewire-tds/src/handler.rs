@@ -414,6 +414,10 @@ async fn execute_sql<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 let sqlite_sql = meta.to_sqlite_sql();
                 write_query_result(&mut resp, backend, &sqlite_sql, params).await;
             }
+            // Only the MySQL dialect produces table rebuilds.
+            TranslateResult::RebuildTable(_) => {
+                return send_error(stream, "table rebuilds are MySQL-only").await;
+            }
             TranslateResult::Sql(sqlite_sql) => {
                 if sqlite_sql.is_empty() {
                     token::write_done(&mut resp, token::DONE_FINAL, 0);
