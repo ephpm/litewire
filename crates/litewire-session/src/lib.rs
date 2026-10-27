@@ -611,10 +611,21 @@ impl Session {
                 Ok(SessionResult::Rows(rs))
             }
             StatementKind::Transaction => {
-                self.conn.execute(sql, &[]).await.map_err(map_backend_err)?;
+                let upper = sql.trim().to_ascii_uppercase();
+                if let Err(e) = self.conn.execute(sql, &[]).await {
+                    // MySQL answers COMMIT / ROLLBACK outside a transaction
+                    // with OK (`mysqli_rollback()` after a failed statement
+                    // is a common error path); SQLite errors. Only that
+                    // exact case is absorbed.
+                    let bare_end = upper == "COMMIT" || upper == "ROLLBACK";
+                    if bare_end && e.to_string().contains("no transaction is active") {
+                        self.in_transaction = false;
+                        return Ok(SessionResult::Ok(self.ok(0, 0, false)));
+                    }
+                    return Err(map_backend_err(e));
+                }
                 // Update state only after the backend accepted the
                 // statement -- a failed COMMIT must not clear the flag.
-                let upper = sql.trim().to_ascii_uppercase();
                 if upper.starts_with("BEGIN") || upper.starts_with("START") {
                     self.in_transaction = true;
                 } else if upper.starts_with("COMMIT") || upper.starts_with("ROLLBACK") {

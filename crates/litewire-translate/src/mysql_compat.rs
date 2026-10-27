@@ -608,6 +608,87 @@ pub(crate) fn split_multi_table_update(
     Ok(Some(out))
 }
 
+// ── TRUNCATE, parenthesized UNION members ───────────────────────────────────
+
+/// `TRUNCATE [TABLE] t` → `DELETE FROM t` (SQLite has no TRUNCATE and
+/// optimizes an unqualified DELETE the same way). As in MySQL the next
+/// `AUTO_INCREMENT` id starts over: an emptied rowid table without
+/// `AUTOINCREMENT` restarts at 1. Affected rows: MySQL reports 0, this
+/// reports the rows deleted.
+pub(crate) fn truncate_to_delete(sql: &str) -> Option<String> {
+    let toks = lex(sql).ok()?;
+    if !is_word(&toks, 0, "TRUNCATE") {
+        return None;
+    }
+    let start = if is_word(&toks, 1, "TABLE") { 2 } else { 1 };
+    let name_start = toks.get(start)?.start;
+    let rest = sql[name_start..].trim().trim_end_matches(';').trim();
+    Some(format!("DELETE FROM {rest}"))
+}
+
+/// `(SELECT ...) UNION (SELECT ...)`: SQLite does not accept parenthesized
+/// compound members, so a member without its own `ORDER BY` / `LIMIT`
+/// loses its parentheses (one with them is left for SQLite to reject).
+pub(crate) fn unwrap_union_members(stmt: &mut Statement) {
+    use sqlparser::ast::{SetExpr, VisitMut, VisitorMut};
+
+    struct Unwrap;
+    fn unwrap(e: &mut SetExpr) {
+        if let SetExpr::Query(q) = e
+            && q.order_by.is_none()
+            && q.limit_clause.is_none()
+            && q.with.is_none()
+            && q.locks.is_empty()
+        {
+            let body = std::mem::replace(
+                q.body.as_mut(),
+                SetExpr::Values(sqlparser::ast::Values {
+                    explicit_row: false,
+                    rows: vec![],
+                }),
+            );
+            *e = body;
+        }
+    }
+    impl VisitorMut for Unwrap {
+        type Break = ();
+        fn pre_visit_query(&mut self, query: &mut sqlparser::ast::Query) -> ControlFlow<()> {
+            if let SetExpr::SetOperation { left, right, .. } = query.body.as_mut() {
+                unwrap(left);
+                unwrap(right);
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let _ = stmt.visit(&mut Unwrap);
+}
+
+#[cfg(test)]
+mod truncate_union_tests {
+    use crate::{Dialect, TranslateResult, translate};
+
+    fn one(sql: &str) -> String {
+        match translate(sql, Dialect::MySQL).unwrap().as_slice() {
+            [TranslateResult::Sql(s)] => s.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate() {
+        assert_eq!(one("TRUNCATE table queue"), "DELETE FROM queue");
+        assert_eq!(one("truncate `queue`;"), "DELETE FROM `queue`");
+    }
+
+    #[test]
+    fn parenthesized_union_members() {
+        assert_eq!(
+            one("(SELECT id FROM a WHERE x = 1) UNION (SELECT id FROM b)"),
+            "SELECT id FROM a WHERE x = 1 UNION SELECT id FROM b"
+        );
+    }
+}
+
 // ── Functions ────────────────────────────────────────────────────────────────
 
 fn positional_args(args: &FunctionArguments) -> Option<Vec<&Expr>> {
