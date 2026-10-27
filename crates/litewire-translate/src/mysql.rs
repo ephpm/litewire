@@ -22,6 +22,7 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
     crate::mysql_compat::rewrite_functions(stmt)?;
     crate::mysql_compat::rewrite_update_join(stmt)?;
     crate::mysql_compat::rewrite_delete(stmt)?;
+    crate::mysql_compat::unwrap_union_members(stmt);
     strip_charset_introducers(stmt);
     double_quoted_strings_to_single(stmt);
     add_default_like_escape(stmt);

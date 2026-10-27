@@ -291,6 +291,21 @@ async fn forms(backend: SharedBackend) {
         col(&mut c, "SELECT FROM_UNIXTIME(1700000000) AS t", "t").await,
         ["2023-11-14 22:13:20"]
     );
+    // COMMIT / ROLLBACK outside a transaction are OK, as in MySQL.
+    exec(&mut c, "ROLLBACK").await;
+    exec(&mut c, "COMMIT").await;
+    // TRUNCATE empties the table; ids start over.
+    exec(&mut c, "TRUNCATE TABLE d").await;
+    assert_eq!(ints(&mut c, "SELECT COUNT(*) FROM d").await, [0]);
+    // Parenthesized UNION members.
+    assert_eq!(
+        ints(
+            &mut c,
+            "(SELECT id FROM s WHERE id = 1) UNION (SELECT id FROM l WHERE id = 2) ORDER BY 1"
+        )
+        .await,
+        [1, 2]
+    );
     // SHOW TABLE STATUS.
     assert_eq!(
         col(&mut c, "SHOW TABLE STATUS LIKE 'apps'", "Collation").await,

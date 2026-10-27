@@ -611,10 +611,22 @@ impl Session {
                 Ok(SessionResult::Rows(rs))
             }
             StatementKind::Transaction => {
-                self.conn.execute(sql, &[]).await.map_err(map_backend_err)?;
+                let upper = sql.trim().to_ascii_uppercase();
+                if let Err(e) = self.conn.execute(sql, &[]).await {
+                    // MySQL answers COMMIT / ROLLBACK outside a transaction
+                    // with OK (`mysqli_rollback()` after a failed statement
+                    // is a common error path); SQLite errors. Only that
+                    // exact case is absorbed.
+                    let bare_end = self.dialect == Dialect::MySQL
+                        && (upper == "COMMIT" || upper == "ROLLBACK");
+                    if bare_end && e.to_string().contains("no transaction is active") {
+                        self.in_transaction = false;
+                        return Ok(SessionResult::Ok(self.ok(0, 0, false)));
+                    }
+                    return Err(map_backend_err(e));
+                }
                 // Update state only after the backend accepted the
                 // statement -- a failed COMMIT must not clear the flag.
-                let upper = sql.trim().to_ascii_uppercase();
                 if upper.starts_with("BEGIN") || upper.starts_with("START") {
                     self.in_transaction = true;
                 } else if upper.starts_with("COMMIT") || upper.starts_with("ROLLBACK") {
@@ -1181,10 +1193,10 @@ mod tests {
     #[tokio::test]
     async fn failed_transaction_statement_does_not_change_state() {
         let mut session = memory_session().await;
-        // COMMIT with no open transaction: SQLite rejects it; the flag must
-        // stay clear (state only updates on success).
-        let err = session.query("COMMIT", &[]).await.unwrap_err();
-        assert!(matches!(err, SessionError::Db { .. }));
+        // COMMIT / ROLLBACK with no open transaction: SQLite rejects them,
+        // MySQL answers OK, so the MySQL session does; the flag stays clear.
+        ok(session.query("COMMIT", &[]).await.unwrap());
+        ok(session.query("ROLLBACK", &[]).await.unwrap());
         assert!(!session.in_transaction);
 
         // And a failed BEGIN (nested) must not double-set anything odd.

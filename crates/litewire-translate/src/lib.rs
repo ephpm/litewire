@@ -174,6 +174,19 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
         sql
     };
 
+    // `TRUNCATE [TABLE] t` -> `DELETE FROM t`.
+    let owned_trunc;
+    let sql = match (dialect == Dialect::MySQL)
+        .then(|| mysql_compat::truncate_to_delete(sql))
+        .flatten()
+    {
+        Some(s) => {
+            owned_trunc = s;
+            owned_trunc.as_str()
+        }
+        None => sql,
+    };
+
     // `UPDATE a, b SET` (comma join) only parses as a CROSS JOIN.
     let owned_comma;
     let sql = match (dialect == Dialect::MySQL)
