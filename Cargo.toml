@@ -159,6 +159,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # only change is tokio-rustls 0.25 -> 0.26 (rustls >= 0.23.45) pinned to the
 # aws-lc-rs crypto provider (never `ring`). The `tls` feature and its
 # auth-load-bearing `init_after_ssl` re-parse (#32) are byte-for-byte upstream.
+# Rev 146de689 also drops mysql_common's default features (no binlog => no
+# zstd: RUSTSEC-2026-0391/0398/0403) and selects flate2's pure-Rust backend.
 #
 # NOTE: this [patch] is honoured for litewire's OWN builds only. A patch does
 # not propagate through a git dependency, so a downstream consumer (ePHPm)
@@ -167,4 +169,4 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # Retire this patch when a fixed opensrv-mysql is published to crates.io, or
 # when litewire migrates off opensrv-mysql.
 [patch.crates-io]
-opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "42efd446ba867066c94bcf13d31b3b3fec53ec61" }
+opensrv-mysql = { git = "https://github.com/ephpm/opensrv-mysql.git", rev = "146de689d9febd8dd15eb06eb80bf6f7bdcc1216" }
