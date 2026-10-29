@@ -193,8 +193,18 @@ byte, turning `'café'` in DDL or in a hinted `SELECT` into `'cafÃ©'`.
 
 **Expressions:**
 
+* Single-quoted string literals are re-escaped for SQLite. MySQL's default
+  syntax uses backslash escapes (`\'` is a quote, `\\` a backslash); SQLite
+  and Turso never interpret backslashes, so the only in-string escape they
+  accept is a doubled quote (`''`). The value is decoded once at parse time
+  and then emitted with every embedded quote doubled and every backslash left
+  as a literal byte: a dump's `'a\\\'b'` (the bytes `a \ ' b`) is emitted as
+  `'a\''b'`, which SQLite reads back as the same four bytes. Emitting it the
+  way MySQL would (`'a\'b'`) made SQLite stop the string at `a\` and choke on
+  the rest, which inside a multi-row `INSERT` silently dropped rows.
 * `"double-quoted"` literals are strings in MySQL (no `ANSI_QUOTES`), so they
-  are emitted single-quoted. SQLite reads `"x"` as an identifier first.
+  are emitted single-quoted (and re-escaped for SQLite as above). SQLite reads
+  `"x"` as an identifier first.
 * `LEAST(a, b, ...)` / `GREATEST(...)` → multi-argument `min()` / `max()`
   (`NULL` if any argument is `NULL`, as in MySQL); `CHAR_LENGTH` /
   `CHARACTER_LENGTH` → `length` (characters).
