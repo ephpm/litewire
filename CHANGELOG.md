@@ -177,6 +177,20 @@ the commit that merges this changelog.
 
 ### Fixed
 
+- Single-quoted string literals carrying a backslash immediately before a
+  quote were emitted in a form SQLite misreads, silently dropping rows on a
+  `mysqldump` replay (ephpm Sendy compatibility: a real dump lost exactly 45
+  `campaigns` rows). sqlparser decodes the literal correctly — `'a\\\'b'`
+  becomes the bytes `a \ ' b` — but its `Display` re-serialises for a
+  backslash-escaping dialect and emits the quote bare (`'a\'b'`). SQLite and
+  Turso never interpret backslash escapes, so they read that as `a\` followed
+  by stray tokens; inside a multi-row `INSERT` the offending row and the ones
+  after it were garbled or dropped rather than erroring. `litewire_translate`
+  now re-escapes every single-quoted literal for SQLite (quotes doubled,
+  backslashes kept literal) before emitting. Covered on both backends by
+  `tests/mysql_dump_fidelity.rs` and
+  `litewire_translate::emit::tests::single_quoted_literals_are_escaped_for_sqlite`.
+
 - `UNIX_TIMESTAMP(x)` ignored its argument (always "now") and returned
   text, which SQLite orders after every integer, so `WHERE col <
   UNIX_TIMESTAMP()` matched every row. It now returns an integer for the

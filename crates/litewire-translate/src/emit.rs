@@ -2,12 +2,64 @@
 //!
 //! Uses sqlparser's `Display` implementation which produces standard SQL.
 //! SQLite is largely standard-compliant, so this works for most cases.
+//!
+//! # String-literal escaping
+//!
+//! There is one place where sqlparser's `Display` is *not* SQLite-safe:
+//! single-quoted string literals. sqlparser stores the fully-decoded value in
+//! the AST (`'a\\\'b'` in a MySQL source becomes the four bytes `a \ ' b`),
+//! but its `Display` for `Value::SingleQuotedString` re-serializes it for a
+//! *backslash-escaping* dialect: when a `'` is immediately preceded by a `\`
+//! it emits the quote **bare** (`'a\'b'`) on the assumption the reader will
+//! treat `\'` as an escaped quote.
+//!
+//! SQLite — and therefore Turso — never interprets backslash escapes
+//! (`NO_BACKSLASH_ESCAPES` is effectively always on). It reads `'a\'b'` as the
+//! string `a\` followed by the stray tokens `b'`, so the statement is either a
+//! syntax error or, inside a multi-row `INSERT`, a silently dropped/garbled
+//! row. In a real Sendy `mysqldump` replay this dropped exactly the rows whose
+//! text contained a `\` immediately before a `'` (litewire issue: MySQL
+//! string-escape fidelity).
+//!
+//! The fix is to escape every single-quoted literal the way SQLite expects —
+//! double the embedded quotes (`'` -> `''`) and leave backslashes as literal
+//! bytes — *before* handing the AST to `Display`. Once every `'` sits in a
+//! `''` pair, sqlparser's `Display` has no "lone quote" left to double and
+//! emits the stored bytes verbatim, which is exactly the SQLite-correct
+//! literal. See [`SqliteStringEscaper`].
 
-use sqlparser::ast::Statement;
+use std::ops::ControlFlow;
 
-/// Emit a statement as a SQL string.
+use sqlparser::ast::{Statement, Value, VisitMut, VisitorMut};
+
+/// Rewrites single-quoted string literals so sqlparser's `Display` produces
+/// SQLite-safe output. See the module docs for the full rationale.
+struct SqliteStringEscaper;
+
+impl VisitorMut for SqliteStringEscaper {
+    type Break = ();
+
+    fn pre_visit_value(&mut self, value: &mut Value) -> ControlFlow<Self::Break> {
+        if let Value::SingleQuotedString(s) = value {
+            // Only touch the value if it actually contains a quote — the common
+            // case (no embedded quote) needs no allocation and `Display`
+            // already round-trips it safely.
+            if s.contains('\'') {
+                *s = s.replace('\'', "''");
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Emit a statement as a SQLite-compatible SQL string.
+///
+/// Single-quoted string literals are re-escaped for SQLite (see the module
+/// docs); every other node is rendered by sqlparser's `Display`.
 #[must_use]
 pub fn emit_statement(stmt: &Statement) -> String {
+    let mut stmt = stmt.clone();
+    let _ = stmt.visit(&mut SqliteStringEscaper);
     stmt.to_string()
 }
 
@@ -94,6 +146,33 @@ mod tests {
         let stmts = Parser::parse_sql(&MySqlDialect {}, sql).unwrap();
         let emitted = emit_statement(&stmts[0]);
         assert!(emitted.contains("SELECT user_id FROM orders"));
+    }
+
+    #[test]
+    fn single_quoted_literals_are_escaped_for_sqlite() {
+        // (MySQL source literal, SQLite-safe literal we must emit). The AST
+        // stores the *decoded* bytes; sqlparser's own `Display` leaves a quote
+        // bare when a backslash precedes it, which SQLite then misreads — so
+        // these assert the exact emitted literal, not just a substring.
+        let cases = [
+            // `\\` + `\'`: the Sendy `campaigns` data-loss shape (bytes a \ ' b).
+            (r"SELECT 'a\\\'b'", "'a\\''b'"),
+            // Lone escaped quote (bytes a ' b).
+            (r"SELECT 'a\'b'", "'a''b'"),
+            // Doubled quote in the source (bytes a ' b).
+            (r"SELECT 'a''b'", "'a''b'"),
+            // Escaped backslash, no quote (bytes a \ b): backslash stays literal.
+            (r"SELECT 'a\\b'", "'a\\b'"),
+            // No quote at all: untouched.
+            ("SELECT 'plain'", "'plain'"),
+        ];
+        for (input, want_literal) in cases {
+            let out = translate_sql(input, crate::Dialect::MySQL);
+            assert!(
+                out.contains(want_literal),
+                "input {input:?} emitted {out:?}, expected it to contain {want_literal:?}",
+            );
+        }
     }
 
     // ── Roundtrip tests via translate() ────────────────────────────────────
