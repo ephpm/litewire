@@ -99,7 +99,9 @@ A `SHOW` on a table that does not exist returns no rows (MySQL errors with
 1146).
 
 **`information_schema`** is not pattern-matched. A reference to
-`information_schema.tables`, `.columns`, `.statistics` or `.schemata`
+`information_schema.tables`, `.columns`, `.statistics`, `.schemata`,
+`.key_column_usage`, `.referential_constraints`, `.table_constraints` or
+`.check_constraints`
 anywhere in a statement (subqueries included) is replaced by a derived table
 with MySQL's column names, and the client's own projection, `WHERE`,
 `ORDER BY` and `LIMIT` run against it. Two adjustments make that faithful:
@@ -115,7 +117,10 @@ with MySQL's column names, and the client's own projection, `WHERE`,
   `SELECT row_format FROM information_schema.tables` yields a column named
   `row_format` (PHP array keys are case-sensitive).
 
-Other `information_schema` tables (`routines`, `key_column_usage`, ...) are
+`KEY_COLUMN_USAGE`, `REFERENTIAL_CONSTRAINTS` and `TABLE_CONSTRAINTS` list
+foreign keys (and, in the last, primary keys) derived from SQLite's foreign key
+list, named `<table>_ibfk_<n>` as MySQL names an unnamed InnoDB key;
+`CHECK_CONSTRAINTS` is always empty. Other `information_schema` tables (`routines`, ...) are
 an error. `TABLES` reports `ENGINE = 'InnoDB'`, `ROW_FORMAT = 'Dynamic'`,
 `TABLE_COLLATION = 'utf8mb4_unicode_ci'` and zero sizes.
 

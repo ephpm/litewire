@@ -214,6 +214,84 @@ fn schemata_rows() -> String {
     )
 }
 
+/// SQLite expression naming foreign key `f` of table `m` the way MySQL
+/// names an unnamed InnoDB one (`<table>_ibfk_<n>`). SQLite foreign keys
+/// carry no names; `f.id` is stable per table, so the name is too.
+const FK_NAME: &str = "(m.name || '_ibfk_' || (f.id + 1)) COLLATE NOCASE";
+
+/// `information_schema.KEY_COLUMN_USAGE`-shaped rows: one per foreign key
+/// column, derived from `pragma_foreign_key_list`. Primary and unique key
+/// columns are not listed (SQLite names no such constraints); an implicit
+/// reference to the parent's primary key (`REFERENCES t`) is resolved to
+/// the parent's key column at the same position.
+///
+/// The integer columns are `CAST(.. AS INTEGER)`: on Turso a prepared
+/// (binary-protocol) select of an integer *expression* read through a derived
+/// table drops the connection unless the expression carries a declared type
+/// (the same happens for `information_schema.columns.ORDINAL_POSITION`).
+fn key_column_usage_rows() -> String {
+    format!(
+        "SELECT 'def' AS CONSTRAINT_CATALOG, '{SCHEMA_NAME}' AS CONSTRAINT_SCHEMA, \
+         {FK_NAME} AS CONSTRAINT_NAME, 'def' AS TABLE_CATALOG, \
+         '{SCHEMA_NAME}' AS TABLE_SCHEMA, m.name COLLATE NOCASE AS TABLE_NAME, \
+         f.\"from\" COLLATE NOCASE AS COLUMN_NAME, \
+         CAST(f.seq + 1 AS INTEGER) AS ORDINAL_POSITION, \
+         CAST(f.seq + 1 AS INTEGER) AS POSITION_IN_UNIQUE_CONSTRAINT, \
+         '{SCHEMA_NAME}' AS REFERENCED_TABLE_SCHEMA, \
+         f.\"table\" COLLATE NOCASE AS REFERENCED_TABLE_NAME, \
+         COALESCE(NULLIF(f.\"to\", ''), k.name) COLLATE NOCASE AS REFERENCED_COLUMN_NAME \
+         FROM {} JOIN pragma_foreign_key_list(m.name) AS f \
+         LEFT JOIN pragma_table_info(f.\"table\") AS k ON k.pk = f.seq + 1",
+        Tables::All.source()
+    )
+}
+
+/// `information_schema.REFERENTIAL_CONSTRAINTS`-shaped rows: one per foreign
+/// key, derived from `pragma_foreign_key_list` (see [`key_column_usage_rows`]
+/// for the constraint naming).
+fn referential_constraints_rows() -> String {
+    format!(
+        "SELECT 'def' AS CONSTRAINT_CATALOG, '{SCHEMA_NAME}' AS CONSTRAINT_SCHEMA, \
+         {FK_NAME} AS CONSTRAINT_NAME, 'def' AS UNIQUE_CONSTRAINT_CATALOG, \
+         '{SCHEMA_NAME}' AS UNIQUE_CONSTRAINT_SCHEMA, \
+         'PRIMARY' AS UNIQUE_CONSTRAINT_NAME, 'NONE' AS MATCH_OPTION, \
+         f.on_update AS UPDATE_RULE, f.on_delete AS DELETE_RULE, \
+         m.name COLLATE NOCASE AS TABLE_NAME, \
+         f.\"table\" COLLATE NOCASE AS REFERENCED_TABLE_NAME \
+         FROM {} JOIN pragma_foreign_key_list(m.name) AS f WHERE f.seq = 0",
+        Tables::All.source()
+    )
+}
+
+/// `information_schema.TABLE_CONSTRAINTS`-shaped rows: each table's primary
+/// key and each foreign key (named as in [`key_column_usage_rows`]). `UNIQUE`
+/// and `CHECK` constraints are not listed: SQLite names neither, and its
+/// `CHECK` clauses are not introspectable.
+fn table_constraints_rows() -> String {
+    let src = Tables::All.source();
+    format!(
+        "SELECT 'def' AS CONSTRAINT_CATALOG, '{SCHEMA_NAME}' AS CONSTRAINT_SCHEMA, \
+         'PRIMARY' COLLATE NOCASE AS CONSTRAINT_NAME, '{SCHEMA_NAME}' AS TABLE_SCHEMA, \
+         m.name COLLATE NOCASE AS TABLE_NAME, 'PRIMARY KEY' AS CONSTRAINT_TYPE, \
+         'YES' AS ENFORCED \
+         FROM {src} WHERE m.type = 'table' \
+         AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) AS p WHERE p.pk > 0) \
+         UNION ALL \
+         SELECT 'def', '{SCHEMA_NAME}', {FK_NAME}, '{SCHEMA_NAME}', \
+         m.name COLLATE NOCASE, 'FOREIGN KEY', 'YES' \
+         FROM {src} JOIN pragma_foreign_key_list(m.name) AS f WHERE f.seq = 0"
+    )
+}
+
+/// `information_schema.CHECK_CONSTRAINTS`-shaped rows: always empty. SQLite
+/// keeps `CHECK` clauses only inside the table's `CREATE` text.
+fn check_constraints_rows() -> String {
+    format!(
+        "SELECT 'def' AS CONSTRAINT_CATALOG, '{SCHEMA_NAME}' AS CONSTRAINT_SCHEMA, \
+         '' AS CONSTRAINT_NAME, '' AS CHECK_CLAUSE WHERE 0"
+    )
+}
+
 // ── information_schema substitution ─────────────────────────────────────────
 
 /// Placeholder table names spliced into the AST and replaced with the
@@ -231,6 +309,12 @@ fn emulation_for(table: &str) -> Option<Emulation> {
         "columns" => Some(("columns", || column_rows(Tables::All))),
         "statistics" => Some(("statistics", statistics_rows)),
         "schemata" => Some(("schemata", schemata_rows)),
+        "key_column_usage" => Some(("key_column_usage", key_column_usage_rows)),
+        "table_constraints" => Some(("table_constraints", table_constraints_rows)),
+        "check_constraints" => Some(("check_constraints", check_constraints_rows)),
+        "referential_constraints" => {
+            Some(("referential_constraints", referential_constraints_rows))
+        }
         _ => None,
     }
 }
@@ -254,9 +338,15 @@ fn is_schema_column(expr: &Expr) -> bool {
         },
         _ => return false,
     };
-    ["table_schema", "schema_name", "index_schema"]
-        .iter()
-        .any(|c| ident.value.eq_ignore_ascii_case(c))
+    [
+        "table_schema",
+        "schema_name",
+        "index_schema",
+        "constraint_schema",
+        "referenced_table_schema",
+    ]
+    .iter()
+    .any(|c| ident.value.eq_ignore_ascii_case(c))
 }
 
 /// Replaces `information_schema.<t>` table references with placeholders.
@@ -285,7 +375,9 @@ impl VisitorMut for Substitute {
         let Some((canonical, build)) = emulation_for(table) else {
             return ControlFlow::Break(TranslateError::Unsupported(format!(
                 "information_schema.{table} is not emulated by litewire \
-                 (supported: tables, columns, statistics, schemata)"
+                 (supported: tables, columns, statistics, schemata, \
+                 key_column_usage, referential_constraints, table_constraints, \
+                 check_constraints)"
             )));
         };
         let placeholder = format!("{PLACEHOLDER_PREFIX}{canonical}");

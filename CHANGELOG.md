@@ -36,6 +36,8 @@ the commit that merges this changelog.
 
 ### Added
 
+- `information_schema.key_column_usage`, `referential_constraints`, `table_constraints` (primary and foreign keys) and `check_constraints` (always empty) are emulated; foreign keys come from `pragma_foreign_key_list`, named `<table>_ibfk_<n>`. CakePHP 5 reads them when it describes a table and failed with 1064 before. `constraint_schema` and `referenced_table_schema` comparisons now fold like `table_schema`.
+
 - The `ALTER TABLE` and DML forms self-migrating PHP applications use (ephpm
   Sendy compatibility, found by replaying Sendy 7.1.6's updater against
   MySQL 8.4 and litewire and diffing the schemas):
