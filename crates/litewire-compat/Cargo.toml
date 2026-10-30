@@ -1,0 +1,37 @@
+[package]
+name = "litewire-compat"
+description = "MySQL + PostgreSQL wire-compatibility corpus, differential harness, and gating test for litewire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# litewire itself, wired exactly the way ePHPm consumes it: the MySQL and
+# PostgreSQL wire frontends in front of the in-process Turso engine. `turso`
+# is the only backend enabled (no rusqlite `bundled` SQLite), matching the
+# production link so the corpus exercises the engine ePHPm actually ships.
+litewire = { path = "../litewire", default-features = false, features = [
+    "mysql",
+    "postgres",
+    "turso",
+] }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+# Wire clients. These drive BOTH the litewire listeners and the reference
+# servers over the real protocols, so a wire-layer defect (type encoding,
+# out-of-sync state machine) is caught, not just a translation bug.
+mysql_async = { workspace = true }
+tokio-postgres = { workspace = true }
+
+# Baseline file (checked-in expectations).
+serde = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
