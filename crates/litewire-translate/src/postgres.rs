@@ -1,6 +1,8 @@
 //! PostgreSQL-specific SQL rewrites.
 
-use sqlparser::ast::{DataType, Statement};
+use std::ops::ControlFlow;
+
+use sqlparser::ast::{DataType, Query, Statement, VisitMut, VisitorMut};
 
 use crate::TranslateError;
 
@@ -11,7 +13,25 @@ pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), TranslateError> {
             col.data_type = rewrite_data_type(&col.data_type);
         }
     }
+    // Drop locking-read clauses (`FOR UPDATE`, `FOR SHARE`, ...). SQLite has no
+    // row-level locking, so Turso rejects the `FOR` keyword. The MySQL path
+    // already clears these (see `mysql::QueryShape`); this closes the same gap
+    // on the PostgreSQL side. The rows are returned; the lock is not enforced.
+    let _ = VisitMut::visit(stmt, &mut StripLocks);
     Ok(())
+}
+
+/// Clears every query's locking-read clause (`query.locks`), nested queries
+/// included.
+struct StripLocks;
+
+impl VisitorMut for StripLocks {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<()> {
+        query.locks.clear();
+        ControlFlow::Continue(())
+    }
 }
 
 /// Map PostgreSQL types to SQLite affinities.
@@ -62,6 +82,37 @@ mod tests {
             TranslateResult::Sql(s) => s.as_str(),
             other => panic!("expected Sql, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn for_update_is_stripped() {
+        for sql in [
+            "SELECT id FROM users WHERE id = 1 FOR UPDATE",
+            "SELECT id FROM users FOR SHARE",
+            "SELECT id FROM users WHERE id = 1 FOR UPDATE NOWAIT",
+        ] {
+            let results = translate(sql, Dialect::PostgreSQL).unwrap();
+            let out = extract_sql(&results[0]);
+            assert!(
+                !out.to_ascii_uppercase().contains("FOR UPDATE")
+                    && !out.to_ascii_uppercase().contains("FOR SHARE"),
+                "locking clause survived for `{sql}`: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_update_stripped_in_subquery() {
+        let results = translate(
+            "SELECT * FROM (SELECT id FROM users FOR UPDATE) AS x",
+            Dialect::PostgreSQL,
+        )
+        .unwrap();
+        let out = extract_sql(&results[0]);
+        assert!(
+            !out.to_ascii_uppercase().contains("FOR UPDATE"),
+            "nested locking clause survived: {out}"
+        );
     }
 
     #[test]

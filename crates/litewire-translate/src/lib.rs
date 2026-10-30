@@ -168,6 +168,7 @@ pub fn translate(sql: &str, dialect: Dialect) -> Result<Vec<TranslateResult>, Tr
         let stripped = mysql::normalize_drop_key(&stripped).unwrap_or(stripped);
         let stripped = mysql_compat::parenthesized_add_columns(&stripped).unwrap_or(stripped);
         let stripped = mysql_compat::strip_index_type(&stripped).unwrap_or(stripped);
+        let stripped = mysql_compat::strip_index_comment(&stripped).unwrap_or(stripped);
         owned_sql = mysql::strip_key_column_direction(&stripped).unwrap_or(stripped);
         owned_sql.as_str()
     } else {

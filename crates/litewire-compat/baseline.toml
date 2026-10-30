@@ -24,23 +24,3 @@ reason = "Same Turso CTE engine bug as mysql/cte/simple (dialect-independent —
 id = "mysql/expr/integer_division"
 kind = "result_mismatch"
 reason = "Dialect semantics: MySQL `/` is floating-point division (7/2 = 3.5); SQLite/Turso (and PostgreSQL) do integer division on integer operands (3). Expected divergence, not a litewire defect."
-
-[[entry]]
-id = "pg/func/date_cast"
-kind = "result_mismatch"
-reason = "SQLite CAST semantics: `CAST('2024-01-15' AS DATE)` — SQLite/Turso has no DATE type and the declared type `DATE` carries NUMERIC affinity, so the string is coerced to its leading number (2024). PostgreSQL returns the date. A silent wrong-answer worth tracking; litewire could translate the cast to date(x) if this matters."
-
-[[entry]]
-id = "mysql/func/rand"
-kind = "exec_error"
-reason = "Translation gap: litewire does not map MySQL `RAND()` to SQLite `random()`, so Turso rejects it ('no such function: RAND'). PG `RANDOM()` works because SQLite has `random()`. Add a RAND()->random() rewrite to close this."
-
-[[entry]]
-id = "mysql/gap/index_comment_in_create"
-kind = "translation_error"
-reason = "sqlparser 0.57 cannot parse an index-level `COMMENT 'x'` inside CREATE TABLE (`KEY idx (col) COMMENT '...'`); it fails at the COMMENT token. Independent of the USING BTREE/HASH clauses (which litewire already drops). Tracks an upstream parser gap."
-
-[[entry]]
-id = "pg/gap/select_for_update"
-kind = "exec_error"
-reason = "SQLite has no row-level locking: PostgreSQL `SELECT ... FOR UPDATE` is passed through and Turso rejects the `FOR` keyword. (The MySQL path strips the locking clause; the PG path does not — closing that asymmetry would turn this into a pass.)"
