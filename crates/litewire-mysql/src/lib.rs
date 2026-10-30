@@ -60,6 +60,11 @@ pub struct MysqlFrontendConfig {
     /// the cap a client is refused immediately with
     /// `ER_CON_COUNT_ERROR (1040)`; accepts are never queued.
     pub max_connections: usize,
+    /// Log the inbound statement (truncated) with the parser error when a
+    /// statement fails to translate. Off by default; when off, only the error
+    /// is logged. Enabling it logs the statement raw (an explicit operator
+    /// opt-in for diagnostics).
+    pub log_failed_sql: bool,
 }
 
 /// Refuse a connection with a pre-handshake `ER_CON_COUNT_ERROR` packet.
@@ -254,6 +259,7 @@ impl MysqlFrontend {
         );
 
         let source = self.source.clone();
+        let log_failed_sql = self.config.log_failed_sql;
         // Shared parse+rewrite cache across every accepted connection.
         // Hot workloads (WordPress, Laravel) re-issue the same handful of
         // prepared statements repeatedly; caching drops sqlparser off the
@@ -298,18 +304,24 @@ impl MysqlFrontend {
                 // when a handshake selects one (see `CommandFilter`).
                 let single_backend = matches!(source, BackendSource::Fixed(_));
                 let handler = match source {
-                    BackendSource::Fixed(be) => match LiteWireHandler::new(be, cache).await {
-                        Ok(h) => h,
-                        Err(e) => {
-                            warn!(%peer, "MySQL: failed to open backend session: {e}");
-                            return;
+                    BackendSource::Fixed(be) => {
+                        match LiteWireHandler::new(be, cache, log_failed_sql).await {
+                            Ok(h) => h,
+                            Err(e) => {
+                                warn!(%peer, "MySQL: failed to open backend session: {e}");
+                                return;
+                            }
                         }
-                    },
+                    }
                     // No backend is opened yet: the handshake decides which
                     // one (if any) this connection may have.
-                    BackendSource::PerConnection(auth) => {
-                        LiteWireHandler::new_authenticating(auth, cache, local_addr, peer)
-                    }
+                    BackendSource::PerConnection(auth) => LiteWireHandler::new_authenticating(
+                        auth,
+                        cache,
+                        local_addr,
+                        peer,
+                        log_failed_sql,
+                    ),
                 };
                 let reset_signal = handler.reset_signal();
                 // Three handles to one socket; see `SocketHandle`.

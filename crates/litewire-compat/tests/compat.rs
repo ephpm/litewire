@@ -82,6 +82,7 @@ async fn mysql_prepared_statement_roundtrip() {
     let config = litewire::litewire_mysql::MysqlFrontendConfig {
         listen: addr,
         max_connections: 0,
+        log_failed_sql: false,
     };
     let frontend = litewire::litewire_mysql::MysqlFrontend::new(config, Arc::new(backend));
     let _serve = tokio::spawn(async move {

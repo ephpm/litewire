@@ -35,6 +35,11 @@ pub struct TdsFrontendConfig {
     /// first with Pre-Login, and answering before reading it would mean
     /// framing a response to a message we have not seen.
     pub max_connections: usize,
+    /// Log the inbound statement (truncated) with the parser error when a
+    /// statement fails to translate. Off by default; when off, only the error
+    /// is logged. Enabling it logs the statement raw (an explicit operator
+    /// opt-in for diagnostics).
+    pub log_failed_sql: bool,
 }
 
 /// TDS wire protocol frontend.
@@ -67,6 +72,7 @@ impl TdsFrontend {
         );
 
         let backend = Arc::clone(&self.backend);
+        let log_failed_sql = self.config.log_failed_sql;
 
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -98,7 +104,7 @@ impl TdsFrontend {
                 // Released when this task ends, on the same path that drops
                 // the session and reclaims its worker thread.
                 let _slot = slot;
-                if let Err(e) = handler::handle_connection(stream, be).await {
+                if let Err(e) = handler::handle_connection(stream, be, log_failed_sql).await {
                     debug!(%peer, "TDS session ended: {e}");
                 }
             });

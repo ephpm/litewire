@@ -72,6 +72,7 @@ enum BackendSource {
 pub struct LiteWire {
     source: BackendSource,
     max_connections: usize,
+    log_failed_sql: bool,
     #[cfg(feature = "mysql")]
     mysql_listen: Option<SocketAddr>,
     #[cfg(feature = "hrana")]
@@ -120,6 +121,7 @@ impl LiteWire {
         Self {
             source,
             max_connections: 0,
+            log_failed_sql: false,
             #[cfg(feature = "mysql")]
             mysql_listen: None,
             #[cfg(feature = "hrana")]
@@ -164,6 +166,22 @@ impl LiteWire {
     #[must_use]
     pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
+        self
+    }
+
+    /// Log the inbound statement (truncated to 2000 chars) alongside the parser
+    /// error when a statement fails to translate. **Off by default.**
+    ///
+    /// When disabled (the default) a translation failure logs only the error,
+    /// never the statement text, so no query data reaches the logs unless an
+    /// operator opts in. When enabled the statement is logged **raw** — it is a
+    /// deliberate operator choice for diagnostics, so no redaction is applied.
+    /// This changes logging only; the client still receives the same wire error.
+    ///
+    /// Applies to every configured frontend (MySQL, PostgreSQL, TDS).
+    #[must_use]
+    pub fn log_failed_sql(mut self, enabled: bool) -> Self {
+        self.log_failed_sql = enabled;
         self
     }
 
@@ -241,6 +259,7 @@ impl LiteWire {
             let config = litewire_mysql::MysqlFrontendConfig {
                 listen: addr,
                 max_connections: self.max_connections,
+                log_failed_sql: self.log_failed_sql,
             };
             let frontend = match &self.source {
                 BackendSource::Fixed(backend) => {
@@ -279,6 +298,7 @@ impl LiteWire {
             let config = litewire_postgres::PostgresFrontendConfig {
                 listen: addr,
                 max_connections: self.max_connections,
+                log_failed_sql: self.log_failed_sql,
             };
             let frontend = litewire_postgres::PostgresFrontend::new(config, Arc::clone(backend));
             handles.push(tokio::spawn(async move {
@@ -291,6 +311,7 @@ impl LiteWire {
             let config = litewire_tds::TdsFrontendConfig {
                 listen: addr,
                 max_connections: self.max_connections,
+                log_failed_sql: self.log_failed_sql,
             };
             let frontend = litewire_tds::TdsFrontend::new(config, Arc::clone(backend));
             handles.push(tokio::spawn(async move {
@@ -325,6 +346,17 @@ mod tests {
     #[test]
     fn new_does_not_panic() {
         let _lw = LiteWire::new(memory_backend());
+    }
+
+    #[test]
+    fn log_failed_sql_defaults_off_and_is_settable() {
+        // The whole point of the knob: a caller that sets nothing logs nothing.
+        let lw = LiteWire::new(memory_backend());
+        assert!(!lw.log_failed_sql, "log_failed_sql must default to false");
+        let lw = lw.log_failed_sql(true);
+        assert!(lw.log_failed_sql, "log_failed_sql(true) must enable it");
+        let lw = lw.log_failed_sql(false);
+        assert!(!lw.log_failed_sql, "log_failed_sql(false) must disable it");
     }
 
     #[cfg(feature = "mysql")]

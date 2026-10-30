@@ -34,6 +34,9 @@ pub struct PostgresHandler {
     conn: Box<dyn BackendConn>,
     query_parser: Arc<NoopQueryParser>,
     translate_cache: Arc<TranslateCache>,
+    /// Log the inbound statement with the parser error on a translation
+    /// failure. Off by default (see [`crate::PostgresFrontendConfig`]).
+    log_failed_sql: bool,
 }
 
 impl PostgresHandler {
@@ -46,12 +49,14 @@ impl PostgresHandler {
     pub async fn new(
         backend: SharedBackend,
         translate_cache: Arc<TranslateCache>,
+        log_failed_sql: bool,
     ) -> Result<Self, BackendError> {
         let conn = backend.connect().await?;
         Ok(Self {
             conn,
             query_parser: Arc::new(NoopQueryParser::new()),
             translate_cache,
+            log_failed_sql,
         })
     }
 
@@ -381,6 +386,19 @@ fn extract_params(portal: &Portal<String>) -> Vec<Value> {
     values
 }
 
+/// First 2000 characters of `sql`, with an explicit elision marker, so a huge
+/// statement logged on the (opt-in) translation-error path cannot flood the
+/// logs. Char-boundary safe.
+fn truncate_for_log(sql: &str) -> String {
+    const LIMIT: usize = 2000;
+    let total = sql.chars().count();
+    if total <= LIMIT {
+        return sql.to_string();
+    }
+    let head: String = sql.chars().take(LIMIT).collect();
+    format!("{head}… [truncated, {total} chars total]")
+}
+
 /// Build a PgWireError from an arbitrary error string with SQLSTATE `XX000`
 /// (internal_error). Prefer [`pg_backend_error`] for messages that came from
 /// the backend so they get classified into a specific SQLSTATE.
@@ -418,7 +436,11 @@ impl SimpleQueryHandler for PostgresHandler {
         let translated =
             litewire_translate::translate_cached(&self.translate_cache, query, Dialect::PostgreSQL)
                 .map_err(|e| {
-                    warn!("SQL translation error: {e}");
+                    if self.log_failed_sql {
+                        warn!(sql = %truncate_for_log(query), "SQL translation error: {e}");
+                    } else {
+                        warn!("SQL translation error: {e}");
+                    }
                     pg_error(&e.to_string())
                 })?;
 

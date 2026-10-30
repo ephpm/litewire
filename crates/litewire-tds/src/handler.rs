@@ -21,14 +21,18 @@ struct TdsSession {
     next_tran_id: u64,
     /// Current transaction descriptor (non-zero when in a transaction).
     current_tran_id: u64,
+    /// Log the inbound statement with the parser error on a translation
+    /// failure. Off by default (see [`crate::TdsFrontendConfig`]).
+    log_failed_sql: bool,
 }
 
 impl TdsSession {
-    fn new() -> Self {
+    fn new(log_failed_sql: bool) -> Self {
         Self {
             in_transaction: false,
             next_tran_id: 1,
             current_tran_id: 0,
+            log_failed_sql,
         }
     }
 
@@ -53,7 +57,11 @@ impl TdsSession {
 /// Opens a per-session `BackendConn` after Pre-Login/Login7 so this
 /// client's `BEGIN`/`COMMIT` are isolated from other TDS clients. See
 /// the `BackendConn` docs for the rationale.
-pub async fn handle_connection<S>(mut stream: S, backend: SharedBackend) -> std::io::Result<()>
+pub async fn handle_connection<S>(
+    mut stream: S,
+    backend: SharedBackend,
+    log_failed_sql: bool,
+) -> std::io::Result<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -71,7 +79,7 @@ where
         .await
         .map_err(|e| std::io::Error::other(format!("TDS: failed to open backend session: {e}")))?;
 
-    let mut session = TdsSession::new();
+    let mut session = TdsSession::new(log_failed_sql);
 
     // Phase 3: Query loop
     loop {
@@ -386,6 +394,19 @@ fn extract_nvarchar_param(data: &[u8]) -> Option<String> {
     decode_utf16le(&data[pos..pos + val_len])
 }
 
+/// First 2000 characters of `sql`, with an explicit elision marker, so a huge
+/// statement logged on the (opt-in) translation-error path cannot flood the
+/// logs. Char-boundary safe.
+fn truncate_for_log(sql: &str) -> String {
+    const LIMIT: usize = 2000;
+    let total = sql.chars().count();
+    if total <= LIMIT {
+        return sql.to_string();
+    }
+    let head: String = sql.chars().take(LIMIT).collect();
+    format!("{head}… [truncated, {total} chars total]")
+}
+
 /// Execute translated SQL and send the result as a TDS response.
 async fn execute_sql<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
@@ -398,7 +419,11 @@ async fn execute_sql<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let translated = match litewire_translate::translate(sql, Dialect::TDS) {
         Ok(r) => r,
         Err(e) => {
-            warn!("SQL translation error: {e}");
+            if session.log_failed_sql {
+                warn!(sql = %truncate_for_log(sql), "SQL translation error: {e}");
+            } else {
+                warn!("SQL translation error: {e}");
+            }
             return send_error(stream, &e.to_string()).await;
         }
     };
@@ -583,7 +608,7 @@ mod tests {
 
     #[test]
     fn session_new_initial_state() {
-        let session = TdsSession::new();
+        let session = TdsSession::new(false);
         assert!(!session.in_transaction);
         assert_eq!(session.current_tran_id, 0);
         assert_eq!(session.next_tran_id, 1);
@@ -591,7 +616,7 @@ mod tests {
 
     #[test]
     fn session_begin_sets_transaction() {
-        let mut session = TdsSession::new();
+        let mut session = TdsSession::new(false);
         let id = session.begin();
         assert_eq!(id, 1);
         assert!(session.in_transaction);
@@ -600,7 +625,7 @@ mod tests {
 
     #[test]
     fn session_end_clears_transaction() {
-        let mut session = TdsSession::new();
+        let mut session = TdsSession::new(false);
         session.begin();
         let old_id = session.end();
         assert_eq!(old_id, 1);
@@ -610,7 +635,7 @@ mod tests {
 
     #[test]
     fn session_multiple_begin_end_cycles() {
-        let mut session = TdsSession::new();
+        let mut session = TdsSession::new(false);
 
         let id1 = session.begin();
         assert_eq!(id1, 1);
@@ -632,7 +657,7 @@ mod tests {
 
     #[test]
     fn session_next_tran_id_increments() {
-        let mut session = TdsSession::new();
+        let mut session = TdsSession::new(false);
         session.begin();
         assert_eq!(session.next_tran_id, 2);
         session.end();

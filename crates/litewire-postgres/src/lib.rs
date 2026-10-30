@@ -47,6 +47,11 @@ pub struct PostgresFrontendConfig {
     /// clearly enough that the guess is not worth the risk of desyncing
     /// the stream.
     pub max_connections: usize,
+    /// Log the inbound statement (truncated) with the parser error when a
+    /// statement fails to translate. Off by default; when off, only the error
+    /// is logged. Enabling it logs the statement raw (an explicit operator
+    /// opt-in for diagnostics).
+    pub log_failed_sql: bool,
 }
 
 /// PostgreSQL wire protocol frontend.
@@ -82,6 +87,7 @@ impl PostgresFrontend {
         // same rationale as the MySQL frontend.
         let translate_cache = Arc::new(TranslateCache::default());
         let backend = Arc::clone(&self.backend);
+        let log_failed_sql = self.config.log_failed_sql;
 
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -118,7 +124,7 @@ impl PostgresFrontend {
                 // Released when this task ends, on the same path that drops
                 // the handler and reclaims its session's worker thread.
                 let _slot = slot;
-                let handler = match PostgresHandler::new(be, cache).await {
+                let handler = match PostgresHandler::new(be, cache, log_failed_sql).await {
                     Ok(h) => h,
                     Err(e) => {
                         warn!(%peer, "PostgreSQL: failed to open backend session: {e}");
