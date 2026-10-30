@@ -65,8 +65,21 @@ kind = "result_mismatch"   # ok | translation_error | exec_error | result_mismat
 reason = "MySQL `/` is float division (7/2 = 3.5); SQLite does integer division (3)"
 ```
 
-Regenerate it deliberately (never edit observed categories by hand) and review
-the diff:
+### Deliberate divergences kept in the baseline
+
+Some rows are not translation gaps to be closed but semantic differences between
+MySQL and SQLite/Turso that litewire deliberately does **not** paper over:
+
+* **Integer vs float division** (`mysql/expr/integer_division`). MySQL's `/` is
+  always floating-point (`7 / 2` = `3.5`); SQLite/Turso (like PostgreSQL) does
+  integer division on integer operands (`7 / 2` = `3`). litewire does **not**
+  rewrite `/`: blanket-coercing every division to float would change the result
+  of every integer-arithmetic query and risk silent wrong answers far beyond
+  this one case. An application that needs MySQL float-division semantics must
+  cast an operand itself (`CAST(a AS REAL) / b`, or `a * 1.0 / b`).
+
+Regenerate the baseline deliberately (never edit observed categories by hand)
+and review the diff:
 
 ```bash
 # With the same reference env you want the baseline to reflect:

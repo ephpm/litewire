@@ -166,6 +166,42 @@ pub(crate) fn strip_index_type(sql: &str) -> Option<String> {
     (!edits.is_empty()).then(|| splice(sql, &edits))
 }
 
+/// Remove MySQL `COMMENT '...'` option clauses from table DDL.
+///
+/// sqlparser 0.57 parses a *column* COMMENT (which litewire already drops at
+/// emit), but rejects an *index*-level COMMENT after a key's column list
+/// (`KEY k (col) COMMENT 'x'`), failing at the `COMMENT` token. A comment is
+/// metadata SQLite does not store, so dropping every `COMMENT '...'` (and the
+/// `COMMENT = '...'` table-option form) from the DDL text is safe and closes
+/// the index-COMMENT parse gap.
+///
+/// Quote-aware: it matches the `COMMENT` *keyword token* followed by a string
+/// *token*, so `COMMENT` inside a string literal, a back-tick identifier, or a
+/// column named `comment` (which is never followed by a bare string) is never
+/// touched. `None` when there is nothing to remove.
+pub(crate) fn strip_index_comment(sql: &str) -> Option<String> {
+    let toks = lex(sql).ok()?;
+    let mut edits = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if is_word(&toks, i, "COMMENT") {
+            // Optional `=` for the table-option form `COMMENT = 'x'`.
+            let str_idx = if is_other(&toks, i + 1, '=') {
+                i + 2
+            } else {
+                i + 1
+            };
+            if matches!(toks.get(str_idx).map(|l| &l.tok), Some(Tok::Str(_))) {
+                edits.push((toks[i].start, tok_end(sql, &toks, str_idx), String::new()));
+                i = str_idx + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    (!edits.is_empty()).then(|| splice(sql, &edits))
+}
+
 // ── UPDATE ... [ORDER BY ...] LIMIT n ────────────────────────────────────────
 
 /// A single-table `UPDATE` with a trailing `[ORDER BY ...] LIMIT n` (which
@@ -857,6 +893,57 @@ mod tests {
         let v = sqls(sql);
         assert_eq!(v.len(), 1, "{sql}: {v:?}");
         v.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn index_comment_in_create_table_parses() {
+        // sqlparser 0.57 cannot parse an index-level COMMENT; litewire strips it
+        // before parsing. The inline KEY expands to a separate CREATE INDEX.
+        let v = sqls(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, email VARCHAR(191), \
+             KEY email_idx (email) COMMENT 'lookup')",
+        );
+        let joined = v.join(" ; ");
+        assert!(
+            !joined.to_ascii_uppercase().contains("COMMENT"),
+            "COMMENT survived: {joined}"
+        );
+        assert!(
+            joined.to_ascii_uppercase().contains("CREATE INDEX"),
+            "index not expanded: {joined}"
+        );
+    }
+
+    #[test]
+    fn comment_strip_is_quote_and_token_aware() {
+        // A `COMMENT` keyword inside a string literal is never touched.
+        assert_eq!(
+            super::strip_index_comment("INSERT INTO t (c) VALUES ('KEY k (x) COMMENT ''z''')"),
+            None
+        );
+        // Table-option `COMMENT = 'x'` form is also removed.
+        let stripped =
+            super::strip_index_comment("CREATE TABLE t (id INT) COMMENT = 'a table'").unwrap();
+        assert!(
+            !stripped.to_ascii_uppercase().contains("COMMENT"),
+            "got: {stripped}"
+        );
+        // Nothing to strip -> None.
+        assert_eq!(
+            super::strip_index_comment("CREATE TABLE t (id INT, c TEXT)"),
+            None
+        );
+    }
+
+    #[test]
+    fn column_comment_still_dropped() {
+        // Regression guard: a column-level COMMENT (which sqlparser does parse)
+        // is still gone from the output.
+        let out = one("CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT COMMENT 'hi')");
+        assert!(
+            !out.to_ascii_uppercase().contains("COMMENT"),
+            "column COMMENT survived: {out}"
+        );
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! type casts, and parameter placeholders.
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
-    ObjectName, Statement, Value, ValueWithSpan,
+    BinaryOperator, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, Ident, ObjectName, Statement, Value, ValueWithSpan,
 };
 
 use crate::TranslateError;
@@ -79,13 +79,47 @@ fn rewrite_query_exprs(query: &mut sqlparser::ast::Query) {
 fn rewrite_expr(expr: &mut Expr) {
     match expr {
         Expr::Function(func) => {
-            rewrite_function(func);
-            if let FunctionArguments::List(FunctionArgumentList { args, .. }) = &mut func.args {
-                for arg in args {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                        rewrite_expr(e);
+            // `RAND()` has no SQLite scalar. Replace the *whole expression* with
+            // a float in [0, 1) derived from `random()`; this cannot live in
+            // `rewrite_function`, which only sees the `Function` node and must
+            // keep it a function call.
+            if is_zero_arg_call(func, "RAND") {
+                *expr = rand_to_unit_float();
+            } else {
+                rewrite_function(func);
+                if let FunctionArguments::List(FunctionArgumentList { args, .. }) = &mut func.args {
+                    for arg in args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                            rewrite_expr(e);
+                        }
                     }
                 }
+            }
+        }
+        // `CAST(x AS DATE)`: Turso has no DATE type and the declared type `DATE`
+        // carries NUMERIC affinity, so the string is coerced to its leading
+        // number (`CAST('2024-01-15' AS DATE)` -> 2024). Rewrite to SQLite's
+        // `date(x)`, which returns the ISO date.
+        Expr::Cast {
+            data_type: DataType::Date,
+            ..
+        } => {
+            let taken = std::mem::replace(expr, value_expr(Value::Null));
+            if let Expr::Cast {
+                expr: mut inner, ..
+            } = taken
+            {
+                rewrite_expr(&mut inner);
+                *expr = Expr::Function(Function {
+                    name: func_name("date"),
+                    args: func_args(vec![*inner]),
+                    filter: None,
+                    over: None,
+                    within_group: vec![],
+                    parameters: FunctionArguments::None,
+                    null_treatment: None,
+                    uses_odbc_syntax: false,
+                });
             }
         }
         Expr::Value(val_with_span) => {
@@ -178,6 +212,50 @@ fn rewrite_expr(expr: &mut Expr) {
         }
         _ => {}
     }
+}
+
+/// True if `func` is a call to `name` (case-insensitive) with no arguments,
+/// e.g. `RAND()`.
+fn is_zero_arg_call(func: &Function, name: &str) -> bool {
+    if !func.name.to_string().eq_ignore_ascii_case(name) {
+        return false;
+    }
+    match &func.args {
+        FunctionArguments::None => true,
+        FunctionArguments::List(list) => list.args.is_empty(),
+        FunctionArguments::Subquery(_) => false,
+    }
+}
+
+/// Build `(0.5 + random() / 18446744073709551616.0)`, a float in `[0, 1)` — the
+/// SQLite stand-in for MySQL `RAND()`. `random()` is a signed 64-bit integer in
+/// `[-2^63, 2^63)`; dividing by `2^64` (as a float, forcing float division)
+/// gives `[-0.5, 0.5)`, and `+ 0.5` shifts it to `[0, 1)`.
+fn rand_to_unit_float() -> Expr {
+    let random_call = Expr::Function(Function {
+        name: func_name("random"),
+        args: func_args(vec![]),
+        filter: None,
+        over: None,
+        within_group: vec![],
+        parameters: FunctionArguments::None,
+        null_treatment: None,
+        uses_odbc_syntax: false,
+    });
+    let divided = Expr::BinaryOp {
+        left: Box::new(random_call),
+        op: BinaryOperator::Divide,
+        right: Box::new(value_expr(Value::Number(
+            "18446744073709551616.0".into(),
+            false,
+        ))),
+    };
+    let sum = Expr::BinaryOp {
+        left: Box::new(value_expr(Value::Number("0.5".into(), false))),
+        op: BinaryOperator::Plus,
+        right: Box::new(divided),
+    };
+    Expr::Nested(Box::new(sum))
 }
 
 /// Helper to create a `ValueWithSpan` from a `Value`.
@@ -533,6 +611,56 @@ mod tests {
         let sql = extract_sql(&results[0]);
         assert!(sql.contains("?1"), "got: {sql}");
         assert!(sql.contains("?2"), "got: {sql}");
+    }
+
+    #[test]
+    fn rand_rewrite() {
+        // `RAND()` -> a float in [0, 1) over `random()`; executes on Turso
+        // (which has no `RAND`) and is non-deterministic, so only the shape is
+        // asserted here (correctness is coverage-only in the compat suite).
+        let results = translate("SELECT RAND()", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.to_ascii_lowercase().contains("random()"), "got: {sql}");
+        assert!(!sql.to_ascii_uppercase().contains("RAND("), "got: {sql}");
+        assert!(sql.contains("0.5"), "got: {sql}");
+    }
+
+    #[test]
+    fn rand_rewrite_in_where_clause() {
+        let results = translate("SELECT id FROM t WHERE score > RAND()", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.to_ascii_lowercase().contains("random()"), "got: {sql}");
+        assert!(!sql.to_ascii_uppercase().contains("RAND("), "got: {sql}");
+    }
+
+    #[test]
+    fn rand_with_seed_is_left_alone() {
+        // The seeded form has no SQLite analogue; leave it for the engine to
+        // reject loudly rather than silently drop the seed.
+        let results = translate("SELECT RAND(7)", Dialect::MySQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.to_ascii_uppercase().contains("RAND("), "got: {sql}");
+    }
+
+    #[test]
+    fn cast_as_date_rewrite() {
+        // `CAST('2024-01-15' AS DATE)` -> `date('2024-01-15')` so Turso returns
+        // the ISO date instead of coercing to the leading number (2024).
+        for dialect in [Dialect::PostgreSQL, Dialect::MySQL] {
+            let results = translate("SELECT CAST('2024-01-15' AS DATE)", dialect).unwrap();
+            let sql = extract_sql(&results[0]);
+            assert!(sql.to_ascii_lowercase().contains("date("), "got: {sql}");
+            assert!(!sql.to_ascii_uppercase().contains("CAST("), "got: {sql}");
+            assert!(sql.contains("'2024-01-15'"), "got: {sql}");
+        }
+    }
+
+    #[test]
+    fn cast_as_other_types_unchanged() {
+        // Only DATE is special-cased; other casts pass through.
+        let results = translate("SELECT CAST(x AS INTEGER) FROM t", Dialect::PostgreSQL).unwrap();
+        let sql = extract_sql(&results[0]);
+        assert!(sql.to_ascii_uppercase().contains("CAST("), "got: {sql}");
     }
 
     // ── Helper ──────────────────────────────────────────────────────────────
