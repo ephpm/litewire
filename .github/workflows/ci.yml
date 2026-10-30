@@ -70,6 +70,54 @@ jobs:
       # run alone misses every optional backend (hrana-client, turso).
       - run: cargo test --workspace --all-features
 
+  # Wire-compatibility gate: drive the litewire-compat corpus through the
+  # MySQL and PostgreSQL wire listeners (over the in-process Turso engine) AND
+  # against real MySQL/PostgreSQL servers, normalize and diff the results, and
+  # fail on any regression (a corpus entry that fails and is not baselined).
+  # The `test` job above already runs the same corpus coverage-only (no
+  # servers) as part of `cargo test --workspace`; this job adds result
+  # correctness. The corpus runs in seconds, so it is a PR merge gate.
+  compat:
+    name: wire-compat
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: litewire_compat
+        ports:
+          - 3306:3306
+        # GitHub waits for the service to report healthy before running steps.
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=15
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Services are published on the runner's localhost. The suite creates a
+      # dedicated `litewire_compat` database/schema on each; no application
+      # data is touched.
+      - name: Run wire-compatibility suite
+        env:
+          COMPAT_MYSQL_URL: mysql://root:root@127.0.0.1:3306
+          COMPAT_PG_URL: host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres
+        run: cargo test -p litewire-compat -- --nocapture
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
