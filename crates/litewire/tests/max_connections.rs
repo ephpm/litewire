@@ -28,6 +28,7 @@ async fn start_mysql(port: u16, max_connections: usize) -> tokio::task::JoinHand
     let config = litewire::litewire_mysql::MysqlFrontendConfig {
         listen: addr,
         max_connections,
+        log_failed_sql: false,
     };
     let frontend =
         litewire::litewire_mysql::MysqlFrontend::new(config, std::sync::Arc::new(backend));
@@ -46,6 +47,7 @@ async fn start_postgres(port: u16, max_connections: usize) -> tokio::task::JoinH
     let config = litewire::litewire_postgres::PostgresFrontendConfig {
         listen: addr,
         max_connections,
+        log_failed_sql: false,
     };
     let frontend =
         litewire::litewire_postgres::PostgresFrontend::new(config, std::sync::Arc::new(backend));
@@ -381,6 +383,7 @@ async fn tds_cap_refuses_and_releases() {
     let config = litewire::litewire_tds::TdsFrontendConfig {
         listen: addr,
         max_connections: 1,
+        log_failed_sql: false,
     };
     let frontend = litewire::litewire_tds::TdsFrontend::new(config, std::sync::Arc::new(backend));
     tokio::spawn(async move {

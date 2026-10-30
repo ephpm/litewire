@@ -32,6 +32,7 @@ async fn serve(backend: SharedBackend) -> Conn {
     let config = litewire::litewire_mysql::MysqlFrontendConfig {
         listen: addr,
         max_connections: 0,
+        log_failed_sql: false,
     };
     let frontend = litewire::litewire_mysql::MysqlFrontend::new(config, backend);
     tokio::spawn(async move {

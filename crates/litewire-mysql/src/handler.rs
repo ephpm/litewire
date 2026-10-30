@@ -53,6 +53,19 @@ fn ok_response(affected_rows: u64, last_insert_id: u64, in_transaction: bool) ->
     }
 }
 
+/// First 2000 characters of `sql`, with an explicit elision marker, so a huge
+/// statement logged on the (opt-in) translation-error path cannot flood the
+/// logs. Char-boundary safe.
+fn truncate_for_log(sql: &str) -> String {
+    const LIMIT: usize = 2000;
+    let total = sql.chars().count();
+    if total <= LIMIT {
+        return sql.to_string();
+    }
+    let head: String = sql.chars().take(LIMIT).collect();
+    format!("{head}… [truncated, {total} chars total]")
+}
+
 use crate::types::{mysql_type_for_value, sqlite_to_mysql_column_type};
 
 /// Everything the authenticating (multi-tenant) path needs to resolve this
@@ -152,6 +165,9 @@ pub struct LiteWireHandler {
     /// `COM_RESET_CONNECTION` or `COM_CHANGE_USER`; drained by
     /// [`Self::apply_pending_reset`] before the next statement.
     reset_pending: Arc<AtomicBool>,
+    /// Log the inbound statement with the parser error on a translation
+    /// failure. Off by default (see [`crate::MysqlFrontendConfig`]).
+    log_failed_sql: bool,
 }
 
 impl LiteWireHandler {
@@ -170,6 +186,7 @@ impl LiteWireHandler {
     pub async fn new(
         backend: SharedBackend,
         translate_cache: Arc<TranslateCache>,
+        log_failed_sql: bool,
     ) -> Result<Self, BackendError> {
         let conn = backend.connect().await?;
         let session = OnceLock::new();
@@ -181,6 +198,7 @@ impl LiteWireHandler {
             stmts: HashMap::new(),
             next_stmt_id: 1,
             reset_pending: Arc::new(AtomicBool::new(false)),
+            log_failed_sql,
         })
     }
 
@@ -195,6 +213,7 @@ impl LiteWireHandler {
         translate_cache: Arc<TranslateCache>,
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
+        log_failed_sql: bool,
     ) -> Self {
         Self {
             session: OnceLock::new(),
@@ -209,6 +228,7 @@ impl LiteWireHandler {
             stmts: HashMap::new(),
             next_stmt_id: 1,
             reset_pending: Arc::new(AtomicBool::new(false)),
+            log_failed_sql,
         }
     }
 
@@ -805,7 +825,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for LiteWireHandler {
             }
             Err(e) => {
                 if matches!(e, SessionError::Translate(_)) {
-                    warn!("SQL translation error: {e}");
+                    if self.log_failed_sql {
+                        warn!(sql = %truncate_for_log(query), "SQL translation error: {e}");
+                    } else {
+                        warn!("SQL translation error: {e}");
+                    }
                 }
                 write_session_error(results, &e).await
             }
@@ -881,6 +905,7 @@ mod tests {
             Arc::new(TranslateCache::default()),
             "127.0.0.1:3306".parse().unwrap(),
             "127.0.0.1:5555".parse().unwrap(),
+            false,
         );
         assert!(handler.session().is_none());
     }
@@ -903,7 +928,7 @@ mod tests {
         let cache = Arc::new(TranslateCache::default());
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(LiteWireHandler::new(backend, cache))
+            .block_on(LiteWireHandler::new(backend, cache, false))
             .unwrap()
     }
 
@@ -1225,7 +1250,7 @@ mod tests {
     async fn memory_handler_async() -> LiteWireHandler {
         let backend = Arc::new(Rusqlite::memory().unwrap()) as SharedBackend;
         let cache = Arc::new(TranslateCache::default());
-        LiteWireHandler::new(backend, cache).await.unwrap()
+        LiteWireHandler::new(backend, cache, false).await.unwrap()
     }
 
     #[tokio::test]

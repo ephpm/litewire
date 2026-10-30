@@ -111,6 +111,7 @@ impl MysqlWire {
         let config = litewire::litewire_mysql::MysqlFrontendConfig {
             listen: addr,
             max_connections: 0,
+            log_failed_sql: false,
         };
         let frontend = litewire::litewire_mysql::MysqlFrontend::new(config, Arc::new(backend));
         let serve = tokio::spawn(async move {
@@ -293,6 +294,7 @@ impl PgWire {
         let config = litewire::litewire_postgres::PostgresFrontendConfig {
             listen: addr,
             max_connections: 0,
+            log_failed_sql: false,
         };
         let frontend =
             litewire::litewire_postgres::PostgresFrontend::new(config, Arc::new(backend));

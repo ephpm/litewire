@@ -24,6 +24,7 @@ async fn start_litewire(port: u16) -> tokio::task::JoinHandle<()> {
     let config = litewire::litewire_tds::TdsFrontendConfig {
         listen: addr,
         max_connections: 0,
+        log_failed_sql: false,
     };
     let frontend = litewire::litewire_tds::TdsFrontend::new(config, std::sync::Arc::new(backend));
 

@@ -23,6 +23,7 @@ async fn start_litewire(port: u16) -> tokio::task::JoinHandle<()> {
     let config = litewire::litewire_postgres::PostgresFrontendConfig {
         listen: addr,
         max_connections: 0,
+        log_failed_sql: false,
     };
     let frontend =
         litewire::litewire_postgres::PostgresFrontend::new(config, std::sync::Arc::new(backend));

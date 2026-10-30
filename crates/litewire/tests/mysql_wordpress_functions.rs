@@ -25,6 +25,7 @@ async fn start_litewire(port: u16) -> tokio::task::JoinHandle<()> {
     let config = litewire::litewire_mysql::MysqlFrontendConfig {
         listen: addr,
         max_connections: 0,
+        log_failed_sql: false,
     };
     let frontend =
         litewire::litewire_mysql::MysqlFrontend::new(config, std::sync::Arc::new(backend));
