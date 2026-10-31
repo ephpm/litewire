@@ -183,6 +183,33 @@ fn dml(c: &mut Corpus<'_>) {
         "SELECT n FROM t WHERE id = 1",
         Diff::Rows,
     );
+    // INSERT ... RETURNING is row-returning and must run on the query() path
+    // exactly once. Before litewire#38 it was routed to execute(): the engine
+    // wrote the row and then errored ("unexpected row during execution"), so a
+    // caller that retries on error double-inserted. PostgreSQL supports
+    // RETURNING natively (the result is diffed, deterministic because the id is
+    // explicit); MySQL 8.4 does not, so the reference rejects it and the runner
+    // records it as a coverage-only pass. Either way the measured check is that
+    // litewire translates and runs it on the correct path.
+    c.both(
+        "dml",
+        "insert_returning",
+        &["CREATE TABLE rt (id INTEGER PRIMARY KEY, name TEXT)"],
+        "INSERT INTO rt (id, name) VALUES (1, 'alice') RETURNING id",
+        Diff::Rows,
+    );
+    // DELETE ... RETURNING, same routing requirement (PG-only: the clause is a
+    // PostgreSQL extension and MySQL rejects it).
+    c.pg(
+        "dml",
+        "delete_returning",
+        &[
+            "CREATE TABLE rt (id INTEGER PRIMARY KEY, name TEXT)",
+            "INSERT INTO rt (id, name) VALUES (1, 'alice')",
+        ],
+        "DELETE FROM rt WHERE id = 1 RETURNING id",
+        Diff::Rows,
+    );
 }
 
 fn select_basic(c: &mut Corpus<'_>) {
@@ -418,6 +445,18 @@ fn cte_window(c: &mut Corpus<'_>) {
         "WITH au AS (SELECT id, name FROM users WHERE active = 1) \
          SELECT name FROM au ORDER BY name",
         Diff::OrderedRows,
+    );
+    // A CTE whose outer statement is a SELECT is a read. Its leading keyword is
+    // WITH, not SELECT, so before litewire#38 it was mis-routed to execute()
+    // and errored ("unexpected row during execution") on the Turso engine. The
+    // aggregate outer SELECT keeps the result deterministic for the diff.
+    c.both(
+        "cte",
+        "outer_select_count",
+        SEED_USERS,
+        "WITH au AS (SELECT id FROM users WHERE active = 1) \
+         SELECT COUNT(*) AS n FROM au",
+        Diff::Rows,
     );
     // Window functions: MySQL 8 / PG support them; the SQLite engine may not.
     c.both(
