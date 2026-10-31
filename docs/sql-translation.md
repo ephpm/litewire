@@ -157,7 +157,7 @@ Applied for every dialect:
 | `DATABASE()`, `SCHEMA()` | constant `'main'` |
 | `VERSION()` | constant `'8.0.36-litewire'` (`SERVER_VERSION`) |
 | `USER()`, `CURRENT_USER()`, `SESSION_USER()`, `SYSTEM_USER()` | constant `'root@localhost'` |
-| `CONNECTION_ID()` | constant `0` |
+| `CONNECTION_ID()` *embedded in a larger expression* | constant `0` (a bare `SELECT CONNECTION_ID()` reports the connection's real id — see below) |
 | `FOUND_ROWS()` *embedded in a larger expression* | constant `0` (the bare `SELECT FOUND_ROWS()` is emulated statefully — see below) |
 | `NEWID()` | `lower(hex(randomblob(16)))` |
 | `TRUE` / `FALSE` | `1` / `0` |
@@ -441,8 +441,18 @@ layers share the work:
 Return values follow the MySQL manual: `GET_LOCK` 1/0 (NULL for a NULL
 timeout); `RELEASE_LOCK` 1 released / 0 held by another session / NULL not
 held; `RELEASE_ALL_LOCKS` the number of acquisitions released; `IS_FREE_LOCK`
-1/0; `IS_USED_LOCK` the holder's session id or NULL. The session id is
-litewire's own per-connection counter, not the `CONNECTION_ID()` constant.
+1/0; `IS_USED_LOCK` the holder's session id or NULL. That session id is
+litewire's own per-connection counter (a `LockSession` id, starting at 1).
+
+A bare `SELECT CONNECTION_ID()` reports that same per-connection id, so it
+agrees with `IS_USED_LOCK` — MySQL guarantees the two match, and applications
+compare them. It is answered through the same `BackendConn::user_lock` path
+(`UserLockOp::ConnectionId`), so on a forwarding backend it reports the id of
+the session on the far side, exactly where the locks live. A connection with
+no lock scope (or one a clustered replica refuses) has no stable id and
+reports `0`, the historical constant — `CONNECTION_ID()` never errors.
+`CONNECTION_ID()` embedded in a larger expression still rewrites to the `0`
+constant (there is no connection context in stateless translation).
 
 **Scope is the embedder's choice, and refusing is the default.** A plain
 `BackendConn` answers every lock operation with an error ("named locks …

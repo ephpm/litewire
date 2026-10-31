@@ -130,6 +130,14 @@ pub enum UserLockOp {
         /// The normalized lock name.
         name: String,
     },
+    /// `CONNECTION_ID()`: this session's own id. It names no lock — it
+    /// identifies the connection — but it travels the same path as the lock
+    /// operations because the id it must report is the [`LockSession`] id,
+    /// the very value [`UserLockOp::IsUsed`] returns for a lock this session
+    /// holds. Routing it here is what keeps the two consistent, including
+    /// when a backend forwards lock operations to the session's real home on
+    /// another node.
+    ConnectionId,
 }
 
 /// What a lock operation evaluates to: the integer MySQL would return, or
@@ -142,6 +150,8 @@ pub enum UserLockOp {
 ///   three times counts three, as in MySQL).
 /// * `IsFree`: `Some(1)` free, `Some(0)` held.
 /// * `IsUsed`: `Some(holder session id)` or `None` if free.
+/// * `ConnectionId`: `Some(this session's id)`, always present (ids start
+///   at 1).
 pub type UserLockReply = Option<i64>;
 
 /// A lock that is currently held.
@@ -259,6 +269,7 @@ impl LockSession {
             UserLockOp::IsUsed { name } => {
                 self.holder_of(name).and_then(|id| i64::try_from(id).ok())
             }
+            UserLockOp::ConnectionId => i64::try_from(self.id).ok(),
         }
     }
 
@@ -728,6 +739,28 @@ mod tests {
             assert_eq!(w.await.unwrap(), Some(1));
         }
         assert_eq!(registry.held_in(""), 0);
+    }
+
+    /// `CONNECTION_ID()` reports a session's own id, which is exactly the id
+    /// `IS_USED_LOCK` reports for a lock that session holds — the consistency
+    /// MySQL guarantees (issue ephpm#657). The id is non-zero.
+    #[tokio::test]
+    async fn connection_id_matches_is_used_lock_holder() {
+        let registry = UserLockRegistry::new();
+        let a = registry.session("");
+        let b = registry.session("");
+
+        let a_conn_id = a.apply(&UserLockOp::ConnectionId).await;
+        assert_eq!(a_conn_id, Some(i64::try_from(a.id()).unwrap()));
+        assert_ne!(a_conn_id, Some(0), "CONNECTION_ID must be non-zero");
+
+        assert_eq!(a.apply(&get("rc", LockTimeout::Immediate)).await, Some(1));
+        // The holder id another connection observes equals the holder's own
+        // CONNECTION_ID.
+        assert_eq!(
+            b.apply(&UserLockOp::IsUsed { name: "rc".into() }).await,
+            a_conn_id
+        );
     }
 
     #[test]
