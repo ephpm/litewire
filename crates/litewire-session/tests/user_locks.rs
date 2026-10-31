@@ -435,3 +435,62 @@ async fn timed_wait_wakes_on_release() {
     );
     let _a = releaser.await.unwrap();
 }
+
+/// `SELECT CONNECTION_ID()` reports a non-zero id that equals the id
+/// `IS_USED_LOCK()` reports for a lock this connection holds — the MySQL
+/// consistency applications compare on (issue ephpm#657). Before the fix
+/// `CONNECTION_ID()` translated to the constant `0` while `IS_USED_LOCK()`
+/// returned the real holder id, so the two disagreed.
+#[tokio::test]
+async fn connection_id_agrees_with_is_used_lock() {
+    let registry = UserLockRegistry::new();
+    let mut a = scoped_session(&registry, "").await;
+    let mut b = scoped_session(&registry, "").await;
+
+    let conn_id = eval(&mut a, "SELECT CONNECTION_ID()").await;
+    assert!(
+        matches!(conn_id, Value::Integer(n) if n > 0),
+        "CONNECTION_ID must be a non-zero integer, got {conn_id:?}"
+    );
+    // Stable across calls on the same connection.
+    assert_eq!(eval(&mut a, "SELECT CONNECTION_ID()").await, conn_id);
+    // An alias is honored.
+    assert_eq!(eval(&mut a, "SELECT CONNECTION_ID() AS id").await, conn_id);
+
+    // A holds the lock; IS_USED_LOCK reports A's id — observed both by A
+    // itself and by another connection B.
+    assert_eq!(
+        eval(&mut a, "SELECT GET_LOCK('rc', 0)").await,
+        Value::Integer(1)
+    );
+    assert_eq!(eval(&mut a, "SELECT IS_USED_LOCK('rc')").await, conn_id);
+    assert_eq!(eval(&mut b, "SELECT IS_USED_LOCK('rc')").await, conn_id);
+
+    // Two connections have distinct ids.
+    assert_ne!(eval(&mut b, "SELECT CONNECTION_ID()").await, conn_id);
+}
+
+/// A connection with no lock scope answers `CONNECTION_ID()` with `0`
+/// (SQLite has no per-connection id), never an error.
+#[tokio::test]
+async fn connection_id_is_zero_without_a_lock_scope() {
+    let mut s = unscoped_session().await;
+    assert_eq!(
+        eval(&mut s, "SELECT CONNECTION_ID()").await,
+        Value::Integer(0)
+    );
+}
+
+/// The prepared-statement path answers `SELECT CONNECTION_ID()` the same way
+/// as the text path.
+#[tokio::test]
+async fn connection_id_through_prepared_statement() {
+    let registry = UserLockRegistry::new();
+    let mut a = scoped_session(&registry, "").await;
+
+    let conn_id = eval(&mut a, "SELECT CONNECTION_ID()").await;
+    let prepared = a.prepare("SELECT CONNECTION_ID()").unwrap();
+    assert_eq!(prepared.param_count(), 0);
+    let via_prepared = cell(a.execute_prepared(&prepared, &[]).await.unwrap());
+    assert_eq!(via_prepared, conn_id);
+}
