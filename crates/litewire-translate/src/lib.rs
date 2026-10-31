@@ -7,6 +7,7 @@ pub mod alter;
 pub mod cache;
 pub(crate) mod catalog;
 pub mod common;
+pub mod connection_id;
 pub mod emit;
 pub mod found_rows;
 pub mod metadata;
@@ -17,6 +18,7 @@ pub mod tds;
 pub mod user_locks;
 
 pub use cache::TranslateCache;
+pub use connection_id::connection_id_select_column;
 pub use found_rows::{calc_found_rows_count_sql, found_rows_select_column};
 
 /// The MySQL server version litewire reports, as a bare string literal.

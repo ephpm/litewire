@@ -27,7 +27,8 @@ use litewire_translate::metadata::{
 use litewire_translate::user_locks::LockValue;
 use litewire_translate::{
     Dialect, StatementKind, TranslateCache, TranslateError, TranslateResult,
-    calc_found_rows_count_sql, classify, found_rows_select_column, translate_cached,
+    calc_found_rows_count_sql, classify, connection_id_select_column, found_rows_select_column,
+    translate_cached,
 };
 
 /// MySQL `ER_PARSE_ERROR` (SQLSTATE 42000) -- what translation failures map
@@ -142,6 +143,10 @@ enum PreparedSpecial {
     /// A bare `SELECT FOUND_ROWS()`: executing it reads session state
     /// instead of the backend. `column` is the result column name.
     FoundRows { column: String },
+    /// A bare `SELECT CONNECTION_ID()`: executing it reads the connection's
+    /// lock-session id (see [`Session::connection_id_row`]). `column` is the
+    /// result column name.
+    ConnectionId { column: String },
     /// The statement carried `SQL_CALC_FOUND_ROWS`: after executing it,
     /// run `count_sql` (same parameter list) and store the total.
     CalcFoundRows { count_sql: String },
@@ -441,6 +446,13 @@ impl Session {
             return Ok(SessionResult::Rows(self.take_found_rows(column)));
         }
 
+        // A bare `SELECT CONNECTION_ID()` is answered from the connection's
+        // lock scope so it agrees with `IS_USED_LOCK()` (see
+        // [`Session::connection_id_row`]).
+        if let Some(column) = connection_id_select_column(sql, self.dialect) {
+            return Ok(SessionResult::Rows(self.connection_id_row(column).await));
+        }
+
         // `None` for everything but statements carrying SQL_CALC_FOUND_ROWS
         // (one allocation-free scan) -- non-calc queries pay no extra work.
         let count_sql = calc_found_rows_count_sql(sql, self.dialect);
@@ -555,6 +567,36 @@ impl Session {
                 decltype: Some("INTEGER".to_string()),
             }],
             rows: vec![vec![Value::Integer(i64::try_from(n).unwrap_or(i64::MAX))]],
+        }
+    }
+
+    /// Build the one-row result set for `SELECT CONNECTION_ID()`.
+    ///
+    /// The id is the connection's lock-session id, fetched through the same
+    /// path `IS_USED_LOCK()` uses ([`UserLockOp::ConnectionId`]), so the two
+    /// agree — including when the backend forwards lock operations to the
+    /// session's real home on another node (issue ephpm#657).
+    ///
+    /// When the connection has no lock scope (or the backend refuses, as a
+    /// clustered replica does), there is no stable per-connection id, so this
+    /// reports `0` — the value the stateless `CONNECTION_ID()` rewrite has
+    /// always produced, and the value `IS_USED_LOCK()` is likewise unable to
+    /// report there. It never fails the query: `CONNECTION_ID()` is a
+    /// diagnostic the client expects always to answer.
+    async fn connection_id_row(&mut self, column: String) -> ResultSet {
+        let id = match self.conn.user_lock(&UserLockOp::ConnectionId).await {
+            Ok(reply) => reply.unwrap_or(0),
+            Err(e) => {
+                tracing::debug!("CONNECTION_ID has no stable id on this connection: {e}");
+                0
+            }
+        };
+        ResultSet {
+            columns: vec![Column {
+                name: column,
+                decltype: Some("INTEGER".to_string()),
+            }],
+            rows: vec![vec![Value::Integer(id)]],
         }
     }
 
@@ -716,6 +758,17 @@ impl Session {
             });
         }
 
+        if let Some(column) = connection_id_select_column(query, self.dialect) {
+            // Describable shim, never executed — the real id comes from the
+            // connection at execute time (see execute_prepared).
+            let sqlite_sql = format!("SELECT abs(0) AS \"{}\"", column.replace('"', "\"\""));
+            return Ok(Prepared {
+                sqlite_sql,
+                kind: StatementKind::Query,
+                special: Some(PreparedSpecial::ConnectionId { column }),
+            });
+        }
+
         // An ALTER that rebuilds a table runs through the session.
         let translated = translate_cached(&self.cache, query, self.dialect)?;
         if translated
@@ -837,6 +890,10 @@ impl Session {
             Some(PreparedSpecial::FoundRows { column }) => {
                 let column = column.clone();
                 return Ok(SessionResult::Rows(self.take_found_rows(column)));
+            }
+            Some(PreparedSpecial::ConnectionId { column }) => {
+                let column = column.clone();
+                return Ok(SessionResult::Rows(self.connection_id_row(column).await));
             }
             // Re-evaluated from the original text: the lock calls' results
             // depend on the parameters bound to *this* execution.
