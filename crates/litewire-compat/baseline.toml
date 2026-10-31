@@ -10,15 +10,13 @@
 # `reason` is prefixed `observed:`; replace it with a real
 # explanation (as below) when you triage a new row.
 
-[[entry]]
-id = "mysql/cte/simple"
-kind = "exec_error"
-reason = "Turso engine bug: a trivial `WITH x AS (SELECT ...) SELECT ... FROM x` errors with 'unexpected row during execution'. Turso is Beta upstream; the same CTE works on rusqlite. Revisit when the engine is bumped."
-
-[[entry]]
-id = "pg/cte/simple"
-kind = "exec_error"
-reason = "Same Turso CTE engine bug as mysql/cte/simple (dialect-independent — the failure is in the engine, not translation)."
+# NOTE: `mysql/cte/simple` and `pg/cte/simple` were previously baselined here
+# as an exec_error ("unexpected row during execution"), attributed to a Turso
+# CTE engine bug. That attribution was wrong: the error was litewire#38 — a
+# `WITH … SELECT` leads with `WITH`, so `classify()` mis-routed it to the
+# backend's `execute()` path, which errors on any statement that yields a row.
+# With #38 fixed they route to `query()` and pass, so their baseline rows are
+# removed (the corpus now gates them as must-pass).
 
 [[entry]]
 id = "mysql/expr/integer_division"

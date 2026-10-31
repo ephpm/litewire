@@ -668,6 +668,24 @@ pub enum StatementKind {
 }
 
 /// Quickly classify a SQL string without full parsing.
+///
+/// Routing hinges on whether the statement **produces a row set**: a
+/// [`StatementKind::Query`] is run on the backend's `query()` path (which can
+/// pull rows), everything else on `execute()` (which errors — "unexpected row
+/// during execution" on Turso — if the statement yields a row). Two ordinary
+/// forms are not identified by their leading keyword and must be recognised
+/// explicitly, or they are mis-routed to `execute()` and fail (litewire#38):
+///
+/// * a **CTE whose outer statement is a `SELECT`** (`WITH … SELECT …`) is a
+///   read — the leading keyword is `WITH`, not `SELECT`;
+/// * a **`INSERT`/`UPDATE`/`DELETE` … `RETURNING`** returns the affected rows
+///   and so must run on the `query()` path. This also fixes a data-integrity
+///   bug: on the `execute()` path the row is written *before* the "unexpected
+///   row" error, so a caller that retries on error double-inserts. On the
+///   `query()` path the statement runs exactly once.
+///
+/// A **data-modifying CTE** (`WITH … INSERT/UPDATE/DELETE …` with no top-level
+/// `RETURNING`) still produces no row set and stays a [`StatementKind::Mutation`].
 #[must_use]
 pub fn classify(sql: &str) -> StatementKind {
     let upper = sql.trim().to_ascii_uppercase();
@@ -675,13 +693,117 @@ pub fn classify(sql: &str) -> StatementKind {
 
     match first_word {
         "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "PRAGMA" => StatementKind::Query,
-        "INSERT" | "UPDATE" | "DELETE" | "REPLACE" => StatementKind::Mutation,
+        "INSERT" | "UPDATE" | "DELETE" | "REPLACE" => classify_dml(sql),
         "CREATE" | "ALTER" | "DROP" | "TRUNCATE" => StatementKind::Ddl,
         "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" => {
             StatementKind::Transaction
         }
+        "WITH" => classify_cte(sql),
         _ => StatementKind::Other,
     }
+}
+
+/// Classify a statement whose leading keyword is `INSERT`/`UPDATE`/`DELETE`/
+/// `REPLACE`: a top-level `RETURNING` makes it row-returning (query path),
+/// otherwise it is a plain mutation.
+fn classify_dml(sql: &str) -> StatementKind {
+    if has_top_level_returning(sql) {
+        StatementKind::Query
+    } else {
+        StatementKind::Mutation
+    }
+}
+
+/// Classify a `WITH …` statement by its outer (body) statement, which decides
+/// read vs write. CTE subqueries live inside parentheses (depth > 0); the body
+/// keyword is the first depth-0 statement keyword after the CTE list.
+fn classify_cte(sql: &str) -> StatementKind {
+    for word in top_level_words(sql) {
+        match word.as_str() {
+            "SELECT" | "VALUES" => return StatementKind::Query,
+            "INSERT" | "UPDATE" | "DELETE" | "REPLACE" => return classify_dml(sql),
+            _ => {}
+        }
+    }
+    StatementKind::Other
+}
+
+/// Whether a `RETURNING` keyword appears at parenthesis depth 0 (i.e. as the
+/// statement's own `RETURNING` clause, not inside a subquery, string literal,
+/// quoted identifier, or comment).
+fn has_top_level_returning(sql: &str) -> bool {
+    top_level_words(sql).iter().any(|w| w == "RETURNING")
+}
+
+/// Collect the ASCII word tokens of `sql` that lie at parenthesis depth 0 and
+/// outside any string literal, quoted identifier, or comment — uppercased and
+/// in order. Deliberately lightweight (no full parse): enough for [`classify`]
+/// to find a CTE's outer statement and a top-level `RETURNING` without being
+/// fooled by quoted text such as `INSERT INTO t VALUES ('returning home')`.
+fn top_level_words(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let n = bytes.len();
+    let mut words = Vec::new();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        match c {
+            b'\'' | b'"' | b'`' => {
+                // Skip a quoted literal / identifier. A doubled quote is an
+                // escaped quote (SQL standard); a backslash escapes the next
+                // byte inside '…'/"…" (MySQL), but never inside `…`.
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\\' && c != b'`' && i + 1 < n {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == c {
+                        if i + 1 < n && bytes[i + 1] == c {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < n && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < n && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                if depth == 0 {
+                    words.push(sql[start..i].to_ascii_uppercase());
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    words
 }
 
 #[cfg(test)]
@@ -798,6 +920,121 @@ mod tests {
     #[test]
     fn classify_leading_whitespace() {
         assert_eq!(classify("  SELECT 1"), StatementKind::Query);
+    }
+
+    // ── classify: CTE outer statement (litewire#38) ──────────────────────────
+
+    #[test]
+    fn classify_cte_outer_select_is_query() {
+        assert_eq!(
+            classify("WITH au AS (SELECT id FROM users WHERE active = 1) SELECT * FROM au"),
+            StatementKind::Query
+        );
+    }
+
+    #[test]
+    fn classify_cte_recursive_outer_select_is_query() {
+        assert_eq!(
+            classify(
+                "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 10) \
+                 SELECT x FROM cnt"
+            ),
+            StatementKind::Query
+        );
+    }
+
+    #[test]
+    fn classify_multi_cte_outer_select_is_query() {
+        assert_eq!(
+            classify("WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b"),
+            StatementKind::Query
+        );
+    }
+
+    #[test]
+    fn classify_cte_lowercase_outer_select_is_query() {
+        assert_eq!(
+            classify("with au as (select id from users) select * from au"),
+            StatementKind::Query
+        );
+    }
+
+    #[test]
+    fn classify_data_modifying_cte_stays_mutation() {
+        // The outer statement writes and returns no rows -> execute path.
+        assert_eq!(
+            classify(
+                "WITH stale AS (SELECT id FROM users WHERE active = 0) \
+                      DELETE FROM users WHERE id IN (SELECT id FROM stale)"
+            ),
+            StatementKind::Mutation
+        );
+    }
+
+    #[test]
+    fn classify_data_modifying_cte_with_returning_is_query() {
+        assert_eq!(
+            classify(
+                "WITH t AS (SELECT 1 AS id) \
+                      INSERT INTO log (id) SELECT id FROM t RETURNING id"
+            ),
+            StatementKind::Query
+        );
+    }
+
+    // ── classify: DML RETURNING (litewire#38) ────────────────────────────────
+
+    #[test]
+    fn classify_insert_returning_is_query() {
+        assert_eq!(
+            classify("INSERT INTO users (name) VALUES ('Alice') RETURNING id"),
+            StatementKind::Query
+        );
+    }
+
+    #[test]
+    fn classify_update_returning_is_query() {
+        assert_eq!(
+            classify("UPDATE users SET age = 31 WHERE id = 1 RETURNING age"),
+            StatementKind::Query
+        );
+    }
+
+    #[test]
+    fn classify_delete_returning_is_query() {
+        assert_eq!(
+            classify("DELETE FROM users WHERE id = 1 RETURNING id"),
+            StatementKind::Query
+        );
+    }
+
+    #[test]
+    fn classify_plain_insert_stays_mutation() {
+        assert_eq!(
+            classify("INSERT INTO users (name) VALUES ('Alice')"),
+            StatementKind::Mutation
+        );
+    }
+
+    #[test]
+    fn classify_returning_inside_string_literal_is_not_a_returning_clause() {
+        // The word RETURNING only appears inside a string literal, so this is a
+        // plain mutation -- mis-routing it to query() would lose last_insert_id
+        // and affected-row reporting.
+        assert_eq!(
+            classify("INSERT INTO notes (body) VALUES ('she is returning id tomorrow')"),
+            StatementKind::Mutation
+        );
+    }
+
+    #[test]
+    fn classify_returning_inside_subquery_is_not_top_level() {
+        // A RETURNING nested in a subquery does not make the outer INSERT
+        // row-returning; only a top-level RETURNING does.
+        assert_eq!(
+            classify("INSERT INTO t (id) SELECT id FROM (SELECT 1 AS id) s"),
+            StatementKind::Mutation
+        );
     }
 
     // ── translate integration ───────────────────────────────────────────────
