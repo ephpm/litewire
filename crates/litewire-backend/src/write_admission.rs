@@ -63,10 +63,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use litewire_translate::{StatementKind, classify};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::BackendError;
+
+/// The statement's first whitespace-delimited word, uppercased. Empty for
+/// blank input. Write admission classifies by this keyword directly rather
+/// than through `litewire_translate::classify`, whose query-vs-execute routing
+/// is a separate concern (see [`WriteIntent`]).
+fn leading_keyword(sql: &str) -> String {
+    sql.trim()
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+}
 
 /// Default ceiling on how long a write waits for a permit before failing.
 ///
@@ -77,10 +88,18 @@ pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a statement does to a session's write-admission state.
 ///
-/// Derived from [`litewire_translate::classify`], refined for the
-/// distinctions a transaction-aware permit needs and `classify` does not
-/// draw -- notably `BEGIN` vs `COMMIT` (both `StatementKind::Transaction`)
-/// and `ROLLBACK` vs `ROLLBACK TO` (only the first ends a transaction).
+/// Write admission asks a different question from
+/// [`litewire_translate::classify`]: not "does this statement return rows /
+/// take the `query()` path?" but "does it take SQLite's single write lock?".
+/// Those agree for most statements, but `classify` routes some *writing*
+/// forms to its row-returning `Query` path -- a DML `... RETURNING`, and
+/// (since litewire#38) a CTE whose outer statement is a `SELECT` -- so a
+/// `StatementKind::Query` no longer implies "read" for admission purposes.
+/// [`WriteIntent::of`] therefore keys the write-vs-read decision on the
+/// statement's leading keyword directly, falling back to `classify` only for
+/// the transaction-control distinctions a permit needs and `classify` does
+/// not draw: `BEGIN` vs `COMMIT` (both `StatementKind::Transaction`) and
+/// `ROLLBACK` vs `ROLLBACK TO` (only the first ends a transaction).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteIntent {
     /// A pure read. Never takes a permit.
@@ -112,27 +131,52 @@ pub enum WriteIntent {
 impl WriteIntent {
     /// Classify a statement of already-translated SQLite SQL.
     ///
-    /// # Conservative handling of `StatementKind::Other`
+    /// The write-vs-read decision keys on the **leading keyword**, not on
+    /// [`classify`]'s routing result, because `classify` sends some writing
+    /// forms down its row-returning `Query` path (see the note on
+    /// [`WriteIntent`]). Only the transaction-control refinement defers to
+    /// `classify` via [`Self::transaction_intent`].
     ///
-    /// `classify` keys on the first word, so several real writes land in
-    /// `Other`: a data-modifying CTE (`WITH x AS (...) INSERT ...`), and
-    /// `VACUUM` / `ANALYZE` / `REINDEX`. Those are treated as writes here.
-    /// The cost is that a *read-only* `WITH ... SELECT` also takes a
-    /// permit; the alternative -- letting a data-modifying CTE bypass
-    /// admission entirely -- would silently defeat the mechanism for any
-    /// application that uses one. Over-admitting is a throughput
-    /// nuisance; under-admitting is the bug this module exists to fix.
+    /// # Conservative handling of a CTE
+    ///
+    /// A `WITH ...` statement is treated as a write. It may be a
+    /// data-modifying CTE (`WITH x AS (...) INSERT ...`, with or without a
+    /// `RETURNING` clause), which must take a permit; the cost is that a
+    /// *read-only* `WITH ... SELECT` also takes one. Letting a data-modifying
+    /// CTE bypass admission would silently defeat the mechanism for any
+    /// application that uses one. Over-admitting is a throughput nuisance;
+    /// under-admitting is the bug this module exists to fix. `VACUUM` /
+    /// `ANALYZE` / `REINDEX` are writes for the same reason.
     #[must_use]
     pub fn of(sql: &str) -> Self {
-        match classify(sql) {
-            StatementKind::Query => Self::Read,
-            StatementKind::Mutation | StatementKind::Ddl => Self::Write,
-            StatementKind::Transaction => Self::transaction_intent(sql),
-            StatementKind::Other => Self::other_intent(sql),
+        match leading_keyword(sql).as_str() {
+            "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "PRAGMA" | "VALUES" => Self::Read,
+            // DML writes -- including the `... RETURNING` variants that
+            // `classify` now routes to its Query (row-returning) path.
+            "INSERT" | "UPDATE" | "DELETE" | "REPLACE" => Self::Write,
+            // DDL writes.
+            "CREATE" | "ALTER" | "DROP" | "TRUNCATE" => Self::Write,
+            // A CTE is conservatively a write (see the doc note above), as are
+            // the bare maintenance statements.
+            "WITH" | "VACUUM" | "ANALYZE" | "REINDEX" => Self::Write,
+            // `END` is SQLite's synonym for `COMMIT`; `classify`'s keyword
+            // list does not include it. Leaving it neutral would be a
+            // **permit leak** -- a session that wrote inside `BEGIN ... END`
+            // would park a permit and never return it until the connection
+            // closed. `END` is only ever a statement's first word as
+            // transaction control (the `END` that closes a `CASE` is
+            // mid-expression), so keying on it is safe.
+            "END" => Self::EndTransaction,
+            "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" => {
+                Self::transaction_intent(sql)
+            }
+            // Anything with no bearing on the write lock (`SET`, `USE`, an
+            // unrecognised statement, ...).
+            _ => Self::Neutral,
         }
     }
 
-    /// Refine a `StatementKind::Transaction` into its effect on the
+    /// Refine a transaction-control statement into its effect on the
     /// transaction stack.
     fn transaction_intent(sql: &str) -> Self {
         let mut words = sql.trim().split_ascii_whitespace();
@@ -152,32 +196,6 @@ impl WriteIntent {
             // the permit while the session still held sqld's write lock.
             "ROLLBACK" if second == "TO" => Self::RollbackTo,
             _ => Self::EndTransaction,
-        }
-    }
-
-    /// Decide whether a statement `classify` could not place is a write.
-    /// See the note on [`WriteIntent::of`].
-    ///
-    /// `END` is here rather than in [`Self::transaction_intent`] because
-    /// `classify` does not recognise it as transaction control at all --
-    /// its keyword list has `COMMIT` but not `COMMIT`'s SQLite synonym.
-    /// Leaving it as neutral would be a **permit leak**: a session that
-    /// wrote inside `BEGIN ... END` would park a permit and never give it
-    /// back until the connection closed. `END` is only ever a statement's
-    /// first word as transaction control (the `END` that closes a `CASE`
-    /// is mid-expression), so keying on it is safe.
-    fn other_intent(sql: &str) -> Self {
-        let first = sql
-            .trim()
-            .split_ascii_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-
-        match first.as_str() {
-            "WITH" | "VACUUM" | "ANALYZE" | "REINDEX" => Self::Write,
-            "END" => Self::EndTransaction,
-            _ => Self::Neutral,
         }
     }
 
