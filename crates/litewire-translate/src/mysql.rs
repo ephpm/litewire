@@ -1175,8 +1175,30 @@ fn rewrite_column_def(col: &mut sqlparser::ast::ColumnDef) {
 }
 
 /// Map MySQL types to SQLite affinities.
+///
+/// This deliberately collapses every type to one of SQLite's four storage
+/// affinities (`INTEGER` / `REAL` / `TEXT` / `BLOB`), so the original MySQL
+/// declaration — width, `DECIMAL(p,s)` precision/scale, `UNSIGNED`,
+/// `ENUM`/`SET` members — does **not** survive into the stored schema, and the
+/// catalog views report the affinity, not the source type (see the note on
+/// `catalog::DATA_TYPE`). It is why `INTEGER PRIMARY KEY` stays exactly
+/// `INTEGER` (SQLite's rowid alias, needed for `AUTO_INCREMENT`), dates stay
+/// `TEXT` (one comparison order), and decimals are stored as `REAL`.
+///
+/// The one carve-out is `tinyint(1)` / `BOOL` / `BOOLEAN`: MySQL's boolean
+/// idiom, which ORMs (Laravel, CakePHP, Doctrine) detect purely by the
+/// `tinyint(1)` spelling to cast a column to bool. It is kept as `TINYINT(1)`
+/// rather than flattened to `INTEGER`. `TINYINT(1)` still has SQLite INTEGER
+/// affinity (its name contains `INT`), so values are stored exactly as any
+/// other integer; only the reported type changes. A `tinyint(1) PRIMARY KEY`
+/// (nonsensical) would no longer be a rowid alias, which is harmless.
 fn rewrite_data_type(dt: &DataType) -> DataType {
     match dt {
+        // Boolean / `tinyint(1)` -> keep `TINYINT(1)` (see fn docs).
+        DataType::Boolean | DataType::Bool | DataType::TinyInt(Some(1)) => {
+            DataType::TinyInt(Some(1))
+        }
+
         // Integer types -> INTEGER
         DataType::TinyInt(_)
         | DataType::SmallInt(_)
@@ -1214,9 +1236,6 @@ fn rewrite_data_type(dt: &DataType) -> DataType {
         | DataType::TinyBlob
         | DataType::MediumBlob
         | DataType::LongBlob => DataType::Blob(None),
-
-        // Boolean -> INTEGER
-        DataType::Boolean => DataType::Integer(None),
 
         // Date/time types -> TEXT
         DataType::Date
@@ -1455,12 +1474,30 @@ mod tests {
     }
 
     #[test]
-    fn boolean_to_integer_in_ddl() {
-        let results = translate("CREATE TABLE t (active BOOLEAN)", Dialect::MySQL).unwrap();
-        let sql = extract_sql(&results[0]);
-        let upper = sql.to_ascii_uppercase();
-        assert!(!upper.contains("BOOLEAN"), "BOOLEAN not rewritten: {sql}");
-        assert!(upper.contains("INTEGER"), "no INTEGER found: {sql}");
+    fn boolean_and_tinyint1_kept_as_tinyint1() {
+        // MySQL's boolean idiom is kept as `TINYINT(1)` (still INTEGER affinity)
+        // so the catalog can report it and ORMs can cast to bool. `BOOL`,
+        // `BOOLEAN` and a literal `TINYINT(1)` all land there; other integer
+        // widths still collapse to `INTEGER`.
+        for ty in ["BOOLEAN", "BOOL", "TINYINT(1)"] {
+            let results =
+                translate(&format!("CREATE TABLE t (active {ty})"), Dialect::MySQL).unwrap();
+            let sql = extract_sql(&results[0]);
+            let upper = sql.to_ascii_uppercase();
+            assert!(upper.contains("TINYINT(1)"), "{ty} -> {sql}");
+            assert!(!upper.contains("BOOLEAN"), "{ty} left BOOLEAN: {sql}");
+        }
+        // tinyint(4) / int(1) are not the boolean idiom: width stripped -> INTEGER.
+        for ty in ["TINYINT(4)", "INT(1)", "TINYINT"] {
+            let results = translate(&format!("CREATE TABLE t (n {ty})"), Dialect::MySQL).unwrap();
+            let sql = extract_sql(&results[0]);
+            let upper = sql.to_ascii_uppercase();
+            assert!(upper.contains("INTEGER"), "{ty} -> {sql}");
+            assert!(
+                !upper.contains("TINYINT(1)"),
+                "{ty} wrongly kept (1): {sql}"
+            );
+        }
     }
 
     #[test]
