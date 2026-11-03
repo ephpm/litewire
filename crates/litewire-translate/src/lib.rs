@@ -309,6 +309,14 @@ fn is_mysql_ddl(sql: &str) -> bool {
 /// Remove bare `(<digits>)` groups outside string/identifier quotes:
 /// `bigint(20)` -> `bigint`, `KEY k (col(191))` -> `KEY k (col)`.
 /// Groups containing anything but digits (e.g. `decimal(10,2)`) are kept.
+///
+/// One exception: `tinyint(1)` is kept. It is MySQL's boolean idiom, and the
+/// catalog reports it as `tinyint(1)` so ORMs can cast the column to bool (see
+/// `mysql::rewrite_data_type`). The digit must be exactly `1` and the
+/// preceding token exactly `tinyint`, so `tinyint(4)`, `int(1)` and an index
+/// prefix length on a column — which is backtick-quoted when the name is the
+/// reserved word `tinyint`, so its preceding token is not the bare keyword —
+/// are all still stripped.
 fn strip_numeric_paren_groups(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(sql.len());
@@ -326,14 +334,43 @@ fn strip_numeric_paren_groups(sql: &str) -> String {
                 j += 1;
             }
             if j > i + 1 && j < bytes.len() && bytes[j] == b')' {
-                i = j + 1; // skip the whole (NNN) group
-                continue;
+                let keep_tinyint_one =
+                    j == i + 2 && bytes[i + 1] == b'1' && trailing_token_is(&out, b"tinyint");
+                if !keep_tinyint_one {
+                    i = j + 1; // skip the whole (NNN) group
+                    continue;
+                }
+                // else fall through: emit `(`, then `1` and `)` normally.
             }
         }
         out.push(bytes[i]);
         i += 1;
     }
     bytes_to_string(out)
+}
+
+/// Does the emitted text end (ignoring trailing ASCII whitespace) in exactly
+/// the keyword `kw` as a whole token — the maximal trailing run of ASCII
+/// letters equals `kw`, case-insensitively? Used to keep `tinyint(1)` while
+/// stripping other `(<digits>)` groups.
+fn trailing_token_is(out: &[u8], kw: &[u8]) -> bool {
+    let mut end = out.len();
+    while end > 0 && out[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && out[start - 1].is_ascii_alphabetic() {
+        start -= 1;
+    }
+    // The alpha run must be a whole token, not the tail of a longer identifier:
+    // reject when the byte before it continues an identifier (`_` or a digit),
+    // so `user_tinyint(1)` / `col2tinyint(1)` — a column named `…tinyint` with
+    // an index-prefix length of 1 — still has its `(1)` stripped and parses.
+    // (An ASCII letter can never sit at `start - 1`; the run above is maximal.)
+    if start > 0 && (out[start - 1] == b'_' || out[start - 1].is_ascii_digit()) {
+        return false;
+    }
+    out[start..end].eq_ignore_ascii_case(kw)
 }
 
 /// If a quoted string or identifier starts at `bytes[i]`, the index just
@@ -811,6 +848,47 @@ fn top_level_words(sql: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_numeric_paren_groups_rules() {
+        // display widths and index prefix lengths are stripped ...
+        assert_eq!(
+            strip_numeric_paren_groups("CREATE TABLE t (a BIGINT(20), b VARCHAR(191))"),
+            "CREATE TABLE t (a BIGINT, b VARCHAR)"
+        );
+        assert_eq!(
+            strip_numeric_paren_groups("CREATE INDEX i ON t (meta_key(191))"),
+            "CREATE INDEX i ON t (meta_key)"
+        );
+        // ... but tinyint(1), MySQL's boolean idiom, is kept.
+        assert_eq!(
+            strip_numeric_paren_groups("CREATE TABLE t (ok TINYINT(1), n TINYINT(4))"),
+            "CREATE TABLE t (ok TINYINT(1), n TINYINT)"
+        );
+        // `int(1)` is not the boolean idiom; the preceding token must be tinyint.
+        assert_eq!(
+            strip_numeric_paren_groups("CREATE TABLE t (n INT(1))"),
+            "CREATE TABLE t (n INT)"
+        );
+        // a column literally named `tinyint` (backtick-quoted) with a prefix
+        // length of 1 is still stripped: its preceding token is not the keyword.
+        assert_eq!(
+            strip_numeric_paren_groups("CREATE INDEX i ON t (`tinyint`(1))"),
+            "CREATE INDEX i ON t (`tinyint`)"
+        );
+        // an unquoted column whose name merely *ends* in `tinyint` (preceded by
+        // `_` or a digit) is not the keyword either: its `(1)` index-prefix
+        // length is stripped, so the DDL stays parseable. Regression for a
+        // word-boundary bug that kept `(1)` here and broke translation.
+        assert_eq!(
+            strip_numeric_paren_groups("CREATE INDEX i ON t (user_tinyint(1))"),
+            "CREATE INDEX i ON t (user_tinyint)"
+        );
+        assert_eq!(
+            strip_numeric_paren_groups("CREATE INDEX i ON t (col2tinyint(1))"),
+            "CREATE INDEX i ON t (col2tinyint)"
+        );
+    }
 
     // ── classify ────────────────────────────────────────────────────────────
 

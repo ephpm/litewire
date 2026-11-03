@@ -57,11 +57,32 @@ pub(crate) fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// The SQLite expression mapping a declared column type to the MySQL type
-/// name the catalog reports. Text affinity maps to `longtext` / `longblob`
-/// so clients apply no length cap (WordPress's `wpdb` reads this for its
-/// charset/length checks).
-const MYSQL_TYPE: &str = "CASE \
+/// The SQLite expressions mapping a column's *stored* type to the MySQL type
+/// the catalog reports — `DATA_TYPE` is the bare type name, `COLUMN_TYPE` the
+/// full one (MySQL reports both; here they differ only for `tinyint(1)`).
+///
+/// litewire collapses every column to a SQLite storage affinity at CREATE time
+/// (`mysql::rewrite_data_type`), so by the time the catalog sees a column its
+/// stored type is only `INTEGER` / `REAL` / `TEXT` / `BLOB` — the original
+/// width, `DECIMAL(p,s)` precision/scale, `UNSIGNED`, and `ENUM`/`SET` members
+/// are gone and cannot be reported. Integer affinity therefore maps to
+/// `bigint`, real to `double`, and text/blob to `longtext` / `longblob` (the
+/// latter so clients apply no length cap — WordPress's `wpdb` reads this for
+/// its charset/length checks). The one exception is `tinyint(1)`, which
+/// `rewrite_data_type` deliberately preserves (MySQL's boolean idiom; ORMs
+/// detect it by that exact spelling).
+///
+/// The boolean carve-out matches both `TINYINT(1)` and bare `TINYINT` because
+/// the two embedded engines store the declared type differently: rusqlite
+/// (real SQLite) keeps the declaration verbatim, so `pragma_table_info.type`
+/// is `TINYINT(1)`; Turso re-parses and normalizes it, dropping the width, so
+/// the pragma type comes back as bare `TINYINT` (the stored DDL still shows
+/// `TINYINT (1)`). Matching bare `TINYINT` is safe because `rewrite_data_type`
+/// flattens every non-boolean integer type to `INTEGER`, so the only stored
+/// type whose name is `TINYINT`/`TINYINT(1)` is the boolean rewrite — neither
+/// spelling can collide with an ordinary integer column on either engine.
+const DATA_TYPE: &str = "CASE \
+    WHEN upper(p.type) IN ('TINYINT(1)', 'TINYINT') THEN 'tinyint' \
     WHEN upper(p.type) LIKE '%INT%' THEN 'bigint' \
     WHEN upper(p.type) IN ('REAL', 'DOUBLE', 'FLOAT', 'NUMERIC', 'DECIMAL') THEN 'double' \
     WHEN upper(p.type) LIKE '%BLOB%' THEN 'longblob' \
@@ -69,7 +90,18 @@ const MYSQL_TYPE: &str = "CASE \
     WHEN p.type = '' THEN 'longtext' \
     ELSE lower(p.type) END";
 
-/// SQLite condition: is column `p` text-typed (as [`MYSQL_TYPE`] sees it)?
+/// See [`DATA_TYPE`]. Identical except `tinyint(1)` keeps its width, since
+/// MySQL's `COLUMN_TYPE` is the full declaration (`tinyint(1)`, not `tinyint`).
+const COLUMN_TYPE: &str = "CASE \
+    WHEN upper(p.type) IN ('TINYINT(1)', 'TINYINT') THEN 'tinyint(1)' \
+    WHEN upper(p.type) LIKE '%INT%' THEN 'bigint' \
+    WHEN upper(p.type) IN ('REAL', 'DOUBLE', 'FLOAT', 'NUMERIC', 'DECIMAL') THEN 'double' \
+    WHEN upper(p.type) LIKE '%BLOB%' THEN 'longblob' \
+    WHEN upper(p.type) LIKE '%CHAR%' OR upper(p.type) LIKE '%CLOB%' OR upper(p.type) LIKE '%TEXT%' THEN 'longtext' \
+    WHEN p.type = '' THEN 'longtext' \
+    ELSE lower(p.type) END";
+
+/// SQLite condition: is column `p` text-typed (as [`DATA_TYPE`] sees it)?
 const IS_TEXT: &str = "(upper(p.type) LIKE '%CHAR%' OR upper(p.type) LIKE '%CLOB%' \
     OR upper(p.type) LIKE '%TEXT%' OR p.type = '')";
 
@@ -135,13 +167,13 @@ pub(crate) fn column_rows(tables: Tables<'_>) -> String {
          p.cid + 1 AS ORDINAL_POSITION, \
          p.dflt_value AS COLUMN_DEFAULT, \
          CASE WHEN p.\"notnull\" = 1 OR p.pk > 0 THEN 'NO' ELSE 'YES' END AS IS_NULLABLE, \
-         {MYSQL_TYPE} AS DATA_TYPE, \
+         {DATA_TYPE} AS DATA_TYPE, \
          CASE WHEN {IS_TEXT} THEN 4294967295 END AS CHARACTER_MAXIMUM_LENGTH, \
          CASE WHEN {IS_TEXT} THEN 4294967295 END AS CHARACTER_OCTET_LENGTH, \
          NULL AS NUMERIC_PRECISION, NULL AS NUMERIC_SCALE, NULL AS DATETIME_PRECISION, \
          CASE WHEN {IS_TEXT} THEN 'utf8mb4' END AS CHARACTER_SET_NAME, \
          CASE WHEN {IS_TEXT} THEN 'utf8mb4_unicode_ci' END AS COLLATION_NAME, \
-         {MYSQL_TYPE} AS COLUMN_TYPE, \
+         {COLUMN_TYPE} AS COLUMN_TYPE, \
          CASE WHEN p.pk > 0 THEN 'PRI' WHEN {uni} THEN 'UNI' WHEN {mul} THEN 'MUL' ELSE '' END \
            AS COLUMN_KEY, \
          CASE WHEN {auto} THEN 'auto_increment' ELSE '' END AS EXTRA, \
