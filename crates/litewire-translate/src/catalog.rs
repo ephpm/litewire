@@ -105,6 +105,31 @@ const COLUMN_TYPE: &str = "CASE \
 const IS_TEXT: &str = "(upper(p.type) LIKE '%CHAR%' OR upper(p.type) LIKE '%CLOB%' \
     OR upper(p.type) LIKE '%TEXT%' OR p.type = '')";
 
+/// The SQLite expression mapping `pragma_table_info`'s `dflt_value` to the
+/// value MySQL reports in `information_schema.COLUMNS.COLUMN_DEFAULT` /
+/// `SHOW COLUMNS`.`Default`.
+///
+/// SQLite returns `dflt_value` as the *source text* of the DEFAULT clause, so
+/// `DEFAULT NULL` comes back as the 4-character string `NULL` (not SQL NULL)
+/// and a string default comes back quoted (`'foo'`). MySQL reports SQL NULL
+/// for a `NULL` or absent default, and the unquoted value for a string
+/// default. mysqldump emits `DEFAULT NULL` on every nullable column, so
+/// without this mapping essentially every nullable column of an imported
+/// schema reports the literal string `"NULL"` — which ORMs that seed form
+/// fields from the default then write back verbatim. Map:
+///   * absent default (`dflt_value` already SQL NULL) -> SQL NULL;
+///   * the bare `NULL` keyword (any case, unquoted) -> SQL NULL;
+///   * a quoted string literal -> its contents, with `''` unescaped to `'`;
+///   * everything else (numbers, `CURRENT_TIMESTAMP`, expressions) -> as-is.
+const COLUMN_DEFAULT: &str = "CASE \
+    WHEN p.dflt_value IS NULL THEN NULL \
+    WHEN upper(p.dflt_value) = 'NULL' THEN NULL \
+    WHEN length(p.dflt_value) >= 2 \
+        AND substr(p.dflt_value, 1, 1) = '''' \
+        AND substr(p.dflt_value, length(p.dflt_value), 1) = '''' \
+      THEN replace(substr(p.dflt_value, 2, length(p.dflt_value) - 2), '''''', '''') \
+    ELSE p.dflt_value END";
+
 /// Which tables a catalog query covers.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Tables<'a> {
@@ -165,7 +190,7 @@ pub(crate) fn column_rows(tables: Tables<'_>) -> String {
          m.name COLLATE NOCASE AS TABLE_NAME, \
          p.name COLLATE NOCASE AS COLUMN_NAME, \
          p.cid + 1 AS ORDINAL_POSITION, \
-         p.dflt_value AS COLUMN_DEFAULT, \
+         {COLUMN_DEFAULT} AS COLUMN_DEFAULT, \
          CASE WHEN p.\"notnull\" = 1 OR p.pk > 0 THEN 'NO' ELSE 'YES' END AS IS_NULLABLE, \
          {DATA_TYPE} AS DATA_TYPE, \
          CASE WHEN {IS_TEXT} THEN 4294967295 END AS CHARACTER_MAXIMUM_LENGTH, \

@@ -303,6 +303,154 @@ async fn probes(backend: SharedBackend) {
     assert_eq!(count(&mut c, "SHOW TABLES").await, 3);
 }
 
+/// One column's reported default: `COLUMN_DEFAULT IS NULL` (SQL NULL?),
+/// `COLUMN_DEFAULT = 'NULL'` (the literal string "NULL"?), and the value.
+struct ColDefault {
+    real_null: Option<i64>,
+    str_null: Option<i64>,
+    value: Option<String>,
+}
+
+/// `COLUMN_DEFAULT` / `SHOW COLUMNS`.`Default` reports SQL NULL for a `NULL`
+/// or absent default (not the literal string "NULL"), and the unquoted value
+/// for a string default. SQLite's `pragma_table_info` returns `dflt_value` as
+/// the DEFAULT clause's source text, so `DEFAULT NULL` would otherwise surface
+/// as the 4-char string "NULL" — and since mysqldump emits `DEFAULT NULL` on
+/// every nullable column, an imported schema would report "NULL" for nearly
+/// every nullable column. ORMs that seed new-record form fields from the
+/// column default then write that string back (observed in CakePHP 5).
+async fn column_default(backend: SharedBackend) {
+    let mut c = serve(backend).await;
+    c.query_drop(
+        "CREATE TABLE posts (\
+         id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+         url VARCHAR(255) DEFAULT NULL, \
+         title VARCHAR(255), \
+         status VARCHAR(20) DEFAULT 'active', \
+         greeting VARCHAR(50) DEFAULT 'it''s', \
+         nullish VARCHAR(10) DEFAULT 'NULL', \
+         created TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
+         note VARCHAR(50) DEFAULT '', \
+         qty INT DEFAULT 0)",
+    )
+    .await
+    .unwrap();
+
+    // The mysql client renders SQL NULL and the string "NULL" identically, so
+    // assert on server-side booleans: real_null=1 => correct SQL NULL,
+    // str_null=1 => the bug (the literal string "NULL").
+    let rows: Vec<Row> = c
+        .query(
+            "SELECT COLUMN_NAME AS n, \
+             (COLUMN_DEFAULT IS NULL) AS real_null, \
+             (COLUMN_DEFAULT = 'NULL') AS str_null, \
+             COLUMN_DEFAULT AS dflt \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'posts' \
+             ORDER BY ORDINAL_POSITION",
+        )
+        .await
+        .unwrap();
+    let got: std::collections::HashMap<String, ColDefault> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("n").unwrap(),
+                ColDefault {
+                    real_null: r.get_opt::<Option<i64>, _>("real_null").unwrap().unwrap(),
+                    str_null: r.get_opt::<Option<i64>, _>("str_null").unwrap().unwrap(),
+                    value: r.get_opt::<Option<String>, _>("dflt").unwrap().unwrap(),
+                },
+            )
+        })
+        .collect();
+
+    // genuine no-default (SQLite dflt_value already NULL) — already correct.
+    assert_eq!(
+        got["id"].real_null,
+        Some(1),
+        "id: absent default is SQL NULL"
+    );
+    assert_eq!(got["id"].value, None);
+    // explicit `DEFAULT NULL` — the reported bug: must be SQL NULL, not "NULL".
+    assert_eq!(
+        got["url"].real_null,
+        Some(1),
+        "url: DEFAULT NULL must be SQL NULL"
+    );
+    assert_ne!(
+        got["url"].str_null,
+        Some(1),
+        "url: must not be the string \"NULL\""
+    );
+    assert_eq!(got["url"].value, None);
+    // a nullable column with no default clause — also SQL NULL.
+    assert_eq!(
+        got["title"].real_null,
+        Some(1),
+        "title: no default is SQL NULL"
+    );
+    // string literal default — unquoted contents.
+    assert_eq!(got["status"].real_null, Some(0));
+    assert_eq!(got["status"].value.as_deref(), Some("active"));
+    // embedded quote — SQLite's doubled '' unescaped to a single '.
+    assert_eq!(got["greeting"].value.as_deref(), Some("it's"));
+    // a string literal whose CONTENT is the text NULL (`DEFAULT 'NULL'`) stays
+    // the string "NULL" — it must NOT become SQL NULL. This is the arm-ordering
+    // property: the bare-`NULL` branch only fires on the unquoted token, so the
+    // quoted literal falls through to quote-stripping instead.
+    assert_eq!(
+        got["nullish"].real_null,
+        Some(0),
+        "nullish: DEFAULT 'NULL' is the string, not SQL NULL"
+    );
+    assert_eq!(got["nullish"].str_null, Some(1));
+    assert_eq!(got["nullish"].value.as_deref(), Some("NULL"));
+    // an expression default (`CURRENT_TIMESTAMP`) passes through untouched — not
+    // quoted, not the bare NULL token, so neither branch rewrites it.
+    assert_eq!(
+        got["created"].real_null,
+        Some(0),
+        "created: CURRENT_TIMESTAMP default is not SQL NULL"
+    );
+    assert_eq!(
+        got["created"].value.as_deref().map(str::to_ascii_uppercase),
+        Some("CURRENT_TIMESTAMP".to_string()),
+        "created: CURRENT_TIMESTAMP must pass through unchanged"
+    );
+    // empty-string default stays an empty string, not NULL.
+    assert_eq!(
+        got["note"].real_null,
+        Some(0),
+        "note: '' default is not NULL"
+    );
+    assert_eq!(got["note"].value.as_deref(), Some(""));
+    // numeric default passes through as text.
+    assert_eq!(got["qty"].real_null, Some(0));
+    assert_eq!(got["qty"].value.as_deref(), Some("0"));
+
+    // `SHOW FULL COLUMNS`.`Default` reads the same emulation.
+    let rows: Vec<Row> = c.query("SHOW FULL COLUMNS FROM posts").await.unwrap();
+    let defaults: std::collections::HashMap<String, Option<String>> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("Field").unwrap(),
+                r.get_opt::<Option<String>, _>("Default").unwrap().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(defaults["url"], None, "SHOW COLUMNS: DEFAULT NULL -> NULL");
+    assert_eq!(
+        defaults["nullish"].as_deref(),
+        Some("NULL"),
+        "SHOW COLUMNS: DEFAULT 'NULL' -> the string"
+    );
+    assert_eq!(defaults["status"].as_deref(), Some("active"));
+    assert_eq!(defaults["greeting"].as_deref(), Some("it's"));
+    assert_eq!(defaults["qty"].as_deref(), Some("0"));
+}
+
 /// litewire collapses every column type to a SQLite storage affinity, so the
 /// catalog reports `bigint` / `double` / `longtext` / `longblob` rather than
 /// the declared MySQL type — width, decimal precision, `unsigned` and
@@ -402,6 +550,21 @@ async fn schema_probes_filter_turso() {
     let backend: SharedBackend =
         std::sync::Arc::new(litewire::litewire_turso::Turso::memory().await.unwrap());
     probes(backend).await;
+}
+
+#[tokio::test]
+async fn column_default_rusqlite() {
+    let backend: SharedBackend =
+        std::sync::Arc::new(litewire::backend::Rusqlite::memory().unwrap());
+    column_default(backend).await;
+}
+
+#[cfg(feature = "turso")]
+#[tokio::test]
+async fn column_default_turso() {
+    let backend: SharedBackend =
+        std::sync::Arc::new(litewire::litewire_turso::Turso::memory().await.unwrap());
+    column_default(backend).await;
 }
 
 #[tokio::test]
