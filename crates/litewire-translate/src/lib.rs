@@ -362,6 +362,14 @@ fn trailing_token_is(out: &[u8], kw: &[u8]) -> bool {
     while start > 0 && out[start - 1].is_ascii_alphabetic() {
         start -= 1;
     }
+    // The alpha run must be a whole token, not the tail of a longer identifier:
+    // reject when the byte before it continues an identifier (`_` or a digit),
+    // so `user_tinyint(1)` / `col2tinyint(1)` — a column named `…tinyint` with
+    // an index-prefix length of 1 — still has its `(1)` stripped and parses.
+    // (An ASCII letter can never sit at `start - 1`; the run above is maximal.)
+    if start > 0 && (out[start - 1] == b'_' || out[start - 1].is_ascii_digit()) {
+        return false;
+    }
     out[start..end].eq_ignore_ascii_case(kw)
 }
 
@@ -867,6 +875,18 @@ mod tests {
         assert_eq!(
             strip_numeric_paren_groups("CREATE INDEX i ON t (`tinyint`(1))"),
             "CREATE INDEX i ON t (`tinyint`)"
+        );
+        // an unquoted column whose name merely *ends* in `tinyint` (preceded by
+        // `_` or a digit) is not the keyword either: its `(1)` index-prefix
+        // length is stripped, so the DDL stays parseable. Regression for a
+        // word-boundary bug that kept `(1)` here and broke translation.
+        assert_eq!(
+            strip_numeric_paren_groups("CREATE INDEX i ON t (user_tinyint(1))"),
+            "CREATE INDEX i ON t (user_tinyint)"
+        );
+        assert_eq!(
+            strip_numeric_paren_groups("CREATE INDEX i ON t (col2tinyint(1))"),
+            "CREATE INDEX i ON t (col2tinyint)"
         );
     }
 

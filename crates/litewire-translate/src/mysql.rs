@@ -1192,6 +1192,12 @@ fn rewrite_column_def(col: &mut sqlparser::ast::ColumnDef) {
 /// affinity (its name contains `INT`), so values are stored exactly as any
 /// other integer; only the reported type changes. A `tinyint(1) PRIMARY KEY`
 /// (nonsensical) would no longer be a rowid alias, which is harmless.
+///
+/// `tinyint(1) unsigned` is deliberately **not** carved out: it parses to a
+/// distinct `TinyIntUnsigned(Some(1))` and flattens to `INTEGER` like any other
+/// integer (reported `bigint`). The unsigned boolean idiom is vanishingly rare,
+/// and the affinity collapse already discards `UNSIGNED`, so there is no faithful
+/// `tinyint(1) unsigned` to report anyway.
 fn rewrite_data_type(dt: &DataType) -> DataType {
     match dt {
         // Boolean / `tinyint(1)` -> keep `TINYINT(1)` (see fn docs).
@@ -1497,6 +1503,21 @@ mod tests {
                 !upper.contains("TINYINT(1)"),
                 "{ty} wrongly kept (1): {sql}"
             );
+        }
+    }
+
+    #[test]
+    fn column_named_tinyint_with_prefix_length_parses() {
+        // Regression: the `tinyint(1)` carve-out must not keep the `(1)` on a
+        // column whose unquoted name merely *ends* in `tinyint` (preceded by
+        // `_` or a digit). Here `(1)` is an index-prefix length, not a width;
+        // keeping it produced DDL sqlparser could not parse.
+        for col in ["user_tinyint", "col2tinyint"] {
+            let sql = format!("CREATE TABLE t ({col} VARCHAR(8), KEY k ({col}(1)))");
+            let results = translate(&sql, Dialect::MySQL)
+                .unwrap_or_else(|e| panic!("{col}: translate failed: {e}"));
+            let out = extract_sql(&results[0]);
+            assert!(!out.contains("(1)"), "{col}: prefix length survived: {out}");
         }
     }
 

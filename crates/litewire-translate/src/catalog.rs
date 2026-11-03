@@ -71,8 +71,18 @@ pub(crate) fn sql_str(s: &str) -> String {
 /// its charset/length checks). The one exception is `tinyint(1)`, which
 /// `rewrite_data_type` deliberately preserves (MySQL's boolean idiom; ORMs
 /// detect it by that exact spelling).
+///
+/// The boolean carve-out matches both `TINYINT(1)` and bare `TINYINT` because
+/// the two embedded engines store the declared type differently: rusqlite
+/// (real SQLite) keeps the declaration verbatim, so `pragma_table_info.type`
+/// is `TINYINT(1)`; Turso re-parses and normalizes it, dropping the width, so
+/// the pragma type comes back as bare `TINYINT` (the stored DDL still shows
+/// `TINYINT (1)`). Matching bare `TINYINT` is safe because `rewrite_data_type`
+/// flattens every non-boolean integer type to `INTEGER`, so the only stored
+/// type whose name is `TINYINT`/`TINYINT(1)` is the boolean rewrite — neither
+/// spelling can collide with an ordinary integer column on either engine.
 const DATA_TYPE: &str = "CASE \
-    WHEN upper(p.type) = 'TINYINT(1)' THEN 'tinyint' \
+    WHEN upper(p.type) IN ('TINYINT(1)', 'TINYINT') THEN 'tinyint' \
     WHEN upper(p.type) LIKE '%INT%' THEN 'bigint' \
     WHEN upper(p.type) IN ('REAL', 'DOUBLE', 'FLOAT', 'NUMERIC', 'DECIMAL') THEN 'double' \
     WHEN upper(p.type) LIKE '%BLOB%' THEN 'longblob' \
@@ -83,7 +93,7 @@ const DATA_TYPE: &str = "CASE \
 /// See [`DATA_TYPE`]. Identical except `tinyint(1)` keeps its width, since
 /// MySQL's `COLUMN_TYPE` is the full declaration (`tinyint(1)`, not `tinyint`).
 const COLUMN_TYPE: &str = "CASE \
-    WHEN upper(p.type) = 'TINYINT(1)' THEN 'tinyint(1)' \
+    WHEN upper(p.type) IN ('TINYINT(1)', 'TINYINT') THEN 'tinyint(1)' \
     WHEN upper(p.type) LIKE '%INT%' THEN 'bigint' \
     WHEN upper(p.type) IN ('REAL', 'DOUBLE', 'FLOAT', 'NUMERIC', 'DECIMAL') THEN 'double' \
     WHEN upper(p.type) LIKE '%BLOB%' THEN 'longblob' \
