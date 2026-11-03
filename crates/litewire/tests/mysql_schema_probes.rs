@@ -451,6 +451,92 @@ async fn column_default(backend: SharedBackend) {
     assert_eq!(defaults["qty"].as_deref(), Some("0"));
 }
 
+/// litewire collapses every column type to a SQLite storage affinity, so the
+/// catalog reports `bigint` / `double` / `longtext` / `longblob` rather than
+/// the declared MySQL type — width, decimal precision, `unsigned` and
+/// enum/set members do not survive CREATE TABLE. The one carve-out is MySQL's
+/// boolean idiom `tinyint(1)` / `BOOL` / `BOOLEAN`, kept as `tinyint(1)` so
+/// ORMs can cast the column to bool. This pins both: the carve-out works, and
+/// the integer-PK `AUTO_INCREMENT` (SQLite rowid alias, needs the PK column to
+/// stay exactly `INTEGER`) is unaffected by it.
+async fn column_type_fidelity(backend: SharedBackend) {
+    let mut c = serve(backend).await;
+    c.query_drop(
+        "CREATE TABLE widgets (\
+         id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+         active TINYINT(1) DEFAULT 0, \
+         is_admin BOOLEAN DEFAULT 0, \
+         width INT(1), \
+         qty INT, \
+         big BIGINT, \
+         price DECIMAL(10,2), \
+         name VARCHAR(190))",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<Row> = c
+        .query(
+            "SELECT COLUMN_NAME AS n, DATA_TYPE AS d, COLUMN_TYPE AS ct \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'widgets' \
+             ORDER BY ORDINAL_POSITION",
+        )
+        .await
+        .unwrap();
+    let got: std::collections::HashMap<String, (String, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("n").unwrap(),
+                (
+                    r.get::<String, _>("d").unwrap(),
+                    r.get::<String, _>("ct").unwrap(),
+                ),
+            )
+        })
+        .collect();
+
+    // the boolean carve-out: `tinyint(1)` and `BOOL`/`BOOLEAN` report as such.
+    assert_eq!(got["active"], ("tinyint".into(), "tinyint(1)".into()));
+    assert_eq!(got["is_admin"], ("tinyint".into(), "tinyint(1)".into()));
+    // everything else still collapses to the affinity's MySQL type. `int(1)`
+    // is NOT the boolean idiom (only `tinyint(1)` is) — it stays bigint.
+    assert_eq!(got["width"], ("bigint".into(), "bigint".into()));
+    assert_eq!(got["id"], ("bigint".into(), "bigint".into()));
+    assert_eq!(got["qty"], ("bigint".into(), "bigint".into()));
+    assert_eq!(got["big"], ("bigint".into(), "bigint".into()));
+    assert_eq!(got["price"], ("double".into(), "double".into()));
+    assert_eq!(got["name"], ("longtext".into(), "longtext".into()));
+
+    // SHOW COLUMNS reads the same path.
+    let rows: Vec<Row> = c
+        .query("SHOW COLUMNS FROM widgets WHERE Field = 'active'")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<String, _>("Type").unwrap(), "tinyint(1)");
+
+    // the boolean carve-out must NOT disturb integer-PK AUTO_INCREMENT: `id`
+    // stays an `INTEGER` rowid alias, so inserts auto-assign and climb.
+    assert_eq!(
+        strings(
+            &mut c,
+            "SHOW COLUMNS FROM widgets WHERE Field = 'id'",
+            "Extra"
+        )
+        .await,
+        ["auto_increment"]
+    );
+    c.query_drop("INSERT INTO widgets (active) VALUES (1)")
+        .await
+        .unwrap();
+    let first = c.last_insert_id().unwrap();
+    c.query_drop("INSERT INTO widgets (active) VALUES (0)")
+        .await
+        .unwrap();
+    assert_eq!(c.last_insert_id(), Some(first + 1), "AUTO_INCREMENT climbs");
+}
+
 #[tokio::test]
 async fn schema_probes_filter_rusqlite() {
     let backend: SharedBackend =
@@ -479,4 +565,19 @@ async fn column_default_turso() {
     let backend: SharedBackend =
         std::sync::Arc::new(litewire::litewire_turso::Turso::memory().await.unwrap());
     column_default(backend).await;
+}
+
+#[tokio::test]
+async fn column_type_fidelity_rusqlite() {
+    let backend: SharedBackend =
+        std::sync::Arc::new(litewire::backend::Rusqlite::memory().unwrap());
+    column_type_fidelity(backend).await;
+}
+
+#[cfg(feature = "turso")]
+#[tokio::test]
+async fn column_type_fidelity_turso() {
+    let backend: SharedBackend =
+        std::sync::Arc::new(litewire::litewire_turso::Turso::memory().await.unwrap());
+    column_type_fidelity(backend).await;
 }
