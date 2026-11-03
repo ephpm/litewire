@@ -328,6 +328,8 @@ async fn column_default(backend: SharedBackend) {
          title VARCHAR(255), \
          status VARCHAR(20) DEFAULT 'active', \
          greeting VARCHAR(50) DEFAULT 'it''s', \
+         nullish VARCHAR(10) DEFAULT 'NULL', \
+         created TIMESTAMP DEFAULT CURRENT_TIMESTAMP, \
          note VARCHAR(50) DEFAULT '', \
          qty INT DEFAULT 0)",
     )
@@ -393,6 +395,29 @@ async fn column_default(backend: SharedBackend) {
     assert_eq!(got["status"].value.as_deref(), Some("active"));
     // embedded quote — SQLite's doubled '' unescaped to a single '.
     assert_eq!(got["greeting"].value.as_deref(), Some("it's"));
+    // a string literal whose CONTENT is the text NULL (`DEFAULT 'NULL'`) stays
+    // the string "NULL" — it must NOT become SQL NULL. This is the arm-ordering
+    // property: the bare-`NULL` branch only fires on the unquoted token, so the
+    // quoted literal falls through to quote-stripping instead.
+    assert_eq!(
+        got["nullish"].real_null,
+        Some(0),
+        "nullish: DEFAULT 'NULL' is the string, not SQL NULL"
+    );
+    assert_eq!(got["nullish"].str_null, Some(1));
+    assert_eq!(got["nullish"].value.as_deref(), Some("NULL"));
+    // an expression default (`CURRENT_TIMESTAMP`) passes through untouched — not
+    // quoted, not the bare NULL token, so neither branch rewrites it.
+    assert_eq!(
+        got["created"].real_null,
+        Some(0),
+        "created: CURRENT_TIMESTAMP default is not SQL NULL"
+    );
+    assert_eq!(
+        got["created"].value.as_deref().map(str::to_ascii_uppercase),
+        Some("CURRENT_TIMESTAMP".to_string()),
+        "created: CURRENT_TIMESTAMP must pass through unchanged"
+    );
     // empty-string default stays an empty string, not NULL.
     assert_eq!(
         got["note"].real_null,
@@ -416,6 +441,11 @@ async fn column_default(backend: SharedBackend) {
         })
         .collect();
     assert_eq!(defaults["url"], None, "SHOW COLUMNS: DEFAULT NULL -> NULL");
+    assert_eq!(
+        defaults["nullish"].as_deref(),
+        Some("NULL"),
+        "SHOW COLUMNS: DEFAULT 'NULL' -> the string"
+    );
     assert_eq!(defaults["status"].as_deref(), Some("active"));
     assert_eq!(defaults["greeting"].as_deref(), Some("it's"));
     assert_eq!(defaults["qty"].as_deref(), Some("0"));
