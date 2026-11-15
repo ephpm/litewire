@@ -849,15 +849,43 @@ fn check_param_count(sql: &str, got: usize) -> Result<(), BackendError> {
     Ok(())
 }
 
+/// Prepare `sql` on `conn`, interning only *parameterised* statements.
+///
+/// The Turso SDK's `prepare_cached` stores every statement text in a
+/// per-connection map that is never evicted. A statement that declares no bind
+/// parameters is effectively one-shot — a dump of literal `INSERT`s, or an app
+/// that inlines its values (WordPress' `$wpdb->prepare` emits literal SQL) — so
+/// caching it only grows that map without ever scoring a hit. On a long-lived
+/// connection (a wire session, a parked reuse-pool connection, ePHPm's
+/// per-thread bridge session) that is an unbounded memory leak: a client that
+/// runs millions of distinct literal statements interns one entry per
+/// statement until the process is out of memory.
+///
+/// So cache only statements that carry placeholders — the ones prepared once
+/// and re-bound with fresh parameters, where the cache actually pays off — and
+/// prepare literal statements uncached. A literal statement is cheap to
+/// re-prepare and, being literal, is rarely issued twice anyway.
+async fn prepare_statement(
+    conn: &turso::Connection,
+    sql: &str,
+) -> Result<turso::Statement, turso::Error> {
+    if expected_param_count(sql) == 0 {
+        conn.prepare(sql).await
+    } else {
+        conn.prepare_cached(sql).await
+    }
+}
+
 /// Run `SELECT`-shaped `sql` on `conn` and collect the rows.
 async fn query_on(
     conn: &turso::Connection,
     sql: &str,
     params: &[Value],
 ) -> Result<ResultSet, BackendError> {
-    // `prepare_cached` interns the parsed statement in the engine's
-    // per-connection cache, mirroring the rusqlite backend.
-    let mut stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
+    // Cache only parameterised statements; a literal one-shot is prepared
+    // uncached so it cannot grow the SDK's unbounded statement cache. See
+    // [`prepare_statement`].
+    let mut stmt = prepare_statement(conn, sql).await.map_err(map_turso_err)?;
     // Engine parse errors surface first (prepare above); then enforce
     // the bind count like rusqlite does — the engine itself would
     // silently run with unbound parameters as NULL.
@@ -907,7 +935,7 @@ async fn execute_on(
     params: &[Value],
     baseline_rowid: i64,
 ) -> Result<ExecuteResult, BackendError> {
-    let mut stmt = conn.prepare_cached(sql).await.map_err(map_turso_err)?;
+    let mut stmt = prepare_statement(conn, sql).await.map_err(map_turso_err)?;
     // Same bind-count parity check as `query` (see `check_param_count`).
     check_param_count(sql, params.len())?;
     let affected = stmt
@@ -999,9 +1027,7 @@ impl BackendConn for TursoConn {
         // Prepare without executing -- same trick as the rusqlite backend,
         // no LIMIT-0 probe needed.
         let result = offload::engine(async {
-            state
-                .conn
-                .prepare_cached(sql)
+            prepare_statement(&state.conn, sql)
                 .await
                 .map(|stmt| to_columns(&stmt.columns()))
                 .map_err(map_turso_err)
@@ -1346,6 +1372,63 @@ mod tests {
             .unwrap();
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][1], Value::Text("Alice".into()));
+    }
+
+    #[tokio::test]
+    async fn literal_and_parameterised_statements_both_execute() {
+        // `prepare_statement` caches only parameterised statements and prepares
+        // literal (no-placeholder) ones uncached, so a connection that runs
+        // many distinct literal statements cannot grow the SDK's unbounded
+        // statement cache. Guard that both paths stay correct: a run of
+        // distinct literal INSERTs and a re-bound parameterised INSERT must all
+        // land and read back, by literal and by parameterised SELECT.
+        let backend = Turso::memory().await.unwrap();
+        let c = backend.connect().await.unwrap();
+        c.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // The leak shape: many DISTINCT literal INSERTs on one long-lived
+        // connection — the uncached path.
+        for i in 1..=200 {
+            let r = c
+                .execute(&format!("INSERT INTO t (id, v) VALUES ({i}, 'v{i}')"), &[])
+                .await
+                .unwrap();
+            assert_eq!(r.affected_rows, 1);
+        }
+
+        // The parameterised path still caches and re-binds correctly.
+        for i in 201i64..=210 {
+            let r = c
+                .execute(
+                    "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                    &[Value::Integer(i), Value::Text(format!("p{i}"))],
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.affected_rows, 1);
+        }
+
+        // Every row landed (literal SELECT — also the uncached path).
+        let rs = c.query("SELECT COUNT(*) FROM t", &[]).await.unwrap();
+        assert_eq!(rs.rows[0][0], Value::Integer(210));
+
+        // A literal row by literal lookup, and a parameterised row by
+        // parameterised lookup.
+        let rs = c
+            .query("SELECT v FROM t WHERE id = 137", &[])
+            .await
+            .unwrap();
+        assert_eq!(rs.rows[0][0], Value::Text("v137".into()));
+        let rs = c
+            .query("SELECT v FROM t WHERE id = ?1", &[Value::Integer(205)])
+            .await
+            .unwrap();
+        assert_eq!(rs.rows[0][0], Value::Text("p205".into()));
     }
 
     #[tokio::test]
