@@ -122,6 +122,40 @@ pub trait BackendConn: Send + Sync {
     /// Execute a statement that modifies data.
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, BackendError>;
 
+    /// Execute a sequence of parameter-free statements on **this** connection,
+    /// in source order, stopping at the first error.
+    ///
+    /// Each statement autocommits on its own (there is no implicit transaction
+    /// around the batch); a statement that fails neither runs nor commits any
+    /// statement after it, exactly as running them one at a time would leave
+    /// them. On full success the returned vector has one [`ExecuteResult`] per
+    /// input statement, in order; on failure the error is that of the failing
+    /// statement (statements before it have already executed).
+    ///
+    /// Because every statement runs on the same connection, a following
+    /// `last_insert_rowid()` / `changes()` on this connection observes the
+    /// batch's last statement — which is why a forwarding decorator overrides
+    /// this to run the whole batch on one owner-side connection in one round
+    /// trip, rather than opening a throw-away connection per batch.
+    ///
+    /// The statements are run **verbatim**: this is a connection-level
+    /// primitive, so the caller is responsible for any dialect translation
+    /// (unlike the [`Session`](../litewire_session/struct.Session.html) query
+    /// path). It is meant for a burst of already-final, parameter-free
+    /// mutations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failing statement's [`BackendError`] (SQL-vs-infrastructure
+    /// distinction preserved), stopping the batch there.
+    async fn exec_batch(&self, statements: &[String]) -> Result<Vec<ExecuteResult>, BackendError> {
+        let mut results = Vec::with_capacity(statements.len());
+        for sql in statements {
+            results.push(self.execute(sql, &[]).await?);
+        }
+        Ok(results)
+    }
+
     /// Describe the columns a prepared SELECT would produce, *without*
     /// executing it. Used by wire frontends to answer `COM_STMT_PREPARE`
     /// (MySQL) / `Describe` (Postgres) without a `LIMIT 0` round trip
