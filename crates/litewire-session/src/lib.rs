@@ -19,7 +19,7 @@ mod user_locks;
 use std::sync::Arc;
 
 use litewire_backend::user_lock::{UserLockOp, UserLockReply};
-use litewire_backend::{BackendConn, BackendError, Column, ResultSet, Value};
+use litewire_backend::{BackendConn, BackendError, Column, ExecuteResult, ResultSet, Value};
 use litewire_translate::alter::ColumnRebuild;
 use litewire_translate::metadata::{
     DEFAULT_SQL_MODE, SessionVars, SetSqlMode, SqlModeValue, detect_set_sql_mode,
@@ -479,6 +479,40 @@ impl Session {
         }
 
         Ok(last)
+    }
+
+    /// Run a burst of **already-final, parameter-free** statements on this
+    /// session's own backend connection, in source order, stopping at the
+    /// first error. Thin wrapper over [`BackendConn::exec_batch`] that keeps
+    /// the connection encapsulated.
+    ///
+    /// Unlike [`Session::query`] this does **not** translate, split, or track
+    /// transaction state: the caller supplies the final statements (e.g. a
+    /// forwarding caller that has already translated and validated a pure-write
+    /// burst) and the session runs them verbatim. Keeping them on the session's
+    /// pinned connection is the point — a following `last_insert_rowid()` /
+    /// `changes()` issued through this same session observes the batch, which a
+    /// throw-away per-batch connection would not.
+    ///
+    /// It is the caller's responsibility to only pass a burst for which running
+    /// it as one batch is observably identical to running each statement
+    /// through [`Session::query`]: no parameters, no transaction control, no
+    /// row-returning or session-special statements. The session's own
+    /// `in_transaction` flag is neither read nor updated here.
+    ///
+    /// The error is the raw [`BackendError`] (not a [`SessionError`]), because
+    /// no translation or MySQL-code mapping is performed on this path; the
+    /// caller maps it as it sees fit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failing statement's [`BackendError`]; statements before it
+    /// have already executed and autocommitted on this connection.
+    pub async fn exec_batch(
+        &self,
+        statements: &[String],
+    ) -> Result<Vec<ExecuteResult>, BackendError> {
+        self.conn.exec_batch(statements).await
     }
 
     /// The session `sql_mode`: what `SELECT @@sql_mode` reports. Empty
@@ -1185,6 +1219,115 @@ mod tests {
             rs.rows,
             vec![vec![Value::Integer(1), Value::Text("alice".into())]]
         );
+    }
+
+    // ── exec_batch (#439) ────────────────────────────────────────────────────
+
+    /// A batch runs its statements in source order on the one connection and
+    /// returns one result per statement, with `last_insert_rowid` tracking each
+    /// insert.
+    #[tokio::test]
+    async fn exec_batch_runs_in_order_and_reports_each_result() {
+        let mut session = memory_session().await;
+        ok(session
+            .query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap());
+
+        let results = session
+            .exec_batch(&[
+                "INSERT INTO t (v) VALUES ('a')".to_string(),
+                "INSERT INTO t (v) VALUES ('b')".to_string(),
+                "INSERT INTO t (v) VALUES ('c')".to_string(),
+            ])
+            .await
+            .expect("a pure-write batch succeeds");
+
+        assert_eq!(results.len(), 3, "one result per statement");
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r.affected_rows, 1);
+            assert_eq!(
+                r.last_insert_rowid,
+                Some(i as i64 + 1),
+                "each statement's rowid, in order"
+            );
+        }
+
+        // Source order preserved on disk.
+        let rs = rows(
+            session
+                .query("SELECT v FROM t ORDER BY id", &[])
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            rs.rows,
+            vec![
+                vec![Value::Text("a".into())],
+                vec![Value::Text("b".into())],
+                vec![Value::Text("c".into())],
+            ]
+        );
+    }
+
+    /// The batch runs on the session's own connection, so a following
+    /// `last_insert_rowid()` through the same session observes the batch's last
+    /// insert — the coherence a throw-away per-batch connection would break.
+    #[tokio::test]
+    async fn exec_batch_last_insert_id_is_coherent_on_the_same_connection() {
+        let mut session = memory_session().await;
+        ok(session
+            .query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[])
+            .await
+            .unwrap());
+
+        session
+            .exec_batch(&[
+                "INSERT INTO t (v) VALUES ('a')".to_string(),
+                "INSERT INTO t (v) VALUES ('b')".to_string(),
+            ])
+            .await
+            .unwrap();
+
+        // Straight through the pinned connection (bypassing dialect handling),
+        // exactly how a forwarded LAST_INSERT_ID() reaches the owner.
+        let rs = session
+            .conn
+            .query("SELECT last_insert_rowid()", &[])
+            .await
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![Value::Integer(2)]]);
+    }
+
+    /// A failing statement stops the batch: statements before it committed, the
+    /// one that failed and every statement after it did not run.
+    #[tokio::test]
+    async fn exec_batch_stops_at_the_first_error() {
+        let mut session = memory_session().await;
+        ok(session
+            .query("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])
+            .await
+            .unwrap());
+
+        let err = session
+            .exec_batch(&[
+                "INSERT INTO t (id) VALUES (1)".to_string(),
+                // Duplicate primary key — fails.
+                "INSERT INTO t (id) VALUES (1)".to_string(),
+                // Never runs.
+                "INSERT INTO t (id) VALUES (2)".to_string(),
+            ])
+            .await;
+        assert!(err.is_err(), "a duplicate-key statement fails the batch");
+
+        // Only the first insert committed; the third never ran.
+        let rs = rows(
+            session
+                .query("SELECT id FROM t ORDER BY id", &[])
+                .await
+                .unwrap(),
+        );
+        assert_eq!(rs.rows, vec![vec![Value::Integer(1)]]);
     }
 
     // ── Metadata path ──────────────────────────────────────────────────────
